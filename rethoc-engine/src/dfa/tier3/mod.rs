@@ -50,7 +50,7 @@ use crate::{
 
 pub(crate) mod effects;
 
-use super::{DfaCache, DfaMemory, DfaStateId};
+use super::{DfaCache, DfaMemory, DfaStateId, IdleStates};
 use effects as tier3_effects;
 
 // ---------------------------------------------------------------------------
@@ -1646,6 +1646,8 @@ pub(crate) struct Tier3DfaCache {
     stride: usize,
     transitions: Vec<Transition>,
     start_seeds: Box<[(CounterIdx, StateIdx, u32)]>,
+    /// Which DFA states are idle (start state plus dead body states).
+    idle: IdleStates,
 }
 
 impl fmt::Debug for Tier3DfaCache {
@@ -1663,6 +1665,7 @@ impl Tier3DfaCache {
             stride: 256,
             transitions: Vec::new(),
             start_seeds: Box::new([]),
+            idle: IdleStates::new(),
         }
     }
 
@@ -2302,6 +2305,7 @@ impl Tier3DfaCache {
         memory.clear(num_nfa_states);
         self.transitions.clear();
         self.start_seeds = Box::new([]);
+        self.idle.clear();
     }
 
     /// Prepare the cache for `regex`.
@@ -2902,6 +2906,19 @@ fn break_consuming_tails(
 // Tier 3 Matcher
 // ---------------------------------------------------------------------------
 
+/// Number of consecutive prefilter probes over which its effectiveness is
+/// judged (see [`Tier3DfaMatcher::rearm_cooldown`]).
+const PREFILTER_PROBE_WINDOW: u32 = 32;
+
+/// Minimum average number of bytes a prefilter probe must skip for the
+/// prefilter to stay armed.  Below this the bookkeeping around each probe
+/// costs more than stepping the skipped bytes through the DFA.
+const PREFILTER_MIN_AVG_SKIP: u32 = 4;
+
+/// Number of input bytes for which an ineffective prefilter is left
+/// disarmed before it is tried again.
+const PREFILTER_COOLDOWN: usize = 4096;
+
 /// Tier 3 DFA matcher.
 ///
 /// Two instance-tracking strategies are available, selected once at
@@ -3007,6 +3024,42 @@ pub struct Tier3DfaMatcher<'a> {
     /// contaminated.
     clean_nb_trans_slot: Option<usize>,
     prefilter: Prefilter,
+    /// True when the matcher holds exactly the start state's threads, so
+    /// that the next byte may be handled as if the stream began there:
+    /// the DFA state is put back to the start state and, if that byte
+    /// cannot begin a match, the prefilter skips ahead.
+    ///
+    /// Set at construction and whenever the matcher becomes quiescent
+    /// (see [`settle`](Self::settle)); consumed at the next byte.  Nothing
+    /// is rewritten when the flag is set — only when it is consumed — so
+    /// [`finish`](Self::finish) never observes a half-restarted matcher.
+    fresh: bool,
+    /// True when the matcher may become [`fresh`](Self::fresh) again
+    /// mid-stream.  This requires a start state that is the same at every
+    /// input position and owns no counter instance: the start closure has
+    /// no assertions and no counters, and cannot match empty.  Patterns
+    /// that start with a counter are not restartable — their initial state
+    /// carries seeded instances — so their prefilter stays one-shot.
+    restartable: bool,
+    /// `restartable` and a prefilter exists: landing on the start state is
+    /// worth noticing because the prefilter can then skip input.  Without
+    /// a prefilter the start state needs no special handling.
+    rearm: bool,
+    /// Number of probes in the current effectiveness window.
+    prefilter_probes: u32,
+    /// Bytes skipped by the probes of the current window.
+    prefilter_skipped: u32,
+    /// Input bytes still to be stepped through the DFA before the start
+    /// state is watched again.
+    ///
+    /// Re-arming the prefilter pays off when candidates are sparse.  On
+    /// input where most bytes are candidates that fail at once, every
+    /// probe skips nothing and the data-dependent "back at start?" test
+    /// only adds work.  After [`PREFILTER_PROBE_WINDOW`] probes that
+    /// skipped fewer than [`PREFILTER_MIN_AVG_SKIP`] bytes on average,
+    /// the matcher steps the next [`PREFILTER_COOLDOWN`] bytes without
+    /// looking for the start state, then tries again.
+    rearm_cooldown: usize,
     /// Pending effects to resolve at the next byte boundary.
     ///
     /// This buffer is the **read side** of a swap-buffer pair.  At each
@@ -3521,27 +3574,30 @@ impl<'a> Tier3DfaMatcher<'a> {
         }
 
         let ever_matched = cache.inner.start_is_match;
-        let match_at_end = cache.inner.start_is_match_at_end;
         let has_live_instances = !cache.start_seeds.is_empty();
+        let restartable = !regex.start_closure.is_empty()
+            && cache.start_seeds.is_empty()
+            && !cache.inner.start_is_match
+            && !cache.inner.start_is_match_at_end;
+        let rearm = restartable && !matches!(regex.prefilter, Prefilter::None);
 
-        Tier3DfaMatcher {
-            current: cache.inner.start_id,
-            no_break_current: cache.inner.start_id,
-            last_nb_counter_free_mae: cache.inner.start_is_match_at_end,
+        let mut matcher = Tier3DfaMatcher {
+            // The start-state fields below are placeholders: they are set
+            // by `enter_start_state()` and `reset_position()`, the same
+            // code that puts a quiescent matcher back at the start.
+            current: DfaStateId::DEAD,
+            no_break_current: DfaStateId::DEAD,
+            last_nb_counter_free_mae: false,
             use_ranges,
             ever_matched,
-            match_at_end,
+            match_at_end: false,
             has_live_instances,
             post_break_tails: Vec::new(),
             next_post_break_tails: Vec::new(),
-            // The start state may include NFA states from break paths
-            // (the start closure is computed with follow_break=true), but
-            // these are freshly seeded — not from a previous counter break.
-            // Treat the start state as uncontaminated.
             current_has_break_extras: false,
-            clean_nb: cache.inner.start_id,
-            clean_nb_cf_mae: cache.inner.start_is_match_at_end,
-            clean_nb_is_match: cache.inner.start_is_match,
+            clean_nb: DfaStateId::DEAD,
+            clean_nb_cf_mae: false,
+            clean_nb_is_match: false,
             clean_nb_trans_slot: None,
             cache,
             memory,
@@ -3552,6 +3608,12 @@ impl<'a> Tier3DfaMatcher<'a> {
             inst_counters,
             next_instances,
             prefilter: regex.prefilter,
+            fresh: true,
+            restartable,
+            rearm,
+            prefilter_probes: 0,
+            prefilter_skipped: 0,
+            rearm_cooldown: 0,
             pending_effects_current: Vec::new(),
             pending_effects_next: Vec::new(),
             reach_scratch: super::ReachScratch::new(),
@@ -3559,7 +3621,50 @@ impl<'a> Tier3DfaMatcher<'a> {
             resolved_actions: tier3_effects::ResolvedActions::default(),
             tail_seen: vec![0; regex.states.len()],
             tail_epoch: 0,
-        }
+        };
+        matcher.enter_start_state();
+        matcher.reset_position();
+        matcher
+    }
+
+    /// Point the DFA state and the contamination tracking at the start
+    /// state.
+    ///
+    /// Used at construction and when a [`fresh`](Self::fresh) matcher
+    /// consumes its next byte.  In the latter case the matcher already
+    /// holds exactly the start state's threads; this drops dead
+    /// counter-body states from the DFA state and forgets contamination,
+    /// which only describes threads that no longer exist.
+    ///
+    /// Counter instances, tails and pending effects are not touched: at
+    /// construction they hold the start seeds, and a matcher only becomes
+    /// fresh again when all of them are empty.
+    #[inline]
+    fn enter_start_state(&mut self) {
+        let inner = &self.cache.inner;
+        self.current = inner.start_id;
+        // The start state may include NFA states from break paths (the
+        // start closure is computed with follow_break=true), but these
+        // are freshly seeded — not from a previous counter break.  Treat
+        // the start state as uncontaminated.
+        self.current_has_break_extras = false;
+        self.clean_nb = inner.start_id;
+        self.clean_nb_cf_mae = inner.start_is_match_at_end;
+        self.clean_nb_is_match = inner.start_is_match;
+        self.clean_nb_trans_slot = None;
+    }
+
+    /// Give the end-of-input side channels the start state's answers.
+    ///
+    /// Used at construction and when the prefilter skips input: those
+    /// fields describe the last byte stepped through the DFA, which is no
+    /// longer the last byte of the input.
+    #[inline]
+    fn reset_position(&mut self) {
+        let inner = &self.cache.inner;
+        self.no_break_current = inner.start_id;
+        self.last_nb_counter_free_mae = inner.start_is_match_at_end;
+        self.match_at_end = inner.start_is_match_at_end;
     }
 
     step_slow_impl!(step_slow_ranged, ranged_counters, next_ranged);
@@ -3641,62 +3746,170 @@ impl<'a> Tier3DfaMatcher<'a> {
         }
     }
 
+    /// True when no thread is tracked outside the DFA state and the
+    /// counter instances: no post-break tail, no pending effect.
+    #[inline(always)]
+    fn side_channels_empty(&self) -> bool {
+        self.post_break_tails.is_empty()
+            && self.pending_effects_current.is_empty()
+            && self.pending_effects_next.is_empty()
+    }
+
+    /// After a slow step that left no live instance: mark the matcher
+    /// [`fresh`](Self::fresh) if no other thread is live either.
+    ///
+    /// Every thread that entered a counter is tracked by an instance, a
+    /// post-break tail, or a pending effect; with all three empty, only
+    /// counter-free threads remain, and those are exactly the non-body NFA
+    /// states of the current DFA state.  When that set equals the start
+    /// state's (the state is the start state or is
+    /// [idle](super::IdleStates::is_idle)), the matcher is equivalent to a
+    /// new one.
+    ///
+    /// Kept out of line: the caller is the per-byte loop, and this only
+    /// runs on slow steps with no live instance.
+    #[inline(never)]
+    fn settle(&mut self) {
+        debug_assert!(self.restartable && !self.has_live_instances);
+        if self.side_channels_empty()
+            && self.current != DfaStateId::DEAD
+            && (self.current == self.cache.inner.start_id
+                || self
+                    .cache
+                    .idle
+                    .is_idle(&self.cache.inner, self.current, self.regex))
+        {
+            self.fresh = true;
+        }
+    }
+
     #[inline(always)]
     pub fn chunk(&mut self, input: &[u8]) {
         if self.ever_matched {
             return;
         }
 
-        let input = match self.prefilter {
-            Prefilter::None => input,
+        // Dispatch once per chunk so the prefilter is monomorphized into
+        // the scanning loop: a byte-set test for the byte at hand and a
+        // SIMD finder for skipping.  Without a prefilter every byte is a
+        // candidate and the finder is never called.
+        match self.prefilter {
+            Prefilter::None => self.chunk_impl::<false>(input, |_| true, |_| Some(0)),
             Prefilter::Memchr1(b) => {
-                if let Some(idx) = memchr::memchr(b, input) {
-                    self.prefilter = Prefilter::None;
-                    &input[idx..]
-                } else {
-                    return;
-                }
+                self.chunk_impl::<true>(input, |x| x == b, |hay| memchr::memchr(b, hay));
             }
             Prefilter::Memchr2(b1, b2) => {
-                if let Some(idx) = memchr::memchr2(b1, b2, input) {
-                    self.prefilter = Prefilter::None;
-                    &input[idx..]
-                } else {
-                    return;
-                }
+                self.chunk_impl::<true>(
+                    input,
+                    |x| x == b1 || x == b2,
+                    |hay| memchr::memchr2(b1, b2, hay),
+                );
             }
             Prefilter::Memchr3(b1, b2, b3) => {
-                if let Some(idx) = memchr::memchr3(b1, b2, b3, input) {
-                    self.prefilter = Prefilter::None;
-                    &input[idx..]
-                } else {
-                    return;
-                }
+                self.chunk_impl::<true>(
+                    input,
+                    |x| x == b1 || x == b2 || x == b3,
+                    |hay| memchr::memchr3(b1, b2, b3, hay),
+                );
             }
             Prefilter::Memclass(t) => {
-                if let Some(idx) = crate::memclass::memclass(&t, input) {
-                    self.prefilter = Prefilter::None;
-                    &input[idx..]
-                } else {
-                    return;
-                }
+                self.chunk_impl::<true>(
+                    input,
+                    |x| t.contains(x),
+                    |hay| crate::memclass::memclass(&t, hay),
+                );
             }
             Prefilter::Range(lo, hi) => {
-                if let Some(idx) = crate::memrange::memrange(lo, hi, input) {
-                    self.prefilter = Prefilter::None;
-                    &input[idx..]
-                } else {
-                    return;
-                }
+                self.chunk_impl::<true>(
+                    input,
+                    |x| lo <= x && x <= hi,
+                    |hay| crate::memrange::memrange(lo, hi, hay),
+                );
             }
+        }
+    }
+
+    /// Prefilter-integrated scanning loop.
+    ///
+    /// Whenever the matcher is [`fresh`](Self::fresh) — at the start of
+    /// the stream, and again each time it becomes quiescent — the next
+    /// byte is handled from the start state.  If it cannot begin a match
+    /// (`is_candidate`), `finder` skips ahead to the next byte that can;
+    /// testing the byte first keeps input with many failed candidates from
+    /// paying for a finder call that skips nothing.  All other bytes are
+    /// stepped through the DFA normally.
+    ///
+    /// `PREFILTER` is `false` for the instantiation without a prefilter,
+    /// which lets the compiler drop the start-state test from its fast
+    /// path altogether.
+    ///
+    /// Deliberately not `#[inline(always)]`: there is one instantiation
+    /// per prefilter kind, and forcing all of them into the caller (the
+    /// tier dispatcher) measurably slows this loop and the other tiers'.
+    fn chunk_impl<const PREFILTER: bool>(
+        &mut self,
+        input: &[u8],
+        is_candidate: impl Fn(u8) -> bool,
+        finder: impl Fn(&[u8]) -> Option<usize>,
+    ) {
+        let stride = self.cache.stride;
+        let start_id = self.cache.inner.start_id;
+        debug_assert!(PREFILTER || !self.rearm);
+        // Index in `input` from which landing on the start state is
+        // noticed again (see `rearm_cooldown`); never, if the matcher
+        // cannot re-arm.  Folding both into one local keeps the per-byte
+        // test in the fast path down to register compares.
+        let mut rearm_from = if self.rearm {
+            self.rearm_cooldown
+        } else {
+            usize::MAX
         };
 
-        let stride = self.cache.stride;
-
-        for &b in input {
+        let mut i = 0;
+        while i < input.len() {
             if self.ever_matched {
-                return;
+                break;
             }
+            if self.fresh {
+                // Already in an uncontaminated start state (the usual
+                // case after a failed candidate): nothing to rewrite.
+                if self.current != start_id || self.current_has_break_extras {
+                    self.enter_start_state();
+                }
+                let mut skipped = 0;
+                if !is_candidate(input[i]) {
+                    // At least one byte is skipped, so the end-of-input
+                    // answers of the last stepped byte no longer apply.
+                    self.reset_position();
+                    match finder(&input[i..]) {
+                        Some(offset) => skipped = offset,
+                        // No candidate in the rest of this chunk: the
+                        // skipped bytes leave a fresh matcher fresh.
+                        None => break,
+                    }
+                    i += skipped;
+                }
+                self.fresh = false;
+
+                // Judge the prefilter over a window of probes and disarm
+                // it for a while when it is not skipping enough.
+                if self.rearm {
+                    self.prefilter_probes += 1;
+                    self.prefilter_skipped = self
+                        .prefilter_skipped
+                        .saturating_add(skipped.min(u32::MAX as usize) as u32);
+                    if self.prefilter_probes == PREFILTER_PROBE_WINDOW {
+                        if self.prefilter_skipped < PREFILTER_PROBE_WINDOW * PREFILTER_MIN_AVG_SKIP
+                        {
+                            rearm_from = i + PREFILTER_COOLDOWN;
+                        }
+                        self.prefilter_probes = 0;
+                        self.prefilter_skipped = 0;
+                    }
+                }
+            }
+            let b = input[i];
+            i += 1;
             let b_is_word = crate::is_word_byte(b);
 
             // Resolve pending effects from the PREVIOUS step (Bug 26,
@@ -3795,8 +4008,9 @@ impl<'a> Tier3DfaMatcher<'a> {
             {
                 let from_contaminated =
                     self.current_has_break_extras && self.regex.num_counters > 1;
-                self.current = t.no_break;
-                self.no_break_current = t.no_break;
+                let next = t.no_break;
+                self.current = next;
+                self.no_break_current = next;
                 let cf_mae = if from_contaminated {
                     self.clean_nb_cf_mae
                 } else {
@@ -3838,6 +4052,15 @@ impl<'a> Tier3DfaMatcher<'a> {
                         }
                     }
                 }
+                // Back in the start state with no live instance (a
+                // fast-path precondition) and nothing else pending: the
+                // prefilter can take over from the next byte.  The
+                // cooldown test comes first on purpose: it is predictable,
+                // whereas "did this byte land on the start state?" depends
+                // on the input.
+                if PREFILTER && i >= rearm_from && next == start_id && self.side_channels_empty() {
+                    self.fresh = true;
+                }
                 continue;
             }
 
@@ -3865,6 +4088,12 @@ impl<'a> Tier3DfaMatcher<'a> {
                     }
                 }
             }
+            if self.restartable && !self.has_live_instances {
+                self.settle();
+            }
+        }
+        if self.rearm {
+            self.rearm_cooldown = rearm_from.saturating_sub(i);
         }
     }
 
@@ -4264,13 +4493,21 @@ impl fmt::Debug for Tier3DfaMatcher<'_> {
             s.field("is_match_at_end", &state.is_match_at_end);
         }
         s.field("no_break_current", &self.no_break_current)
+            .field("last_nb_counter_free_mae", &self.last_nb_counter_free_mae)
             .field("ever_matched", &self.ever_matched)
             .field("match_at_end", &self.match_at_end)
             .field("has_live_instances", &self.has_live_instances)
+            .field("fresh", &self.fresh)
+            .field("restartable", &self.restartable)
+            .field("rearm", &self.rearm)
+            .field("prefilter_probes", &self.prefilter_probes)
+            .field("prefilter_skipped", &self.prefilter_skipped)
+            .field("rearm_cooldown", &self.rearm_cooldown)
             .field("current_has_break_extras", &self.current_has_break_extras)
             .field("clean_nb", &self.clean_nb)
             .field("clean_nb_cf_mae", &self.clean_nb_cf_mae)
             .field("clean_nb_is_match", &self.clean_nb_is_match)
+            .field("clean_nb_trans_slot", &self.clean_nb_trans_slot)
             .field("post_break_tails_len", &self.post_break_tails.len())
             .field("use_ranges", &self.use_ranges)
             .field(
@@ -4305,12 +4542,13 @@ impl fmt::Display for Tier3DfaMatcher<'_> {
         // Always-show flags (never hidden when false/empty).
         write!(
             f,
-            " matched={} mae={} cf_mae={} break_extras={} live={}",
+            " matched={} mae={} cf_mae={} break_extras={} live={} fresh={}",
             self.ever_matched,
             self.match_at_end,
             self.last_nb_counter_free_mae,
             self.current_has_break_extras,
             self.has_live_instances,
+            self.fresh,
         )?;
         // No-break DFA state (always shown).
         if self.no_break_current == DfaStateId::DEAD {
@@ -4411,5 +4649,442 @@ impl fmt::Display for Tier3DfaMatcher<'_> {
             write!(f, "]")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RegexConfig;
+
+    /// Compile without unrolling so small repetitions keep their counters.
+    fn build(pattern: &str) -> Regex {
+        Regex::with_config(
+            pattern,
+            RegexConfig {
+                max_unroll_states: 0,
+                max_estimated_states: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// Run `f` on a tier-3 matcher for `pattern` that has consumed each
+    /// of `chunks` in turn.
+    fn with_matcher<R>(
+        pattern: &str,
+        chunks: &[&[u8]],
+        f: impl FnOnce(&mut Tier3DfaMatcher) -> R,
+    ) -> R {
+        let re = build(pattern);
+        assert!(re.tier3_eligible, "`{pattern}` must be tier 3 eligible");
+        let analysis = re.tier3_analysis.as_ref().unwrap();
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier3DfaCache::new();
+        cache.prepare(&mut memory, &re, analysis);
+        let mut m = Tier3DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+        for chunk in chunks {
+            m.chunk(chunk);
+        }
+        f(&mut m)
+    }
+
+    /// Debug rendering of the matcher's state, with the prefilter
+    /// effectiveness counters zeroed: they are a heuristic about past
+    /// input, not part of what the matcher will answer.
+    fn state_of(m: &mut Tier3DfaMatcher) -> String {
+        m.prefilter_probes = 0;
+        m.prefilter_skipped = 0;
+        m.rearm_cooldown = 0;
+        format!("{m:?}")
+    }
+
+    /// State of a matcher that has consumed nothing.
+    fn initial_state(pattern: &str) -> String {
+        with_matcher(pattern, &[], state_of)
+    }
+
+    /// Match result for `chunks` on a new tier-3 matcher.
+    fn run(pattern: &str, chunks: &[&[u8]]) -> bool {
+        let re = build(pattern);
+        let analysis = re.tier3_analysis.as_ref().unwrap();
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier3DfaCache::new();
+        cache.prepare(&mut memory, &re, analysis);
+        let mut m = Tier3DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+        for chunk in chunks {
+            m.chunk(chunk);
+        }
+        m.finish()
+    }
+
+    const TWO_GAPS: &str = "foo.{0,5}bar.{0,5}baz";
+
+    // ── Becoming fresh again ──
+
+    #[test]
+    fn test_fresh_after_failed_candidate() {
+        // `f` is a prefilter candidate that leads nowhere.  Mid-candidate
+        // the matcher is busy; once the DFA is back in the start state it
+        // is fresh, and the prefilter skips what follows.
+        with_matcher(TWO_GAPS, &[], |m| {
+            assert!(m.fresh && m.restartable && m.rearm);
+        });
+        with_matcher(TWO_GAPS, &[b"f"], |m| assert!(!m.fresh));
+        with_matcher(TWO_GAPS, &[b"fo"], |m| assert!(!m.fresh));
+        with_matcher(TWO_GAPS, &[b"fx"], |m| assert!(m.fresh));
+        with_matcher(TWO_GAPS, &[b"fxyyyy"], |m| assert!(m.fresh));
+    }
+
+    #[test]
+    fn test_fresh_after_gap_expires() {
+        // First gap open: an instance is live.
+        with_matcher(TWO_GAPS, &[b"fooxx"], |m| {
+            assert!(m.has_live_instances);
+            assert!(!m.fresh);
+        });
+        // Last iteration: the instance is gone, but its break left a
+        // post-break tail waiting for `b`.
+        with_matcher(TWO_GAPS, &[b"fooxxxxx"], |m| {
+            assert!(!m.has_live_instances);
+            assert!(!m.fresh);
+        });
+        // Gap expired.  The dead body state is still in the DFA state —
+        // nothing is rewritten until the next byte arrives — but the
+        // matcher is marked fresh.
+        with_matcher(TWO_GAPS, &[b"fooxxxxxx"], |m| {
+            assert!(!m.has_live_instances);
+            assert_ne!(m.current, m.cache.inner.start_id);
+            assert!(m.fresh);
+        });
+        // The next byte puts the DFA back in the start state.
+        with_matcher(TWO_GAPS, &[b"fooxxxxxxy"], |m| {
+            assert!(m.fresh);
+            assert_eq!(m.current, m.cache.inner.start_id);
+        });
+        // Same after the second gap expires.
+        with_matcher(TWO_GAPS, &[b"fooxbarxxxxxxxxy"], |m| assert!(m.fresh));
+    }
+
+    #[test]
+    fn test_fresh_matcher_equals_initial_state() {
+        // Once the prefilter has skipped input, a fresh matcher is
+        // indistinguishable from a new one.
+        let initial = initial_state(TWO_GAPS);
+        for input in [
+            &b"fxyyyy"[..],
+            b"fooxxxxxxxy",
+            b"fooxbarxxxxxxxxy",
+            b"fofofooxbaxxxxxxxxxxxxfooxxbarxbaxxxxxxxxxxx",
+        ] {
+            let after = with_matcher(TWO_GAPS, &[input], state_of);
+            assert_eq!(after, initial, "input {:?}", String::from_utf8_lossy(input));
+        }
+    }
+
+    #[test]
+    fn test_fresh_waits_for_tails_and_pending_effects() {
+        // The first gap has expired, but `ba` of the second anchor was
+        // consumed in time and lives on as a post-break tail.
+        with_matcher(TWO_GAPS, &[b"fooxxxxba"], |m| {
+            assert!(!m.has_live_instances);
+            assert!(!m.post_break_tails.is_empty());
+            assert!(!m.fresh);
+        });
+        with_matcher(TWO_GAPS, &[b"fooxxxxbay", b"y"], |m| assert!(m.fresh));
+        // A deferred word-boundary assertion keeps the state busy until
+        // it resolves.
+        with_matcher("foo\\b.{0,5}bar", &[b"foo"], |m| assert!(!m.fresh));
+        with_matcher("foo\\b.{0,5}bar", &[b"fooxxxxxxxxxxy"], |m| {
+            assert!(m.fresh)
+        });
+    }
+
+    #[test]
+    fn test_settle_requires_empty_side_channels() {
+        // A tail or a pending effect is a live thread even when the DFA
+        // state looks idle (it may sit on a counter-body state).
+        let pending = tier3_effects::PendingEffect {
+            timing: tier3_effects::EffectTiming::NextByte,
+            guard: tier3_effects::EffectGuard::ALWAYS,
+            atom: tier3_effects::EffectAtom::Match,
+            prev_was_word: false,
+        };
+        with_matcher(TWO_GAPS, &[b"fooxxxxxx"], |m| {
+            // Idle DFA state, nothing live: `settle()` marked it fresh.
+            assert!(m.fresh);
+            assert_ne!(m.current, m.cache.inner.start_id);
+            let idle_state = m.current;
+
+            let body = (0..m.regex.states.len())
+                .find(|&i| m.regex.counter_body_states[i])
+                .expect("pattern has a counter body");
+
+            m.fresh = false;
+            m.post_break_tails.push(StateIdx(body as u32));
+            m.settle();
+            assert!(!m.fresh, "post-break tail");
+            m.post_break_tails.clear();
+
+            m.pending_effects_current.push(pending);
+            m.settle();
+            assert!(!m.fresh, "pending effect (current)");
+            m.pending_effects_current.clear();
+
+            m.pending_effects_next.push(pending);
+            m.settle();
+            assert!(!m.fresh, "pending effect (next)");
+            m.pending_effects_next.clear();
+
+            m.current = DfaStateId::DEAD;
+            m.settle();
+            assert!(!m.fresh, "dead state");
+
+            m.current = idle_state;
+            m.settle();
+            assert!(m.fresh, "idle state, nothing live");
+
+            m.fresh = false;
+            m.current = m.cache.inner.start_id;
+            m.settle();
+            assert!(m.fresh, "start state, nothing live");
+        });
+    }
+
+    #[test]
+    fn test_fast_path_does_not_rearm_with_a_live_tail() {
+        // The DFA fast path can land on the start state while a tail
+        // resolved from a pending effect is still alive.  That tail is a
+        // thread the prefilter knows nothing about, so the matcher must
+        // not be marked fresh.
+        with_matcher(TWO_GAPS, &[b"fx"], |m| {
+            assert!(m.fresh, "plain landing on the start state re-arms");
+            let start_id = m.cache.inner.start_id;
+            // A consuming state outside the start closure that cannot
+            // take `x`: the `b` of the second anchor.
+            let tail = (0..m.regex.states.len() as u32)
+                .map(StateIdx)
+                .find(|&s| {
+                    consume_byte(s, b'b', m.regex).is_some()
+                        && consume_byte(s, b'x', m.regex).is_none()
+                })
+                .expect("pattern has a `b` state");
+
+            m.fresh = false;
+            m.pending_effects_current
+                .push(tier3_effects::PendingEffect {
+                    timing: tier3_effects::EffectTiming::NextByte,
+                    guard: tier3_effects::EffectGuard::ALWAYS,
+                    atom: tier3_effects::EffectAtom::AddTail { origin: tail },
+                    prev_was_word: false,
+                });
+            m.chunk(b"x");
+            assert_eq!(m.current, start_id);
+            assert_eq!(m.post_break_tails, vec![tail]);
+            assert!(!m.fresh);
+        });
+    }
+
+    #[test]
+    fn test_start_state_helpers_reset_every_side_channel() {
+        // `enter_start_state()` and `reset_position()` initialise a new
+        // matcher and put a fresh one back at the start.  Between them
+        // they must restore every field that describes live threads or
+        // the current position, whatever it held before.
+        let initial = initial_state(TWO_GAPS);
+        let after = with_matcher(TWO_GAPS, &[b"fooxxxxxx"], |m| {
+            assert!(m.fresh);
+            m.match_at_end = true;
+            m.last_nb_counter_free_mae = true;
+            m.current_has_break_extras = true;
+            m.clean_nb = m.current;
+            m.clean_nb_cf_mae = true;
+            m.clean_nb_is_match = true;
+            m.clean_nb_trans_slot = Some(0);
+            m.no_break_current = m.current;
+            m.enter_start_state();
+            m.reset_position();
+            state_of(m)
+        });
+        assert_eq!(after, initial);
+
+        // The same through the public path: the fields are scribbled on a
+        // fresh matcher, then one skipped byte must clean all of them.
+        let after = with_matcher(TWO_GAPS, &[b"fooxxxxxx"], |m| {
+            m.match_at_end = true;
+            m.last_nb_counter_free_mae = true;
+            m.current_has_break_extras = true;
+            m.clean_nb_cf_mae = true;
+            m.clean_nb_is_match = true;
+            m.clean_nb_trans_slot = Some(0);
+            m.chunk(b"y");
+            state_of(m)
+        });
+        assert_eq!(after, initial);
+    }
+
+    #[test]
+    fn test_fresh_across_chunk_boundaries() {
+        let initial = initial_state(TWO_GAPS);
+        let input = b"fooxbarxxxxxxxxfxfooxxxxxxxxxxy";
+        for split in 0..=input.len() {
+            let after = with_matcher(TWO_GAPS, &[&input[..split], &input[split..]], state_of);
+            assert_eq!(after, initial, "split at {split}");
+        }
+        // A fresh matcher stays fresh over chunks without a candidate.
+        with_matcher(TWO_GAPS, &[b"xxxx", b"", b"yyyy"], |m| assert!(m.fresh));
+    }
+
+    #[test]
+    fn test_skipped_input_drops_stale_match_at_end() {
+        // `match_at_end` describes the position where the chunk stopped.
+        // If more input follows and is skipped by the prefilter, the flag
+        // must not survive.
+        let pattern = "foo.{0,5}bar$|qux$";
+        assert!(run(pattern, &[b"fooxbar"]));
+        assert!(!run(pattern, &[b"fooxbar", b"z"]));
+        assert!(!run(pattern, &[b"fooxbar", b"zzzzzzzzzzzz"]));
+        assert!(run(pattern, &[b"fooxbar", b"zzzzzzzzzzzz", b"qux"]));
+        assert!(!run(pattern, &[b"qux", b"zzzz"]));
+        assert!(run(pattern, &[b"fooxxxxxxxxxxx", b"zzz", b"foobar"]));
+    }
+
+    // ── Patterns that cannot become fresh again ──
+
+    #[test]
+    fn test_not_restartable_when_start_owns_instances() {
+        // The start closure enters the counter, so the initial state has
+        // seeded instances: the prefilter runs once and is not re-armed.
+        with_matcher("(ab|c){2,9}x", &[], |m| {
+            assert!(m.fresh);
+            assert!(!m.restartable && !m.rearm);
+        });
+        with_matcher("(ab|c){2,9}x", &[b"zzzz"], |m| assert!(m.fresh));
+        with_matcher("(ab|c){2,9}x", &[b"zzabzzzzzzzz"], |m| assert!(!m.fresh));
+    }
+
+    #[test]
+    fn test_not_restartable_when_start_is_position_dependent() {
+        // `^` in the start closure: the start state is only valid at
+        // offset 0.
+        with_matcher("^foo.{0,5}bar|baz.{0,5}qux", &[b"bazxxxxxxxxxxy"], |m| {
+            assert!(!m.restartable && !m.rearm);
+            assert!(!m.fresh);
+        });
+    }
+
+    #[test]
+    fn test_no_prefilter_still_leaves_dead_body_states() {
+        // Too many start bytes for a prefilter: there is nothing to skip,
+        // so landing on the start state needs no handling (`rearm` is
+        // off), but dead counter-body states are still dropped so that
+        // the matcher leaves the counting slow path.
+        let pattern = "[a-z0-9]oo.{0,5}bar.{0,5}baz";
+        with_matcher(pattern, &[], |m| {
+            assert!(matches!(m.prefilter, Prefilter::None));
+            assert!(m.restartable && !m.rearm);
+        });
+        with_matcher(pattern, &[b"aoo!!!!!!"], |m| {
+            assert!(m.fresh);
+            assert_ne!(m.current, m.cache.inner.start_id);
+        });
+        with_matcher(pattern, &[b"aoo!!!!!!!!!!"], |m| {
+            assert!(!m.fresh, "the start state is not re-armed");
+            assert_eq!(m.current, m.cache.inner.start_id);
+        });
+        assert!(run(pattern, &[b"aoo!!!!!!!!!!", b"zoo-bar-baz"]));
+        assert!(!run(pattern, &[b"aoo!!!!!!!!!!", b"bar-baz"]));
+    }
+
+    // ── Prefilter back-off ──
+
+    #[test]
+    fn test_prefilter_backs_off_on_dense_candidates() {
+        // Every other byte is a candidate that fails at once, so each
+        // probe skips nothing.  After one window the matcher stops
+        // watching for the start state.
+        let dense = b"fx".repeat(PREFILTER_PROBE_WINDOW as usize + 8);
+        with_matcher(TWO_GAPS, &[&dense], |m| {
+            assert!(m.rearm_cooldown > 0);
+            assert!(!m.fresh, "back in the start state, but not re-armed");
+            assert_eq!(m.current, m.cache.inner.start_id);
+        });
+
+        // The cooldown is counted in input bytes and survives chunk
+        // boundaries; when it has passed, the prefilter is armed again.
+        let quiet = vec![b'x'; PREFILTER_COOLDOWN];
+        with_matcher(TWO_GAPS, &[&dense, &quiet[..100]], |m| {
+            assert!(m.rearm_cooldown > 0);
+            assert!(!m.fresh);
+        });
+        with_matcher(TWO_GAPS, &[&dense, &quiet[..100], &quiet], |m| {
+            assert_eq!(m.rearm_cooldown, 0);
+            assert!(m.fresh);
+        });
+    }
+
+    #[test]
+    fn test_prefilter_stays_armed_on_sparse_candidates() {
+        // Failed candidates followed by long skips: the prefilter pays.
+        let sparse = b"fxxxxxxxxxxxxxxxxxxxx".repeat(4 * PREFILTER_PROBE_WINDOW as usize);
+        with_matcher(TWO_GAPS, &[&sparse], |m| {
+            assert_eq!(m.rearm_cooldown, 0);
+            assert!(m.fresh);
+        });
+    }
+
+    #[test]
+    fn test_prefilter_back_off_does_not_change_results() {
+        let dense = b"fx".repeat(3 * PREFILTER_PROBE_WINDOW as usize);
+        let mut hit = dense.clone();
+        hit.extend_from_slice(b"fooxbarxbaz");
+        let mut miss = dense.clone();
+        miss.extend_from_slice(b"fooxbarxxxxxxbaz");
+        let mut late = dense.clone();
+        late.extend_from_slice(&vec![b'x'; PREFILTER_COOLDOWN + 50]);
+        late.extend_from_slice(b"foobarbaz");
+
+        for chunk_size in [1, 7, 64, usize::MAX] {
+            let chunked = |input: &[u8]| -> bool {
+                let chunks: Vec<&[u8]> = input.chunks(chunk_size.min(input.len())).collect();
+                run(TWO_GAPS, &chunks)
+            };
+            assert!(chunked(&hit), "chunk size {chunk_size}");
+            assert!(!chunked(&miss), "chunk size {chunk_size}");
+            assert!(chunked(&late), "chunk size {chunk_size}");
+            assert!(!chunked(&dense), "chunk size {chunk_size}");
+        }
+    }
+
+    // ── Cache reuse across regexes ──
+
+    #[test]
+    fn test_idle_table_cleared_when_cache_switches_regex() {
+        // The idle classification is indexed by DFA state id, which means
+        // nothing for another regex.  Stale entries would restart the
+        // second regex in the middle of a match.
+        let first = build(TWO_GAPS);
+        let second = build("fooxxxxxxxxy|a.{0,5}b.{0,5}c");
+        assert!(second.tier3_eligible);
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier3DfaCache::new();
+
+        let analysis = first.tier3_analysis.as_ref().unwrap();
+        cache.prepare(&mut memory, &first, analysis);
+        let mut m = Tier3DfaMatcher::new(&mut cache, &mut memory, &first, analysis);
+        m.chunk(b"fooxxxxxxxxxxxxqq");
+        assert!(!m.finish());
+        assert!(
+            cache.idle.class.contains(&super::super::Idle::Yes),
+            "the first regex reached an idle state"
+        );
+
+        let analysis = second.tier3_analysis.as_ref().unwrap();
+        cache.prepare(&mut memory, &second, analysis);
+        assert!(cache.idle.class.is_empty());
+        let mut m = Tier3DfaMatcher::new(&mut cache, &mut memory, &second, analysis);
+        m.chunk(b"fooxxxxxxxxy");
+        assert!(m.finish());
     }
 }

@@ -77,6 +77,9 @@ rethoc-engine/                      # Library crate (regex engine)
   benches/flamegraph.rs             # Callgrind benchmarks (gungraun harness)
   benches/pathological.rs           # Criterion benchmarks: pathological bounded repetitions
   benches/pathological_profile.rs   # Callgrind profile for pathological patterns
+  benches/reengage.rs               # Criterion benchmarks: prefilter re-engagement streams
+  benches/reengage_profile.rs       # Callgrind regression gate for the same streams
+  benches/common/reengage_cases.rs  # Case table shared by the two re-engagement benches
   tests/                            # (empty — all tests are inline in lib.rs)
 rethoc-cli/                         # Binary crate (CLI tool)
   Cargo.toml
@@ -91,7 +94,8 @@ docs/                               # Design documents and patch plans
 ```
 
 All tests are inline in `rethoc-engine/src/lib.rs` (`#[cfg(test)] mod tests`),
-`rethoc-engine/src/memrange.rs`, `rethoc-engine/src/dfa/tier2/mod.rs`, and
+`rethoc-engine/src/memrange.rs`, `rethoc-engine/src/dfa/mod.rs`,
+`rethoc-engine/src/dfa/tier2/mod.rs`, `rethoc-engine/src/dfa/tier3/mod.rs`, and
 `rethoc-engine/src/hir_optimize.rs`.
 
 ## Architecture
@@ -308,6 +312,38 @@ Two pattern groups:
   (Tier 4 only).  Sizes limited to 256 and 1024 bytes.
 
 HTML reports in `target/criterion/`.
+
+Prefilter re-engagement (streams on which the counting tiers must get
+back to the prefilter or off the counting slow path, streams on which
+re-arming the prefilter cannot pay off, and controls).  The cases live in
+`benches/common/reengage_cases.rs` and are shared by two benches:
+
+```bash
+cargo bench --bench reengage                # Criterion: wall-clock throughput per case
+cargo bench --bench reengage -- tier3_dense_candidates   # one case
+cargo bench --bench reengage_profile        # Callgrind: instruction + mispredict counts
+```
+
+`reengage_profile` is a **regression gate**: the counts are deterministic,
+and the run exits non-zero when a case executes >5% more instructions or
+mispredicts >100% more conditional branches than the baseline (the
+previous run by default).  To compare a branch with `main`:
+
+```bash
+git checkout main   && cargo bench --bench reengage_profile -- --save-baseline=main
+git checkout branch && cargo bench --bench reengage_profile -- --baseline=main
+```
+
+Run it after any change to the Tier 2 / Tier 3 scanning loops or to
+prefilter handling.  It does not see layout effects (for example a loop
+that got slower because of inlining decisions elsewhere); use the
+Criterion bench for those.  A case panics in setup if its pattern no
+longer compiles to the expected tier or if its stream matches.
+
+The callgrind benches (`flamegraph`, `pathological_profile`,
+`reengage_profile`) need `valgrind` and `gungraun-runner` at the version
+of the `gungraun` dev-dependency (`cargo install gungraun-runner --version
+0.20.0`), or `GUNGRAUN_RUNNER` pointing at one.
 
 Rebar (comparative benchmarks against `rust/regex`):
 

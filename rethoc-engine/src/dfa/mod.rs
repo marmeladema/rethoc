@@ -38,7 +38,7 @@ pub(crate) use tier3::{
 };
 pub(crate) use tier4::{Tier4DfaCache, Tier4DfaMatcher};
 
-use crate::{AssertEval, AssertKind, CounterIdx, Regex, State, StateIdx};
+use crate::{AssertEval, AssertKind, ByteMap, CounterIdx, Regex, State, StateIdx};
 
 /// Maximum number of DFA states before the flat transition table stops
 /// growing.  2048 states × stride entries × 4 bytes.
@@ -410,6 +410,213 @@ impl DfaMemory {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Counter-body membership and idle DFA states
+// ---------------------------------------------------------------------------
+
+/// Visit every NFA state of a counter body, starting from `start`
+/// (a `CounterInstance.out`).
+///
+/// The walk follows epsilon and consuming edges alike and stops at the
+/// first `CounterIncrement` on each path — for a pattern without nested
+/// counters that is always the body's own, so neither the continue path
+/// (back into the body) nor the break path (out of it) is followed.  The
+/// `CounterIncrement` itself is not reported.
+///
+/// `visited` must be `states.len()` long.  States already marked are
+/// skipped, so one array can be shared across the bodies of several
+/// counters to keep the total cost linear in the NFA size.
+fn walk_counter_body(
+    states: &[State],
+    byte_tables: &[ByteMap],
+    start: StateIdx,
+    visited: &mut [bool],
+    mut visit: impl FnMut(StateIdx, &State),
+) {
+    let mut stack = vec![start];
+    while let Some(idx) = stack.pop() {
+        let i = idx.idx();
+        if i >= states.len() || visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        let state = &states[i];
+        match *state {
+            State::CounterIncrement { .. } => continue,
+            State::Match => {}
+            State::CounterInstance { out, .. } | State::Assert { out, .. } => stack.push(out),
+            State::Split { out, out1 } => {
+                stack.push(out);
+                stack.push(out1);
+            }
+            State::Byte { out, out_exit, .. }
+            | State::ByteCI { out, out_exit, .. }
+            | State::Wildcard { out, out_exit }
+            | State::ByteClassStatic { out, out_exit, .. }
+            | State::ByteClassCustom { out, out_exit, .. } => {
+                stack.push(out);
+                if out_exit != StateIdx::NONE {
+                    stack.push(out_exit);
+                }
+            }
+            State::ByteTable { table } => {
+                for &succ in &byte_tables[table.idx()].0 {
+                    if succ != StateIdx::NONE {
+                        stack.push(succ);
+                    }
+                }
+            }
+        }
+        visit(idx, state);
+    }
+}
+
+/// True for NFA states that consume an input byte.
+fn is_consuming(state: &State) -> bool {
+    matches!(
+        state,
+        State::Byte { .. }
+            | State::ByteCI { .. }
+            | State::Wildcard { .. }
+            | State::ByteClassStatic { .. }
+            | State::ByteClassCustom { .. }
+            | State::ByteTable { .. }
+    )
+}
+
+/// Mark every NFA state on which a thread can rest inside a counter body.
+///
+/// `result[i]` is `true` iff NFA state `i` is a consuming state or an
+/// assertion on a path from some `CounterInstance.out` to the matching
+/// `CounterIncrement`.  A thread can only sit on such a state while it
+/// owns a counter instance, so when the counter has no live instance a
+/// consuming body state is *dead* even if the cached DFA state still lists
+/// it.  Assertions are marked so that callers can tell whether a deferred
+/// assertion belongs to a body.
+///
+/// Only meaningful for patterns without nested counters (see
+/// [`walk_counter_body`]).
+pub(crate) fn compute_counter_body_states(
+    states: &[State],
+    byte_tables: &[ByteMap],
+) -> Box<[bool]> {
+    let mut body = vec![false; states.len()];
+    let mut visited = vec![false; states.len()];
+    for s in states {
+        if let State::CounterInstance { out, .. } = *s {
+            walk_counter_body(states, byte_tables, out, &mut visited, |idx, state| {
+                if is_consuming(state) || matches!(state, State::Assert { .. }) {
+                    body[idx.idx()] = true;
+                }
+            });
+        }
+    }
+    body.into_boxed_slice()
+}
+
+/// Lazily computed answer to "is this DFA state idle?" — see
+/// [`IdleStates::is_idle`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Idle {
+    /// Not classified yet.
+    Unknown,
+    No,
+    Yes,
+}
+
+/// Per-DFA-state cache of the *idle* classification, owned by the Tier 3
+/// cache alongside its [`DfaCache`].
+///
+/// Tier 3 only needs to know whether a state is equivalent to the start
+/// state, because its DFA state over-approximates the live threads and
+/// cannot be rewritten in general.  Tier 2, whose DFA state is exact,
+/// instead drops dead body states from any state (see
+/// `Tier2DfaCache::settled_state`).
+///
+/// Kept out of [`DfaCache`] on purpose: Tier 1 has no counters and must
+/// not pay for the table in its state-interning path or its cache layout.
+struct IdleStates {
+    /// Indexed by [`DfaStateId`]; grown on demand, so states interned
+    /// since the last query read as [`Idle::Unknown`].
+    class: Vec<Idle>,
+}
+
+impl IdleStates {
+    fn new() -> Self {
+        Self { class: Vec::new() }
+    }
+
+    /// Forget every classification (the DFA cache is being rebuilt).
+    #[inline]
+    fn clear(&mut self) {
+        self.class.clear();
+    }
+
+    /// Returns `true` if DFA state `id` of `cache` is *idle*: it differs
+    /// from the start state only by NFA states that sit inside counter
+    /// bodies.
+    ///
+    /// The counting tiers keep a counter's body states in the DFA state for
+    /// as long as the input keeps matching the body, whether or not any
+    /// counter instance is still alive.  Once the caller knows that no
+    /// counter instance (and no other side-channel thread) is live, those
+    /// body states carry no NFA thread, so an idle state is equivalent to
+    /// the start state and the matcher may return to it — which is what
+    /// lets the prefilter take over again.
+    ///
+    /// Precisely, the state is idle when all of the following hold:
+    ///
+    /// - The start closure is free of counters and assertions
+    ///   ([`Regex::start_closure`] is non-empty), so the start state is the
+    ///   same at every input position and owns no counter instance.
+    /// - Neither state is a match, a match-at-end, or has deferred
+    ///   assertions (a deferred assertion is a parked thread).
+    /// - Dropping the counter-body states from `id` leaves exactly the
+    ///   start state's NFA set.
+    ///
+    /// The start state itself is not reported as idle: there is nothing to
+    /// return to.  The answer is cached per state.
+    #[inline]
+    fn is_idle(&mut self, cache: &DfaCache, id: DfaStateId, regex: &Regex) -> bool {
+        match self.class.get(id.idx()) {
+            Some(Idle::Yes) => true,
+            Some(Idle::No) => false,
+            Some(Idle::Unknown) | None => self.classify(cache, id, regex),
+        }
+    }
+
+    #[cold]
+    fn classify(&mut self, cache: &DfaCache, id: DfaStateId, regex: &Regex) -> bool {
+        if self.class.len() < cache.states.len() {
+            self.class.resize(cache.states.len(), Idle::Unknown);
+        }
+        let idle = Self::compute(cache, id, regex);
+        self.class[id.idx()] = if idle { Idle::Yes } else { Idle::No };
+        idle
+    }
+
+    fn compute(cache: &DfaCache, id: DfaStateId, regex: &Regex) -> bool {
+        if id == cache.start_id || cache.start_id == DfaStateId::DEAD {
+            return false;
+        }
+        let body = &regex.counter_body_states;
+        if regex.start_closure.is_empty() || body.is_empty() {
+            return false;
+        }
+        let start = &cache.states[cache.start_id.idx()];
+        let state = &cache.states[id.idx()];
+        let plain =
+            |s: &DfaState| !s.is_match && !s.is_match_at_end && s.deferred_asserts.is_empty();
+        plain(start)
+            && plain(state)
+            && state
+                .nfa_states
+                .iter()
+                .filter(|s| !body[s.idx()])
+                .eq(start.nfa_states.iter())
+    }
+}
+
 struct DfaCache {
     states: IndexSet<DfaState, ahash::RandomState>,
     regex_id: u64,
@@ -527,6 +734,300 @@ mod tests {
             is_match_at_end,
             prev_was_word,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Counter-body membership and idle states
+    // -----------------------------------------------------------------------
+
+    /// Compile with unrolling disabled so that small repetitions keep
+    /// their counters.
+    fn build_counting(pattern: &str) -> Regex {
+        Regex::with_config(
+            pattern,
+            crate::RegexConfig {
+                max_unroll_states: 0,
+                max_estimated_states: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .expect("pattern should compile")
+    }
+
+    /// NFA indices of the consuming states that accept `byte`.
+    fn states_accepting(re: &Regex, byte: u8) -> Vec<u32> {
+        (0..re.states.len() as u32)
+            .filter(|&i| match re.states[StateIdx(i)] {
+                State::Byte { byte: b, .. } => b == byte,
+                State::ByteCI { byte: b, .. } => b == byte || b ^ 0x20 == byte,
+                State::Wildcard { .. } => true,
+                State::ByteClassStatic { table, .. } => table[byte as usize],
+                State::ByteClassCustom { class, .. } => re.classes[class.idx()].contains(byte),
+                State::ByteTable { table } => {
+                    re.byte_tables[table.idx()].0[byte as usize] != StateIdx::NONE
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Indices marked as counter-body states.
+    fn body_indices(re: &Regex) -> Vec<u32> {
+        (0..re.counter_body_states.len() as u32)
+            .filter(|&i| re.counter_body_states[i as usize])
+            .collect()
+    }
+
+    #[test]
+    fn test_counter_body_states_single_byte_body() {
+        // Only the `.` inside the repetition is a body state: the anchors
+        // on either side are not.
+        let re = build_counting("foo.{0,5}bar");
+        assert_eq!(re.counter_body_states.len(), re.states.len());
+        let body = body_indices(&re);
+        assert_eq!(body.len(), 1, "exactly one body state: {body:?}");
+        assert!(matches!(
+            re.states[StateIdx(body[0])],
+            State::Wildcard { .. }
+        ));
+        for b in *b"fobar" {
+            for i in states_accepting(&re, b) {
+                assert_eq!(
+                    re.counter_body_states[i as usize],
+                    body.contains(&i),
+                    "state {i} accepting {:?}",
+                    b as char
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_counter_body_states_multi_byte_and_alternation_body() {
+        // Every consuming state of the body is marked, including interior
+        // positions and both alternation branches; `x` and `y` are not.
+        let re = build_counting("x(ab|cd){2,9}y");
+        let body = body_indices(&re);
+        for b in *b"abcd" {
+            let accepting = states_accepting(&re, b);
+            assert!(!accepting.is_empty());
+            for i in accepting {
+                assert!(
+                    body.contains(&i),
+                    "state {i} ({:?}) is in the body",
+                    b as char
+                );
+            }
+        }
+        for b in *b"xy" {
+            for i in states_accepting(&re, b) {
+                assert!(!body.contains(&i), "state {i} ({:?}) is outside", b as char);
+            }
+        }
+    }
+
+    #[test]
+    fn test_counter_body_states_two_counters() {
+        // Both bodies are marked; the literal between them is not.
+        let re = build_counting("a[0-9]{2,7}b[x-z]{3,8}c");
+        let body = body_indices(&re);
+        assert_eq!(body.len(), 2, "one body state per counter: {body:?}");
+        for b in *b"5y" {
+            for i in states_accepting(&re, b) {
+                assert!(body.contains(&i));
+            }
+        }
+        for b in *b"abc" {
+            for i in states_accepting(&re, b) {
+                assert!(!body.contains(&i));
+            }
+        }
+    }
+
+    #[test]
+    fn test_counter_body_states_marks_assertions_in_bodies() {
+        // An assertion between the body byte and the increment is part of
+        // the body: a thread can be parked on it.  The leading `\b` is
+        // outside.
+        let re = build_counting("\\bx(a\\b){2,6}y");
+        let asserts: Vec<u32> = (0..re.states.len() as u32)
+            .filter(|&i| matches!(re.states[StateIdx(i)], State::Assert { .. }))
+            .collect();
+        assert_eq!(asserts.len(), 2, "two word-boundary assertions");
+        let marked: Vec<bool> = asserts
+            .iter()
+            .map(|&i| re.counter_body_states[i as usize])
+            .collect();
+        assert_eq!(marked.iter().filter(|&&m| m).count(), 1);
+        // The body byte is marked, the anchors are not.
+        for i in states_accepting(&re, b'a') {
+            assert!(re.counter_body_states[i as usize]);
+        }
+        for b in *b"xy" {
+            for i in states_accepting(&re, b) {
+                assert!(!re.counter_body_states[i as usize]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_counter_body_states_empty_without_flat_counters() {
+        // No counters at all.
+        assert!(build_counting("foobar").counter_body_states.is_empty());
+        // Nested counters: the table is not computed (tiers 2 and 3 are
+        // not eligible, and the walk assumes flat bodies).
+        let nested = build_counting("(a{2,5}b){3,7}c");
+        assert!(!nested.tier2_eligible && !nested.tier3_eligible);
+        assert!(nested.counter_body_states.is_empty());
+    }
+
+    /// Build a [`DfaCache`] whose start state is `re`'s start closure,
+    /// with an empty idle table.
+    fn cache_with_start(re: &Regex) -> (DfaCache, IdleStates, Vec<StateIdx>) {
+        let mut start: Vec<StateIdx> = re.start_closure.to_vec();
+        start.sort_unstable();
+        let mut cache = DfaCache::new();
+        cache.start_id = cache
+            .intern_state(&start, &[], false, false, false, || {})
+            .expect("start state fits");
+        (cache, IdleStates::new(), start)
+    }
+
+    /// `base` plus `extra`, sorted (the DFA state key order).
+    fn with_states(base: &[StateIdx], extra: &[u32]) -> Vec<StateIdx> {
+        let mut v = base.to_vec();
+        v.extend(extra.iter().map(|&i| StateIdx(i)));
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    #[test]
+    fn test_is_idle_start_plus_body_states() {
+        let re = build_counting("foo.{0,5}bar");
+        let (mut cache, mut idle, start) = cache_with_start(&re);
+        let body = body_indices(&re);
+        let other = states_accepting(&re, b'r');
+
+        // The start state itself: nothing to return to.
+        assert!(!idle.is_idle(&cache, cache.start_id, &re));
+
+        // Start + dead body state: idle.
+        let s = with_states(&start, &body);
+        let id = cache
+            .intern_state(&s, &[], false, false, false, || {})
+            .unwrap();
+        assert!(idle.is_idle(&cache, id, &re));
+        // Cached answer is stable.
+        assert!(idle.is_idle(&cache, id, &re));
+        assert_eq!(idle.class[id.idx()], Idle::Yes);
+
+        // Start + body + a live non-body thread: not idle.
+        let s = with_states(&with_states(&start, &body), &other);
+        let id = cache
+            .intern_state(&s, &[], false, false, false, || {})
+            .unwrap();
+        assert!(!idle.is_idle(&cache, id, &re));
+        assert_eq!(idle.class[id.idx()], Idle::No);
+
+        // Body state only (start threads missing): not idle.
+        let s = with_states(&[], &body);
+        let id = cache
+            .intern_state(&s, &[], false, false, false, || {})
+            .unwrap();
+        assert!(!idle.is_idle(&cache, id, &re));
+    }
+
+    #[test]
+    fn test_is_idle_rejects_flags_and_deferred_asserts() {
+        let re = build_counting("foo.{0,5}bar");
+        let (mut cache, mut idle, start) = cache_with_start(&re);
+        let s = with_states(&start, &body_indices(&re));
+
+        // A match-at-end state still has something to report.
+        let id = cache
+            .intern_state(&s, &[], false, true, false, || {})
+            .unwrap();
+        assert!(!idle.is_idle(&cache, id, &re));
+        // So does a match state.
+        let id = cache
+            .intern_state(&s, &[], true, false, false, || {})
+            .unwrap();
+        assert!(!idle.is_idle(&cache, id, &re));
+        // A deferred assertion is a parked thread.
+        let parked = [StateIdx(0)];
+        let id = cache
+            .intern_state(&s, &parked, false, false, true, || {})
+            .unwrap();
+        assert!(!idle.is_idle(&cache, id, &re));
+    }
+
+    #[test]
+    fn test_is_idle_requires_context_free_start() {
+        // `^` in the start closure: the start state is only valid at
+        // offset 0, so no state is ever idle.
+        let re = build_counting("^foo.{0,5}bar|baz.{0,5}qux");
+        assert!(re.start_closure.is_empty());
+        let mut cache = DfaCache::new();
+        let mut idle = IdleStates::new();
+        let start: Vec<StateIdx> = states_accepting(&re, b'f')
+            .into_iter()
+            .chain(states_accepting(&re, b'b'))
+            .map(StateIdx)
+            .collect();
+        let start = with_states(&start, &[]);
+        cache.start_id = cache
+            .intern_state(&start, &[], false, false, false, || {})
+            .unwrap();
+        let s = with_states(&start, &body_indices(&re));
+        let id = cache
+            .intern_state(&s, &[], false, false, false, || {})
+            .unwrap();
+        assert!(!idle.is_idle(&cache, id, &re));
+
+        // Counter in the start closure: the start state owns instances.
+        let re = build_counting("a{2,9}b");
+        assert!(re.start_closure.is_empty());
+        let mut cache = DfaCache::new();
+        let mut idle = IdleStates::new();
+        let body: Vec<StateIdx> = body_indices(&re).into_iter().map(StateIdx).collect();
+        cache.start_id = cache
+            .intern_state(&body, &[], false, false, false, || {})
+            .unwrap();
+        let s = with_states(&body, &states_accepting(&re, b'b'));
+        let id = cache
+            .intern_state(&s, &[], false, false, false, || {})
+            .unwrap();
+        assert!(!idle.is_idle(&cache, id, &re));
+    }
+
+    #[test]
+    fn test_idle_table_grows_on_demand_and_clears() {
+        let re = build_counting("foo.{0,5}bar");
+        let (mut cache, mut idle, start) = cache_with_start(&re);
+        // Nothing is classified until the first query.
+        assert!(idle.class.is_empty());
+        let s = with_states(&start, &body_indices(&re));
+        let id = cache
+            .intern_state(&s, &[], false, false, false, || {})
+            .unwrap();
+        assert!(idle.is_idle(&cache, id, &re));
+        assert_eq!(idle.class.len(), cache.states.len());
+        assert_eq!(idle.class[cache.start_id.idx()], Idle::Unknown);
+
+        // A state interned after the table was sized is classified too.
+        let other = with_states(&s, &states_accepting(&re, b'r'));
+        let later = cache
+            .intern_state(&other, &[], false, false, false, || {})
+            .unwrap();
+        assert!(later.idx() >= idle.class.len());
+        assert!(!idle.is_idle(&cache, later, &re));
+        assert_eq!(idle.class[later.idx()], Idle::No);
+        assert!(idle.is_idle(&cache, id, &re), "earlier answers are kept");
+
+        idle.clear();
+        assert!(idle.class.is_empty());
+        assert!(idle.is_idle(&cache, id, &re), "recomputed after clear");
     }
 
     // -----------------------------------------------------------------------
