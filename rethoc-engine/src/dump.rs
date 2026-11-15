@@ -461,6 +461,21 @@ impl fmt::Display for DumpRegex<'_> {
             writeln!(f, "]")?;
         }
 
+        if !r.counter_body_states.is_empty() {
+            write!(f, "  counter_body_states: [")?;
+            for (i, &v) in r.counter_body_states.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                if v {
+                    write!(f, "{i}")?;
+                } else {
+                    write!(f, ".")?;
+                }
+            }
+            writeln!(f, "]")?;
+        }
+
         // -- DFA Analysis (optional) ------------------------------------------
         if self.dfa {
             self.fmt_dfa_analysis(f)?;

@@ -367,48 +367,12 @@ pub(crate) fn compute_tier2_analysis(
             // states through their successors, to find all consuming
             // states.
             let mut all_body_consuming: Vec<u32> = Vec::new();
-            let mut stack: Vec<StateIdx> = vec![*out];
             let mut visited = vec![false; states.len()];
-            while let Some(idx) = stack.pop() {
-                let i = idx.idx();
-                if visited[i] {
-                    continue;
+            super::walk_counter_body(states, byte_tables, *out, &mut visited, |idx, state| {
+                if super::is_consuming(state) {
+                    all_body_consuming.push(idx.0);
                 }
-                visited[i] = true;
-                match states[idx] {
-                    State::CounterIncrement { counter: c, .. } if c == *counter => {
-                        // End of body for this counter — don't follow further.
-                    }
-                    State::Split { out, out1 } => {
-                        stack.push(out1);
-                        stack.push(out);
-                    }
-                    State::Assert { out, .. } | State::CounterInstance { out, .. } => {
-                        stack.push(out);
-                    }
-                    State::Byte { out, out_exit, .. }
-                    | State::ByteCI { out, out_exit, .. }
-                    | State::Wildcard { out, out_exit }
-                    | State::ByteClassStatic { out, out_exit, .. }
-                    | State::ByteClassCustom { out, out_exit, .. } => {
-                        all_body_consuming.push(idx.0);
-                        // Follow through the successor to find more body states.
-                        stack.push(out);
-                        if out_exit != StateIdx::NONE {
-                            stack.push(out_exit);
-                        }
-                    }
-                    State::ByteTable { table } => {
-                        all_body_consuming.push(idx.0);
-                        for &succ in byte_tables[table.idx()].0.iter() {
-                            if succ != StateIdx::NONE {
-                                stack.push(succ);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            });
 
             // Interior = all body consuming states minus the first states.
             let mut interior: Vec<u32> = all_body_consuming
@@ -725,6 +689,19 @@ pub(crate) struct Tier2DfaCache {
     start_seeds: Box<[(CounterIdx, u32)]>,
     /// Runtime state for all differential counters.
     counters: CounterState,
+    /// Cached transitions out of the DEAD state, one per byte class
+    /// (`stride` entries).  The DEAD state has no row in
+    /// [`transitions`](Self::transitions); without this cache every byte
+    /// consumed while dead would recompute the restart closure.
+    dead_transitions: Vec<Transition>,
+    /// Per DFA state: the state to continue from once no counter instance
+    /// is live — the same state without its counter-body NFA states (see
+    /// [`settled_state`](Self::settled_state)).  Grown on demand;
+    /// [`DfaStateId::UNPOPULATED`] marks entries not computed yet.
+    settled: Vec<DfaStateId>,
+    /// Whether [`settled_state`](Self::settled_state) may be used for the
+    /// prepared regex.  Computed once in [`prepare`](Self::prepare).
+    settle_enabled: bool,
 }
 
 impl fmt::Debug for Tier2DfaCache {
@@ -743,6 +720,9 @@ impl Tier2DfaCache {
             transitions: Vec::new(),
             start_seeds: Box::new([]),
             counters: CounterState::new(),
+            dead_transitions: Vec::new(),
+            settled: Vec::new(),
+            settle_enabled: false,
         }
     }
 
@@ -1204,6 +1184,91 @@ impl Tier2DfaCache {
         mask
     }
 
+    /// The DFA state to continue from when no counter instance is live:
+    /// `id` without its counter-body NFA states.
+    ///
+    /// A thread can only sit inside a counter body while it owns a counter
+    /// instance.  The DFA state nevertheless keeps listing a counter's
+    /// body states for as long as the input matches the body, so once the
+    /// last instance is gone those states are dead weight: they keep every
+    /// transition on the counting slow path and keep the state different
+    /// from the start state, which stops the prefilter from re-engaging.
+    /// Dropping them leaves exactly the live threads; match flags and
+    /// deferred assertions (parked threads outside any body) are kept.
+    ///
+    /// Returns `id` itself when there is nothing to drop, when dropping
+    /// would leave no thread at all (the DEAD state is not worth entering:
+    /// it recomputes its transition on every byte), or when the state cap
+    /// leaves no room for the result.  Cached per state.
+    ///
+    /// Must only be called when [`settle_enabled`](Self::settle_enabled).
+    #[inline]
+    fn settled_state(&mut self, id: DfaStateId, regex: &Regex) -> DfaStateId {
+        match self.settled.get(id.idx()) {
+            Some(&s) if s != DfaStateId::UNPOPULATED => s,
+            _ => self.compute_settled(id, regex),
+        }
+    }
+
+    #[cold]
+    fn compute_settled(&mut self, id: DfaStateId, regex: &Regex) -> DfaStateId {
+        debug_assert!(self.settle_enabled);
+        let target = self.without_body_states(id, regex).unwrap_or(id);
+        if self.settled.len() < self.inner.states.len() {
+            self.settled
+                .resize(self.inner.states.len(), DfaStateId::UNPOPULATED);
+        }
+        self.settled[id.idx()] = target;
+        // The result has no body states left, so it settles to itself.
+        self.settled[target.idx()] = target;
+        target
+    }
+
+    /// Intern the state `id` minus its counter-body NFA states.  `None`
+    /// when `id` has none, when nothing would remain, or when the state
+    /// cap is reached.
+    fn without_body_states(&mut self, id: DfaStateId, regex: &Regex) -> Option<DfaStateId> {
+        let body = &regex.counter_body_states;
+        let state = &self.inner.states[id.idx()];
+        if !state.nfa_states.iter().any(|s| body[s.idx()]) {
+            return None;
+        }
+        let nfa: Vec<StateIdx> = state
+            .nfa_states
+            .iter()
+            .copied()
+            .filter(|s| !body[s.idx()])
+            .collect();
+        let deferred = state.deferred_asserts.clone();
+        let (is_match, is_match_at_end, prev_was_word) =
+            (state.is_match, state.is_match_at_end, state.prev_was_word);
+        if nfa.is_empty() && deferred.is_empty() && !is_match && !is_match_at_end {
+            return None;
+        }
+        self.intern_state(&nfa, &deferred, is_match, is_match_at_end, prev_was_word)
+    }
+
+    /// Whether dead counter-body states may be dropped for `regex`.
+    ///
+    /// Two classes of pattern are excluded because the "body thread ⇒ live
+    /// instance" argument does not carry over to them unchanged:
+    ///
+    /// - **Overlap-proven patterns.**  Their Tier 2 eligibility rests on a
+    ///   proof over the DFA states reachable by ordinary transitions;
+    ///   states produced by dropping body states are outside that set.
+    /// - **Assertions inside a counter body.**  A thread parked on a
+    ///   deferred body assertion has its instance cleared and re-seeded by
+    ///   `populate()`, so instance liveness is not exact for these bodies.
+    fn can_settle(regex: &Regex) -> bool {
+        !regex.counter_body_states.is_empty()
+            && !regex.tier2_overlap_proven
+            && !regex
+                .states
+                .iter()
+                .zip(regex.counter_body_states.iter())
+                .any(|(state, &in_body)| in_body && matches!(state, State::Assert { .. }))
+    }
+
     fn intern_closure_result(&mut self, cr: &ClosureResult, byte: u8) -> DfaStateId {
         if cr.nfa_states.is_empty()
             && cr.deferred_asserts.is_empty()
@@ -1243,6 +1308,10 @@ impl Tier2DfaCache {
         self.transitions.clear();
         self.start_seeds = Box::new([]);
         self.counters.clear();
+        self.dead_transitions.clear();
+        self.dead_transitions.resize_with(stride, Transition::empty);
+        self.settled.clear();
+        self.settle_enabled = false;
     }
 
     #[inline]
@@ -1258,6 +1327,7 @@ impl Tier2DfaCache {
         }
         self.clear(memory, regex.states.len(), regex.num_byte_classes);
         self.inner.regex_id = id;
+        self.settle_enabled = Self::can_settle(regex);
 
         let cr = self.epsilon_closure(
             memory,
@@ -1464,6 +1534,10 @@ pub struct Tier2DfaMatcher<'a> {
     ever_matched: bool,
     match_at_end: bool,
     has_live_counters: bool,
+    /// Copy of [`Tier2DfaCache::settle_enabled`]: whether dead
+    /// counter-body states may be dropped from the DFA state once no
+    /// instance is live.
+    settle: bool,
     prefilter: Prefilter,
 }
 
@@ -1563,6 +1637,7 @@ impl<'a> Tier2DfaMatcher<'a> {
             ever_matched: cache.inner.start_is_match,
             match_at_end: cache.inner.start_is_match_at_end,
             has_live_counters: has_live,
+            settle: cache.settle_enabled,
             cache,
             memory,
             regex,
@@ -1699,6 +1774,16 @@ impl<'a> Tier2DfaMatcher<'a> {
 
         // Update has_live_counters flag.
         self.has_live_counters = self.cache.counters.has_live();
+
+        // With no live instance left, counter-body NFA states still
+        // listed in the successor carry no thread: continue from the same
+        // state without them, so that later transitions stop counting and
+        // — back in the start state — the prefilter can re-engage.
+        // `match_at_end` is left alone: the settled state keeps the match
+        // flags, and the flag set above describes this position.
+        if self.settle && !self.has_live_counters && self.current != DfaStateId::DEAD {
+            self.current = self.cache.settled_state(self.current, self.regex);
+        }
     }
 
     fn step_from_dead(&mut self, byte: u8) {
@@ -1708,14 +1793,32 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
         self.match_at_end = false;
 
-        let trans = self.cache.populate(
-            self.memory,
-            DfaStateId::DEAD,
-            byte,
-            self.regex,
-            self.analysis,
-        );
+        // The transition out of DEAD depends only on the byte (the
+        // restart closure with that byte as predecessor), so it is cached
+        // per byte class like any other transition.
+        let class = if self.cache.stride == 256 {
+            byte as usize
+        } else {
+            self.regex.byte_classes[byte as usize] as usize
+        };
+        if self.cache.dead_transitions[class].no_break == DfaStateId::UNPOPULATED {
+            let trans = self.cache.populate(
+                self.memory,
+                DfaStateId::DEAD,
+                byte,
+                self.regex,
+                self.analysis,
+            );
+            self.cache.dead_transitions[class] = trans;
+        }
+        let trans = &self.cache.dead_transitions[class];
         self.current = trans.no_break;
+
+        // Still dead and nothing seeded: no counter state to maintain.
+        // The phase clock only matters relative to live instances.
+        if trans.no_break == DfaStateId::DEAD && trans.seeds.is_empty() {
+            return;
+        }
 
         if trans.counting_mask == 0 {
             if trans.no_break_is_match {
@@ -1733,7 +1836,6 @@ impl<'a> Tier2DfaMatcher<'a> {
         self.cache.counters.advance_all_phases();
 
         // Seed with phase-aware placement.
-        // `trans` is an owned local — no borrow conflict with cache.
         for &(counter, initial_value) in trans.seeds.iter() {
             let c_idx = counter.idx();
             if c_idx < self.cache.counters.meta.len() {
@@ -1888,7 +1990,8 @@ impl fmt::Debug for Tier2DfaMatcher<'_> {
         }
         s.field("ever_matched", &self.ever_matched)
             .field("match_at_end", &self.match_at_end)
-            .field("has_live_counters", &self.has_live_counters);
+            .field("has_live_counters", &self.has_live_counters)
+            .field("settle", &self.settle);
         s.finish()
     }
 }
@@ -1978,6 +2081,361 @@ mod tests {
         let mut m = mem.matcher_for_tier(re, 2).unwrap();
         m.chunk(input);
         m.finish()
+    }
+
+    // ── Dropping dead counter-body states ──
+
+    /// Run `f` on a tier-2 matcher for `pattern` (compiled without
+    /// unrolling) that has consumed `input`.
+    fn with_matcher<R>(pattern: &str, input: &[u8], f: impl FnOnce(&Tier2DfaMatcher) -> R) -> R {
+        let re = build(pattern);
+        assert!(re.tier2_eligible, "`{pattern}` must be tier 2 eligible");
+        let analysis = re.tier2_analysis.as_ref().unwrap();
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier2DfaCache::new();
+        cache.prepare(&mut memory, &re, analysis);
+        let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+        m.chunk(input);
+        f(&m)
+    }
+
+    /// True if the matcher sits in the start state with no live counter —
+    /// the exact condition under which `chunk_prefilter` skips input.
+    fn at_start(m: &Tier2DfaMatcher) -> bool {
+        m.current == m.cache.inner.start_id && !m.has_live_counters
+    }
+
+    /// True if the matcher's DFA state lists a counter-body NFA state.
+    fn has_body_state(m: &Tier2DfaMatcher) -> bool {
+        m.current != DfaStateId::DEAD
+            && m.cache.inner.states[m.current.idx()]
+                .nfa_states
+                .iter()
+                .any(|s| m.regex.counter_body_states[s.idx()])
+    }
+
+    #[test]
+    fn test_settle_after_gap_expires() {
+        // While the gap is open the counter is live.
+        with_matcher("foo.{0,5}bar", b"fooxxx", |m| {
+            assert!(m.settle);
+            assert!(m.has_live_counters);
+            assert!(has_body_state(m));
+            assert!(!at_start(m));
+        });
+        // One byte past the bound the last instance is gone, and the dead
+        // body state must not keep the DFA away from the start state.
+        with_matcher("foo.{0,5}bar", b"fooxxxxxx", |m| assert!(at_start(m)));
+        with_matcher("foo.{0,5}bar", b"fooxxxxxxxxxxxxxxxx", |m| {
+            assert!(at_start(m))
+        });
+        // Exactly at the bound the instance can still break.
+        with_matcher("foo.{0,5}bar", b"fooxxxxx", |m| assert!(!at_start(m)));
+    }
+
+    #[test]
+    fn test_settle_keeps_live_threads() {
+        // The gap has expired but `ba` of the second anchor was consumed
+        // in time.  The dead body state is dropped at once; the live
+        // thread stays, so the state is not the start state yet.
+        with_matcher("foo.{0,5}bar", b"fooxxxxba", |m| {
+            assert!(!m.has_live_counters);
+            assert!(!has_body_state(m));
+            assert!(!at_start(m));
+        });
+        // The thread still completes the match...
+        let re = build("foo.{0,5}bar");
+        let mut mem = MatcherMemory::default();
+        assert!(match_tier2(&mut mem, &re, b"fooxxxxbar"));
+        // ...and once it dies the matcher is back at the start state.
+        with_matcher("foo.{0,5}bar", b"fooxxxxbaz", |m| assert!(at_start(m)));
+        // A new anchor prefix after expiry is an ordinary DFA state.
+        with_matcher("foo.{0,5}bar", b"fooxxxxxxxxfo", |m| {
+            assert!(!at_start(m));
+            assert!(!has_body_state(m));
+        });
+    }
+
+    #[test]
+    fn test_settle_multi_byte_body() {
+        // Dead interior body states of a two-byte body.
+        with_matcher("x(ab){2,4}y", b"xababab", |m| assert!(m.has_live_counters));
+        with_matcher("x(ab){2,4}y", b"xababababab", |m| assert!(at_start(m)));
+        with_matcher("x(ab){2,4}y", b"xabababababababab", |m| {
+            assert!(at_start(m))
+        });
+    }
+
+    #[test]
+    fn test_settle_is_chunking_independent() {
+        let re = build("foo.{0,5}bar");
+        let analysis = re.tier2_analysis.as_ref().unwrap();
+        let input = b"fooxxxxxxxxfoxfooxbaxxxxxxxxxxfoo";
+        for split in 0..=input.len() {
+            let mut memory = DfaMemory::default();
+            let mut cache = Tier2DfaCache::new();
+            cache.prepare(&mut memory, &re, analysis);
+            let mut whole = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+            whole.chunk(input);
+            let expected = (whole.current, whole.has_live_counters, whole.match_at_end);
+
+            let mut memory = DfaMemory::default();
+            let mut cache = Tier2DfaCache::new();
+            cache.prepare(&mut memory, &re, analysis);
+            let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+            m.chunk(&input[..split]);
+            m.chunk(&input[split..]);
+            assert_eq!(
+                (m.current, m.has_live_counters, m.match_at_end),
+                expected,
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_settle_with_position_dependent_start() {
+        // `^` makes the start state valid only at offset 0.  After the
+        // gap of the second branch expires the dead body state is dropped,
+        // but the result is not — and must not be — the start state.
+        let pattern = "^foo[a-e]{0,5}bar|qux[0-9]{0,5}z";
+        with_matcher(pattern, b"qux1234567890", |m| {
+            assert!(m.settle);
+            assert!(!m.has_live_counters);
+            assert!(!has_body_state(m));
+            assert_ne!(m.current, m.cache.inner.start_id);
+        });
+        let re = build(pattern);
+        let mut mem = MatcherMemory::default();
+        assert!(!match_tier2(&mut mem, &re, b"qux1234567890foobar"));
+        assert!(match_tier2(&mut mem, &re, b"qux1234567890qux12z"));
+        assert!(match_tier2(&mut mem, &re, b"fooabcbar"));
+    }
+
+    #[test]
+    fn test_settle_keeps_deferred_assertions_outside_bodies() {
+        // A leading `\b` is re-parked in the DFA state on every byte.  It
+        // is not part of a counter body, so it survives when the dead
+        // body state is dropped.
+        let pattern = "\\bfoo.{0,5}bar";
+        with_matcher(pattern, b"fooxxxxxxxxxx", |m| {
+            assert!(m.settle);
+            assert!(!m.has_live_counters);
+            assert!(!has_body_state(m));
+            let state = &m.cache.inner.states[m.current.idx()];
+            assert!(!state.deferred_asserts.is_empty());
+        });
+        let re = build(pattern);
+        let mut mem = MatcherMemory::default();
+        assert!(match_tier2(&mut mem, &re, b"fooxxxxxxxxxx foo bar"));
+        assert!(!match_tier2(&mut mem, &re, b"fooxxxxxxxxxxfoo bar"));
+        assert!(!match_tier2(&mut mem, &re, b"fooxxxxxxbar"));
+    }
+
+    #[test]
+    fn test_settle_never_produces_dead_state() {
+        // A state holding nothing but a dead body state has no thread at
+        // all.  It is left as it is rather than turned into DEAD: the
+        // ordinary transitions take care of it.
+        let re = build("^foo.{0,5}bar");
+        let analysis = re.tier2_analysis.as_ref().unwrap();
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier2DfaCache::new();
+        cache.prepare(&mut memory, &re, analysis);
+        assert!(cache.settle_enabled);
+        let body: Vec<StateIdx> = (0..re.states.len() as u32)
+            .map(StateIdx)
+            .filter(|s| re.counter_body_states[s.idx()] && consume_byte(*s, b'x', &re).is_some())
+            .collect();
+        assert_eq!(body.len(), 1);
+        let body_only = cache.intern_state(&body, &[], false, false, false).unwrap();
+        assert_eq!(cache.settled_state(body_only, &re), body_only);
+        // With a match-at-end flag there is still something to report, so
+        // the body state is dropped and the flag kept.
+        let flagged = cache.intern_state(&body, &[], false, true, false).unwrap();
+        let settled = cache.settled_state(flagged, &re);
+        assert_ne!(settled, flagged);
+        let state = &cache.inner.states[settled.idx()];
+        assert!(state.nfa_states.is_empty() && state.is_match_at_end);
+    }
+
+    #[test]
+    fn test_anchored_pattern_after_gap_expires() {
+        // Anchored pattern: after the gap expires and the last live thread
+        // dies, nothing can match any more.  The matcher ends up DEAD and
+        // stays there through the cached dead transitions.
+        with_matcher("^foo.{0,5}bar", b"fooxxxxxxxxxx", |m| {
+            assert!(m.settle);
+            assert!(!m.has_live_counters);
+            assert_eq!(m.current, DfaStateId::DEAD);
+            let populated = m
+                .cache
+                .dead_transitions
+                .iter()
+                .filter(|t| t.no_break != DfaStateId::UNPOPULATED)
+                .count();
+            assert_eq!(populated, 1, "one byte class seen while dead");
+        });
+        let re = build("^foo.{0,5}bar");
+        let mut mem = MatcherMemory::default();
+        assert!(!match_tier2(&mut mem, &re, b"fooxxxxxxxxxxbar"));
+        assert!(!match_tier2(&mut mem, &re, b"fooxxxxxxxxxxfooxbar"));
+        assert!(match_tier2(&mut mem, &re, b"fooxxxxxbar"));
+    }
+
+    #[test]
+    fn test_dead_transitions_are_cached_and_cleared() {
+        // Leaving the DEAD state must work through the cache as well: an
+        // unanchored branch restarts from it.
+        let first = build("^foo.{0,5}bar|^qux");
+        let second = build("^a.{0,5}b");
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier2DfaCache::new();
+        let analysis = first.tier2_analysis.as_ref().unwrap();
+        cache.prepare(&mut memory, &first, analysis);
+        assert_eq!(cache.dead_transitions.len(), cache.stride);
+        for _ in 0..2 {
+            let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &first, analysis);
+            m.chunk(b"zzzzzzzzqux");
+            assert_eq!(m.current, DfaStateId::DEAD);
+            assert!(!m.finish());
+        }
+        assert!(
+            cache
+                .dead_transitions
+                .iter()
+                .any(|t| t.no_break != DfaStateId::UNPOPULATED)
+        );
+
+        let analysis = second.tier2_analysis.as_ref().unwrap();
+        cache.prepare(&mut memory, &second, analysis);
+        assert_eq!(cache.dead_transitions.len(), cache.stride);
+        assert!(
+            cache
+                .dead_transitions
+                .iter()
+                .all(|t| t.no_break == DfaStateId::UNPOPULATED)
+        );
+    }
+
+    #[test]
+    fn test_settle_disabled_for_overlap_proven_patterns() {
+        // Eligibility through the overlap proof rests on the states
+        // reachable by ordinary transitions; states without body states
+        // are not among them.  The flag is forced here: only the guard is
+        // under test, not the proof.
+        let mut re = build("foo.{0,5}bar");
+        assert!(Tier2DfaCache::can_settle(&re));
+        re.tier2_overlap_proven = true;
+        assert!(!Tier2DfaCache::can_settle(&re));
+
+        let analysis = re.tier2_analysis.as_ref().unwrap();
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier2DfaCache::new();
+        cache.prepare(&mut memory, &re, analysis);
+        assert!(!cache.settle_enabled);
+        let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+        m.chunk(b"fooxxxxxxxxxxxxxxxx");
+        assert!(!m.settle);
+        assert!(m.cache.settled.is_empty());
+        // The dead body state stays, as it did before settling existed.
+        assert!(has_body_state(&m));
+    }
+
+    #[test]
+    fn test_settle_disabled_for_assertions_inside_bodies() {
+        // Instance liveness is not exact while a thread is parked on a
+        // deferred assertion inside the body.
+        let pattern = "x(a\\b){2,6}y";
+        with_matcher(pattern, b"xa a a a a a a a a", |m| {
+            assert!(!m.settle);
+            assert!(m.cache.settled.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_settled_state_is_cached_and_idempotent() {
+        let re = build("foo.{0,5}bar");
+        let analysis = re.tier2_analysis.as_ref().unwrap();
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier2DfaCache::new();
+        cache.prepare(&mut memory, &re, analysis);
+        let start = cache.inner.start_id;
+        // Nothing is computed until a matcher asks.
+        assert!(cache.settled.is_empty());
+
+        // The start state has no body state: it settles to itself.
+        assert_eq!(cache.settled_state(start, &re), start);
+        assert_eq!(cache.settled[start.idx()], start);
+
+        // Reach the state "start + body state" by running into the gap.
+        let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+        m.chunk(b"fooxx");
+        let in_gap = m.current;
+        assert_ne!(in_gap, start);
+        let states_before = cache.inner.states.len();
+
+        // The bytes after `foo` still allow `b`, so the in-gap state holds
+        // a third thread; without its body state it is a new state.
+        let settled = cache.settled_state(in_gap, &re);
+        assert_ne!(settled, in_gap);
+        assert_eq!(cache.settled[in_gap.idx()], settled);
+        // The result has no body state left and settles to itself.
+        assert_eq!(cache.settled_state(settled, &re), settled);
+        // Asking again neither recomputes nor interns anything.
+        let states_after = cache.inner.states.len();
+        assert!(states_after <= states_before + 1);
+        assert_eq!(cache.settled_state(in_gap, &re), settled);
+        assert_eq!(cache.inner.states.len(), states_after);
+    }
+
+    #[test]
+    fn test_settled_table_cleared_when_cache_switches_regex() {
+        // The table is indexed by DFA state id, which means nothing for
+        // another regex.
+        let first = build("foo.{0,5}bar");
+        let second = build("fooxxxxxxxxy|a.{0,5}b");
+        assert!(second.tier2_eligible);
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier2DfaCache::new();
+
+        let analysis = first.tier2_analysis.as_ref().unwrap();
+        cache.prepare(&mut memory, &first, analysis);
+        let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &first, analysis);
+        m.chunk(b"fooxxxxxxxxxxxxqq");
+        assert!(!m.finish());
+        assert!(!cache.settled.is_empty());
+        assert!(cache.settle_enabled);
+
+        let analysis = second.tier2_analysis.as_ref().unwrap();
+        cache.prepare(&mut memory, &second, analysis);
+        assert!(cache.settled.is_empty());
+        for (input, expected) in [
+            (&b"fooxxxxxxxxy"[..], true),
+            (b"axxxxxxxfooxxxxxxxxy", true),
+            (b"axxxxxxxb", false),
+            (b"axxxxxxxfooaxb", true),
+        ] {
+            let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &second, analysis);
+            m.chunk(input);
+            assert_eq!(m.finish(), expected, "{:?}", String::from_utf8_lossy(input));
+        }
+    }
+
+    #[test]
+    fn test_settle_preserves_match_at_end() {
+        // The gap runs into `$`: at the bound the stream may end in a
+        // match; one byte later it may not, and the matcher is at start.
+        with_matcher("foo.{0,5}$", b"fooxxxxx", |m| assert!(m.match_at_end));
+        with_matcher("foo.{0,5}$", b"fooxxxxxx", |m| {
+            assert!(!m.match_at_end);
+            assert!(at_start(m));
+        });
+        let re = build("foo.{0,5}$");
+        let mut mem = MatcherMemory::default();
+        assert!(match_tier2(&mut mem, &re, b"fooxxxxx"));
+        assert!(!match_tier2(&mut mem, &re, b"fooxxxxxx"));
+        assert!(match_tier2(&mut mem, &re, b"fooxxxxxxfoo"));
     }
 
     // ── Ring buffer reuse across matches ──

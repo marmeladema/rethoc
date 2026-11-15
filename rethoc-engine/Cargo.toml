@@ -15,7 +15,7 @@ serde_json = "1"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
-gungraun = "0.17.2"
+gungraun = "0.20.0"
 itertools = "0.10"
 memchr = "2.8.0"
 proptest = "1"
@@ -35,6 +35,14 @@ harness = false
 
 [[bench]]
 name = "pathological_profile"
+harness = false
+
+[[bench]]
+name = "reengage"
+harness = false
+
+[[bench]]
+name = "reengage_profile"
 harness = false
 
 [[bench]]
