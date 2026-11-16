@@ -277,7 +277,7 @@ mod tests {
         // (?i)[abc]x → 6 start bytes
         match prefilter_for("(?i)[abc]x") {
             Prefilter::Memclass(t) => {
-                for &b in &[b'a', b'A', b'b', b'B', b'c', b'C'] {
+                for &b in b"aAbBcC" {
                     assert!(t.contains(b), "should contain {}", b as char);
                 }
                 assert!(!t.contains(b'd'));
@@ -290,7 +290,7 @@ mod tests {
     fn test_memclass_eight_bytes() {
         match prefilter_for("(?i)[abcd]x") {
             Prefilter::Memclass(t) => {
-                for &b in &[b'a', b'A', b'b', b'B', b'c', b'C', b'd', b'D'] {
+                for &b in b"aAbBcCdD" {
                     assert!(t.contains(b));
                 }
             }

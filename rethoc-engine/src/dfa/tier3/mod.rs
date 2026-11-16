@@ -1294,9 +1294,7 @@ impl InstanceCounters {
     /// Clear all counters (reset live counts to zero).
     #[inline]
     fn clear(&mut self) {
-        for c in &mut self.counts {
-            *c = 0;
-        }
+        self.counts.fill(0);
     }
 
     /// Returns the number of counters.
@@ -1544,9 +1542,7 @@ impl RangeCounters {
     /// Clear all counters (reset live counts to zero).
     #[inline]
     fn clear(&mut self) {
-        for c in &mut self.counts {
-            *c = 0;
-        }
+        self.counts.fill(0);
     }
 
     /// Returns the number of counters.

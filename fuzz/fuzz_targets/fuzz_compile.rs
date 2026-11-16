@@ -20,9 +20,9 @@ use rethoc_engine::RegexBuilder;
 use std::cell::RefCell;
 
 thread_local! {
-    static CURRENT_PATTERN: RefCell<String> = RefCell::new(String::new());
-    static CURRENT_PHASE: RefCell<String> = RefCell::new(String::new());
-    static HOOK_INSTALLED: RefCell<bool> = RefCell::new(false);
+    static CURRENT_PATTERN: RefCell<String> = const { RefCell::new(String::new()) };
+    static CURRENT_PHASE: RefCell<String> = const { RefCell::new(String::new()) };
+    static HOOK_INSTALLED: RefCell<bool> = const { RefCell::new(false) };
 }
 
 fn install_panic_hook() {
@@ -82,14 +82,11 @@ fuzz_target!(|data: &[u8]| {
     // Also try with unrolling disabled.
     set_phase("compilation (no-unroll)");
     builder.max_unroll_states(0);
-    match builder.build(&hir) {
-        Ok(re) => {
-            set_phase("info/memory_size (no-unroll)");
-            let _ = re.memory_size();
-            let _ = re.info();
-            let _ = re.min_tier();
-        }
-        Err(_) => {}
+    if let Ok(re) = builder.build(&hir) {
+        set_phase("info/memory_size (no-unroll)");
+        let _ = re.memory_size();
+        let _ = re.info();
+        let _ = re.min_tier();
     }
 });
 
