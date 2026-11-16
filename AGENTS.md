@@ -123,6 +123,26 @@ rethoc sweep --list tier3-assert      # print the runs instead
 - Run `fuzz` with at most one job per core (the default): a seed near the
   watchdog limit aborts under load.
 
+## CI
+
+GitHub Actions, in `.github/workflows/`:
+
+- `ci.yml` (every PR and push to `main`): `cargo fmt --check` and
+  clippy (both workspaces), `cargo test` in release and debug,
+  `bless_memory.py --check`.
+- `differential.yml` (same triggers): `rethoc fuzz --batch` over a fixed
+  seed range with `ci/known-slow-seeds.txt`, both `rethoc sweep`
+  families, and on PRs the `reengage_profile` Callgrind gate against the
+  base branch.
+- `fuzz-nightly.yml` (daily, or on demand): cargo-fuzz targets.
+
+Third-party actions are pinned by commit SHA with the version in a
+comment; Dependabot (`.github/dependabot.yml`) opens weekly PRs to update
+them. Everything runs under the caps of `scripts/capped`. CI follows the latest
+stable Rust, so a new clippy lint can fail an unrelated PR; fix it there.
+Jobs allowed to fail, and steps commented out, say why in the workflow
+and name the issue that will re-enable them.
+
 ## Bug-fix workflow
 
 1. One bug at a time.
