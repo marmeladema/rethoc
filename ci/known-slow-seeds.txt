@@ -1,0 +1,8 @@
+# Fuzz seeds known to exceed the `rethoc fuzz` watchdog (--abort-after).
+# Matching is correct but slow; each entry is a to-do for the counter work.
+# `rethoc fuzz --batch N --allow-slow ci/known-slow-seeds.txt` runs these
+# alone and reports them as KNOWN-SLOW instead of failing.
+#
+# seed  pattern / reason
+6357  # ^ {1,35}{3,12}*((a?a?)?(a?a?)?)?... : nested bounded counters, ~17 ms per input byte
+6581  # ^x{6,42}{6,14}d?((a?a?)?(a?a?)?)?... : same shape, ~34 s alone, over 40 s under load

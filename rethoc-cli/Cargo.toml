@@ -9,5 +9,7 @@ name = "rethoc"
 path = "src/main.rs"
 
 [dependencies]
+bpaf = { version = "0.9.29", features = ["derive"] }
+regex = "1.13.1"
 rethoc-engine = { path = "../rethoc-engine" }
 serde_json = "1"
