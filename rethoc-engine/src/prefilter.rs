@@ -75,9 +75,10 @@ impl fmt::Display for Prefilter {
 /// Compute a prefilter from the NFA start state.
 ///
 /// Walks epsilon transitions from `start` to collect all bytes accepted
-/// by reachable consuming states.  Follows `Split` and `CounterInstance`
-/// (both are epsilon states).  Bails on `Assert` (needs runtime context
-/// — left for a future improvement).
+/// by reachable consuming states.  Follows `Split`, `CounterInstance` and
+/// `CounterIncrement` (all epsilon states; the last is only reachable
+/// when a counter body can match empty).  Bails on `Assert` (needs
+/// runtime context — left for a future improvement).
 ///
 /// Returns `Prefilter::None` when no consuming states are reachable
 /// (e.g. assertions block all paths) or when the byte set is too large
@@ -158,8 +159,17 @@ pub(crate) fn compute_prefilter(
             State::Assert { .. } => {
                 return Prefilter::None;
             }
-            // CounterIncrement and Match: stop this branch.
-            State::CounterIncrement { .. } | State::Match => {}
+            // A CounterIncrement is only reachable here, without consuming
+            // a byte, when its body can match empty.  The match can then go
+            // on past it: around the loop again, or out through the break
+            // once enough (possibly empty) iterations are done.  Follow
+            // both, so that the bytes after the repetition are candidates
+            // too.  A superset of the true start bytes is always sound.
+            State::CounterIncrement { out, out1, .. } => {
+                stack.push(out);
+                stack.push(out1);
+            }
+            State::Match => {}
         }
     }
 
@@ -459,6 +469,48 @@ mod tests {
                 assert_eq!(c, b'c');
             }
             other => panic!("expected Memchr3('a','b','c'), got {:?}", other),
+        }
+    }
+
+    // ── Counter bodies that can match empty (Bug 60) ──
+
+    #[test]
+    fn test_no_unroll_nullable_counter_body_includes_following_byte() {
+        // Every iteration of (e?){3} can be empty, so a match can start
+        // with the `d` after the repetition.
+        for pattern in ["(e?){3}d", "(e*){1,3}d", "(e|){2,3}d", "(e*){2,}d"] {
+            match prefilter_for_no_unroll(pattern) {
+                Prefilter::Memchr2(b'd', b'e') => {}
+                other => panic!("{pattern}: expected Memchr2('d','e'), got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_nullable_counter_body_default_settings() {
+        // Too large to unroll with the default limit: the counter is kept.
+        match prefilter_for("(e?){40}d") {
+            Prefilter::Memchr2(b'd', b'e') => {}
+            other => panic!("expected Memchr2('d','e'), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_no_unroll_nested_nullable_counter_bodies() {
+        // Both loops can be skipped without consuming anything.
+        match prefilter_for_no_unroll("((e?){2}f?){2}d") {
+            Prefilter::Memchr3(b'd', b'e', b'f') => {}
+            other => panic!("expected Memchr3('d','e','f'), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_no_unroll_nullable_inner_counter_stops_at_consuming_byte() {
+        // The inner loop can be empty but the `x` after it cannot, so
+        // nothing past `x` is a start byte.
+        match prefilter_for_no_unroll("((e?){2}x){2}d") {
+            Prefilter::Memchr2(b'e', b'x') => {}
+            other => panic!("expected Memchr2('e','x'), got {:?}", other),
         }
     }
 
