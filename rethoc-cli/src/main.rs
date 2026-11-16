@@ -1,8 +1,18 @@
-use rethoc_engine::{MatcherMemory, Regex, RegexConfig};
+//! `rethoc`: inspect, run and cross-check the rethoc regex engine.
+//!
+//! The inspection commands (`info`, `dot`, `dump`, `match`, `grep`) are
+//! defined here.  The differential-checking commands (`brute`, `fuzz`,
+//! `shrink`, `sweep`) live in [`check`].
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process;
+use std::str::FromStr;
+
+use bpaf::{Args, Bpaf};
+use rethoc_engine::{MatcherMemory, Regex, RegexConfig};
+
+mod check;
 
 fn parse_pattern(pattern: &str, config: RegexConfig) -> Regex {
     Regex::with_config(pattern, config).unwrap_or_else(|e| {
@@ -12,7 +22,7 @@ fn parse_pattern(pattern: &str, config: RegexConfig) -> Regex {
 }
 
 /// Output format for the `info` and `dump` commands.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Format {
     Text,
     Json,
@@ -20,264 +30,211 @@ enum Format {
     Debug,
 }
 
-fn print_usage() {
-    eprintln!(
-        "\
-Usage: rethoc [OPTIONS] <COMMAND>
+impl FromStr for Format {
+    type Err = String;
 
-Commands:
-  info  <pattern>                Print diagnostic information about the compiled regex
-  dot   <pattern>                Output DOT (Graphviz) representation of the NFA
-  match <pattern> <input>...     Match pattern against one or more inputs
-  grep  <pattern> [file]         Print matching lines from file (or stdin)
-  dump  <pattern>                Dump compiled NFA states, counters, and analysis
-
-Options:
-  --format <text|json|debug>  Output format (default: text; debug uses Rust {{:#?}})
-  --chunk-size <N>     Feed input in chunks of N bytes (default: entire input at once)
-  --tier <0|1|2|3|4>   Force a specific execution tier (0=NFA, 1-4=DFA tiers)
-  --unroll-limit <N>   Max NFA states for repetition unrolling (0=disable, default: 32)
-  --max-states <N>     Max estimated fully-unrolled states (default: 2048)
-  --no-merge           Disable merging of consecutive same-body repetitions
-  --dfa                Include tier-specific DFA analysis in dump output
-  --debug              Print matcher state after each step
-  -q, --quiet          Suppress output (grep: exit code only)
-  -h, --help           Print this help message"
-    );
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            "debug" => Ok(Self::Debug),
+            other => Err(format!(
+                "unknown format `{other}` (expected text, json or debug)"
+            )),
+        }
+    }
 }
 
-enum Command {
+// ---------------------------------------------------------------------------
+// Command line
+// ---------------------------------------------------------------------------
+
+/// Compile options:
+#[derive(Bpaf, Clone, Debug)]
+pub(crate) struct CompileArgs {
+    /// Max NFA states for repetition unrolling (0 disables unrolling, default 32)
+    #[bpaf(long, argument("N"))]
+    pub(crate) unroll_limit: Option<usize>,
+    /// Do not merge adjacent repetitions with the same body
+    #[bpaf(long)]
+    pub(crate) no_merge: bool,
+    /// Max estimated fully-unrolled states (default 2048)
+    #[bpaf(long, argument("N"))]
+    pub(crate) max_states: Option<usize>,
+}
+
+impl CompileArgs {
+    /// Flags that select exactly `config`; `--max-states` only when it
+    /// differs from the default.
+    pub(crate) fn exact(config: &RegexConfig) -> Self {
+        Self {
+            unroll_limit: Some(config.max_unroll_states),
+            no_merge: !config.merge_repetitions,
+            max_states: Some(config.max_estimated_states)
+                .filter(|&m| m != RegexConfig::default().max_estimated_states),
+        }
+    }
+
+    /// The single configuration these flags describe.
+    pub(crate) fn config(&self) -> RegexConfig {
+        let mut config = RegexConfig::default();
+        if let Some(u) = self.unroll_limit {
+            config.max_unroll_states = u;
+        }
+        if let Some(m) = self.max_states {
+            config.max_estimated_states = m;
+        }
+        config.merge_repetitions = !self.no_merge;
+        config
+    }
+
+    /// Configurations the checking commands compile a pattern with.
+    ///
+    /// Without `--unroll-limit` or `--no-merge`, these are the three the
+    /// test suite and the fuzzers use: default unrolling, unrolling off,
+    /// and unrolling and merging off.  Either flag selects that single
+    /// configuration instead.
+    pub(crate) fn check_configs(&self) -> Vec<RegexConfig> {
+        if self.unroll_limit.is_some() || self.no_merge {
+            return vec![self.config()];
+        }
+        [(None, true), (Some(0), true), (Some(0), false)]
+            .into_iter()
+            .map(|(unroll, merge)| {
+                CompileArgs {
+                    unroll_limit: unroll,
+                    no_merge: !merge,
+                    max_states: self.max_states,
+                }
+                .config()
+            })
+            .collect()
+    }
+
+    /// The flags again, as command-line arguments (only those that were
+    /// set, so a child process gets the same defaults).
+    pub(crate) fn to_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(u) = self.unroll_limit {
+            args.extend(["--unroll-limit".into(), u.to_string()]);
+        }
+        if self.no_merge {
+            args.push("--no-merge".into());
+        }
+        if let Some(m) = self.max_states {
+            args.extend(["--max-states".into(), m.to_string()]);
+        }
+        args
+    }
+}
+
+/// Inspect, run and cross-check the rethoc regex engine.
+///
+/// Inputs given to `brute`, `fuzz`, `shrink` and printed by them use
+/// Rust byte escapes (`\n`, `\t`, `\\`, `\xNN`, ...).  Exit codes of the
+/// checking commands: 0 clean, 1 mismatch, 2 usage error, 3 aborted
+/// (watchdog, timeout, out of memory or crash), 4 pattern rejected.
+#[derive(Bpaf, Clone, Debug)]
+#[bpaf(options)]
+enum Opts {
+    /// Print diagnostic information about the compiled regex
+    #[bpaf(command)]
     Info {
-        pattern: String,
-        config: RegexConfig,
+        /// Output format: text, json or debug
+        #[bpaf(long, argument("FORMAT"), fallback(Format::Text))]
         format: Format,
+        #[bpaf(external(compile_args))]
+        compile: CompileArgs,
+        #[bpaf(positional("PATTERN"))]
+        pattern: String,
     },
+    /// Output the NFA as a Graphviz DOT graph
+    #[bpaf(command)]
     Dot {
+        #[bpaf(external(compile_args))]
+        compile: CompileArgs,
+        #[bpaf(positional("PATTERN"))]
         pattern: String,
-        config: RegexConfig,
     },
+    /// Match a pattern against one or more inputs (exits 1 if any does not match)
+    #[bpaf(command("match"))]
     Match {
-        pattern: String,
-        inputs: Vec<String>,
+        /// Feed input in chunks of N bytes (default: whole input at once)
+        #[bpaf(long, argument("N"))]
         chunk_size: Option<usize>,
+        /// Force an execution tier (0 = NFA, 1-4 = DFA tiers)
+        #[bpaf(long, argument("TIER"))]
         tier: Option<u8>,
-        config: RegexConfig,
+        /// Print matcher state after each step
+        #[bpaf(long)]
         debug: bool,
+        #[bpaf(external(compile_args))]
+        compile: CompileArgs,
+        #[bpaf(positional("PATTERN"))]
+        pattern: String,
+        /// Literal input strings
+        #[bpaf(positional("INPUT"), some("match needs at least one input"))]
+        inputs: Vec<String>,
     },
+    /// Print matching lines of a file, or of stdin (exits 1 if none matches)
+    #[bpaf(command)]
     Grep {
-        pattern: String,
-        file: Option<String>,
-        config: RegexConfig,
+        /// Print nothing; stop at the first matching line
+        #[bpaf(short, long)]
         quiet: bool,
-    },
-    Dump {
+        #[bpaf(external(compile_args))]
+        compile: CompileArgs,
+        #[bpaf(positional("PATTERN"))]
         pattern: String,
-        config: RegexConfig,
-        format: Format,
-        dfa: bool,
+        #[bpaf(positional("FILE"))]
+        file: Option<String>,
     },
+    /// Dump compiled NFA states, counters and analysis
+    #[bpaf(command)]
+    Dump {
+        /// Output format: text or debug
+        #[bpaf(long, argument("FORMAT"), fallback(Format::Text))]
+        format: Format,
+        /// Include tier-specific DFA analysis
+        #[bpaf(long)]
+        dfa: bool,
+        #[bpaf(external(compile_args))]
+        compile: CompileArgs,
+        #[bpaf(positional("PATTERN"))]
+        pattern: String,
+    },
+    /// Check every input over an alphabet up to a length against the regex crate
+    #[bpaf(command)]
+    Brute(#[bpaf(external(check::brute::brute_args))] check::brute::BruteArgs),
+    /// Check a range of fuzz-generator seeds against the regex crate
+    #[bpaf(command)]
+    Fuzz(#[bpaf(external(check::fuzz::fuzz_args))] check::fuzz::FuzzArgs),
+    /// Delete bytes from a mismatching input while it keeps mismatching
+    #[bpaf(command)]
+    Shrink(#[bpaf(external(check::shrink::shrink_args))] check::shrink::ShrinkArgs),
+    /// Run `brute` over a family of generated patterns, each under a cap
+    #[bpaf(command)]
+    Sweep(#[bpaf(external(check::sweep::sweep_args))] check::sweep::SweepArgs),
 }
 
-fn parse_args() -> Command {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        print_usage();
-        process::exit(1);
+fn parse_args() -> Opts {
+    match opts().run_inner(Args::current_args()) {
+        Ok(opts) => opts,
+        Err(err) => {
+            err.print_message(100);
+            let code = err.exit_code();
+            process::exit(if code == 0 { 0 } else { check::EXIT_USAGE });
+        }
     }
+}
 
-    let mut chunk_size: Option<usize> = None;
-    let mut tier: Option<u8> = None;
-    let mut unroll_limit: Option<usize> = None;
-    let mut max_estimated_states: Option<usize> = None;
-    let mut format = Format::Text;
-    let mut debug = false;
-    let mut dfa = false;
-    let mut merge = true;
-    let mut quiet = false;
-    let mut positional = Vec::new();
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-h" | "--help" => {
-                print_usage();
-                process::exit(0);
-            }
-            "--chunk-size" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("error: --chunk-size requires a value");
-                    process::exit(1);
-                }
-                chunk_size = Some(args[i].parse::<usize>().unwrap_or_else(|_| {
-                    eprintln!("error: --chunk-size must be a positive integer");
-                    process::exit(1);
-                }));
-                if chunk_size == Some(0) {
-                    eprintln!("error: --chunk-size must be > 0");
-                    process::exit(1);
-                }
-            }
-            "--tier" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("error: --tier requires a value (0-4)");
-                    process::exit(1);
-                }
-                let t = args[i].parse::<u8>().unwrap_or_else(|_| {
-                    eprintln!("error: --tier must be 0, 1, 2, 3, or 4");
-                    process::exit(1);
-                });
-                if t > 4 {
-                    eprintln!("error: --tier must be 0, 1, 2, 3, or 4");
-                    process::exit(1);
-                }
-                tier = Some(t);
-            }
-            "--unroll-limit" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("error: --unroll-limit requires a value");
-                    process::exit(1);
-                }
-                unroll_limit = Some(args[i].parse::<usize>().unwrap_or_else(|_| {
-                    eprintln!("error: --unroll-limit must be a non-negative integer");
-                    process::exit(1);
-                }));
-            }
-            "--max-states" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("error: --max-states requires a value");
-                    process::exit(1);
-                }
-                max_estimated_states = Some(args[i].parse::<usize>().unwrap_or_else(|_| {
-                    eprintln!("error: --max-states must be a non-negative integer");
-                    process::exit(1);
-                }));
-            }
-            "--no-merge" => {
-                merge = false;
-            }
-            "-q" | "--quiet" => {
-                quiet = true;
-            }
-            "--format" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("error: --format requires a value (text, json, or debug)");
-                    process::exit(1);
-                }
-                format = match args[i].as_str() {
-                    "text" => Format::Text,
-                    "json" => Format::Json,
-                    "debug" => Format::Debug,
-                    other => {
-                        eprintln!(
-                            "error: unknown format: {other} (expected 'text', 'json', or 'debug')"
-                        );
-                        process::exit(1);
-                    }
-                };
-            }
-            "--dfa" => {
-                dfa = true;
-            }
-            "--debug" => {
-                debug = true;
-            }
-            other if other.starts_with('-') => {
-                eprintln!("error: unknown option: {other}");
-                print_usage();
-                process::exit(1);
-            }
-            _ => {
-                positional.push(args[i].clone());
-            }
-        }
-        i += 1;
-    }
-
-    if positional.is_empty() {
-        print_usage();
-        process::exit(1);
-    }
-
-    // Build config from parsed flags.
-    let mut config = RegexConfig::default();
-    if let Some(u) = unroll_limit {
-        config.max_unroll_states = u;
-    }
-    if let Some(m) = max_estimated_states {
-        config.max_estimated_states = m;
-    }
-    config.merge_repetitions = merge;
-
-    match positional[0].as_str() {
-        "info" => {
-            if positional.len() != 2 {
-                eprintln!("error: 'info' command takes exactly one pattern argument");
-                process::exit(1);
-            }
-            Command::Info {
-                pattern: positional[1].clone(),
-                config,
-                format,
-            }
-        }
-        "dot" => {
-            if positional.len() != 2 {
-                eprintln!("error: 'dot' command takes exactly one pattern argument");
-                process::exit(1);
-            }
-            Command::Dot {
-                pattern: positional[1].clone(),
-                config,
-            }
-        }
-        "match" => {
-            if positional.len() < 3 {
-                eprintln!("error: 'match' command requires a pattern and at least one input");
-                process::exit(1);
-            }
-            Command::Match {
-                pattern: positional[1].clone(),
-                inputs: positional[2..].to_vec(),
-                chunk_size,
-                tier,
-                config,
-                debug,
-            }
-        }
-        "grep" => {
-            if positional.len() < 2 || positional.len() > 3 {
-                eprintln!("error: 'grep' command takes a pattern and an optional file");
-                process::exit(1);
-            }
-            Command::Grep {
-                pattern: positional[1].clone(),
-                file: positional.get(2).cloned(),
-                config,
-                quiet,
-            }
-        }
-        "dump" => {
-            if positional.len() != 2 {
-                eprintln!("error: 'dump' command takes exactly one pattern argument");
-                process::exit(1);
-            }
-            Command::Dump {
-                pattern: positional[1].clone(),
-                config,
-                format,
-                dfa,
-            }
-        }
-        other => {
-            eprintln!("error: unknown command: {other}");
-            print_usage();
-            process::exit(1);
-        }
+/// Exit with a usage error unless `tier` is a valid tier number.
+fn validate_tier(tier: Option<u8>) {
+    if let Some(t) = tier
+        && t > 4
+    {
+        eprintln!("error: --tier must be 0, 1, 2, 3, or 4");
+        process::exit(check::EXIT_USAGE);
     }
 }
 
@@ -321,7 +278,7 @@ fn run_dump(pattern: &str, config: RegexConfig, format: Format, dfa: bool) {
         }
         Format::Json => {
             eprintln!("error: JSON format is not supported for 'dump' (use 'info' instead)");
-            process::exit(1);
+            process::exit(check::EXIT_USAGE);
         }
     }
 }
@@ -449,31 +406,54 @@ fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig, quiet: bool)
 
 fn main() {
     match parse_args() {
-        Command::Info {
-            pattern,
-            config,
+        Opts::Info {
             format,
-        } => run_info(&pattern, config, format),
-        Command::Dot { pattern, config } => run_dot(&pattern, config),
-        Command::Match {
+            compile,
             pattern,
-            inputs,
+        } => run_info(&pattern, compile.config(), format),
+        Opts::Dot { compile, pattern } => run_dot(&pattern, compile.config()),
+        Opts::Match {
             chunk_size,
             tier,
-            config,
             debug,
-        } => run_match(&pattern, &inputs, chunk_size, tier, config, debug),
-        Command::Grep {
+            compile,
+            pattern,
+            inputs,
+        } => {
+            validate_tier(tier);
+            if chunk_size == Some(0) {
+                eprintln!("error: --chunk-size must be > 0");
+                process::exit(check::EXIT_USAGE);
+            }
+            run_match(&pattern, &inputs, chunk_size, tier, compile.config(), debug)
+        }
+        Opts::Grep {
+            quiet,
+            compile,
             pattern,
             file,
-            config,
-            quiet,
-        } => run_grep(&pattern, file.as_deref(), config, quiet),
-        Command::Dump {
-            pattern,
-            config,
+        } => run_grep(&pattern, file.as_deref(), compile.config(), quiet),
+        Opts::Dump {
             format,
             dfa,
-        } => run_dump(&pattern, config, format, dfa),
+            compile,
+            pattern,
+        } => run_dump(&pattern, compile.config(), format, dfa),
+        Opts::Brute(args) => {
+            validate_tier(args.tier);
+            process::exit(check::brute::run(&args))
+        }
+        Opts::Fuzz(args) => {
+            validate_tier(args.tier);
+            process::exit(check::fuzz::run(&args))
+        }
+        Opts::Shrink(args) => {
+            validate_tier(args.tier);
+            process::exit(check::shrink::run(&args))
+        }
+        Opts::Sweep(args) => {
+            validate_tier(args.tier);
+            process::exit(check::sweep::run(&args))
+        }
     }
 }

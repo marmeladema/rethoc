@@ -2,7 +2,7 @@
 """Bless memory sizes in match_tests! entries.
 
 Scans ``rethoc-engine/src/lib.rs`` for ``match_tests!`` entries, compiles each pattern
-with ``rethoc --format json info``, and updates the expected memory size
+with ``rethoc info --format json``, and updates the expected memory size
 in-place if it has changed.
 
 Only blesses ``memory:`` -- does NOT touch ``min_tier:`` (to avoid
@@ -114,14 +114,14 @@ def parse_rust_string(literal: str) -> str:
 
 
 def get_memory_size(pattern: str, unroll_limit: Optional[int]) -> int:
-    """Run ``rethoc --format json info`` and return ``memory.total``.
+    """Run ``rethoc info --format json`` and return ``memory.total``.
 
     Returns -1 on failure.
     """
-    cmd = [str(RETHOC), "--format", "json", "--max-states", str(TEST_MAX_STATES)]
+    cmd = [str(RETHOC), "info", "--format", "json", "--max-states", str(TEST_MAX_STATES)]
     if unroll_limit is not None:
         cmd.extend(["--unroll-limit", str(unroll_limit)])
-    cmd.extend(["info", pattern])
+    cmd.extend(["--", pattern])
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
     if result.returncode != 0:
