@@ -12872,6 +12872,38 @@ mod tests {
                 (" 1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee", false),
             ],
         }
+        // Bug 56: a state that is in the DFA state only through a break that did
+        // not happen must not seed a counter when no counter-free thread is
+        // left.
+        test_tier3_seed_with_dead_clean_chain {
+            pattern: "^(c?1{2,3}.{2,3}?0)+",
+            memory: 1188,
+            min_tier: 1,
+            inputs: [
+                ("1110c11cc0", false),
+                ("1110c11c10", false),
+                ("1110c111c0", false),
+                ("11cc0", true),
+                ("11cc0c111cc0", true),
+                ("11cc0c11cc", true),
+                ("c11cc0", true),
+                ("1110c11cc0c", false),
+                ("111cc0c11cc0", true),
+                ("11111111110c111111111111111111111111110", false),
+            ],
+        }
+        // Bug 56: the pattern and a shrunk input from the fuzz run.
+        test_tier3_seed_with_dead_clean_chain_large {
+            pattern: "^(c?1{9,44}.{10,27}?0)+",
+            memory: 2017,
+            min_tier: 2,
+            inputs: [
+                ("11111111110c111111111111111111111111110", false),
+                ("11111111110c11111111111111111111111110", true),
+                ("111111111xxxxxxxxxx0", true),
+                ("c111111111110c111111111111111111111111111111111111111110c11111", false),
+            ],
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -3151,31 +3151,36 @@ macro_rules! step_slow_impl {
                 } // for &pos in &target_indices
             }
 
-            // Apply pre_seeds BEFORE counter increment.
+            // Apply pre_seeds BEFORE the per-instance loop, so that the
+            // instances they create take this step (see
+            // `resolved_pre_seeds` in `populate()`).
             //
             // Bug 48: mirror the Bug 32 guard for unconditional seeds.
-            // Pre_seeds are resolved seeds from Increment-action origins
-            // (L=1 body consumed on this transition).  When the current
-            // DFA state is contaminated, pre_seeds may include seeds for
-            // downstream counters whose CI state entered the DFA closure
-            // only via a counter break (e.g. c1 seeded from a with_break
-            // closure that includes c0's break path).  Filter these
-            // against the clean no-break chain's pre_seeds: only seeds
-            // that also appear in the clean chain are truly
+            // When the current DFA state is contaminated, pre_seeds may
+            // include seeds for counters whose CI state entered the DFA
+            // closure only via a counter break (e.g. c1 seeded from a
+            // with_break closure that includes c0's break path).  Filter
+            // these against the clean no-break chain's pre_seeds: only
+            // seeds that also appear in the clean chain are truly
             // counter-free.
+            //
+            // Bug 56: when the clean chain is dead (`clean_nb_trans_slot`
+            // is `None` although the state is contaminated), no thread is
+            // counter-free at all, so no pre_seed is.
             let pre_seed_contaminated =
                 self.current_has_break_extras && self.regex.num_counters > 1;
             for &(counter, origin, value) in &t.pre_seeds {
                 if pre_seed_contaminated {
-                    if let Some(cn_slot) = self.clean_nb_trans_slot {
-                        let cn_t = &self.cache.transitions[cn_slot];
-                        if !cn_t
-                            .pre_seeds
-                            .iter()
-                            .any(|s| s.0 == counter && s.1 == origin)
-                        {
-                            continue;
-                        }
+                    let Some(cn_slot) = self.clean_nb_trans_slot else {
+                        continue;
+                    };
+                    let cn_t = &self.cache.transitions[cn_slot];
+                    if !cn_t
+                        .pre_seeds
+                        .iter()
+                        .any(|s| s.0 == counter && s.1 == origin)
+                    {
+                        continue;
                     }
                 }
                 self.$current.seed(counter.idx(), origin, value);
@@ -3400,12 +3405,22 @@ macro_rules! step_slow_impl {
             // When counting + contaminated, build an epoch-stamped set of
             // clean-chain seed origins for O(1) membership instead of
             // O(|cn_t.seeds|) per main seed.
-            let filter_seeds = t.is_counting && self.clean_nb_trans_slot.is_some();
+            //
+            // Bug 56: the filter applies whenever the FROM state was
+            // contaminated, also when the clean chain is dead
+            // (`clean_nb_trans_slot` is `None`).  A dead clean chain means
+            // that no thread is counter-free, so the set stays empty and
+            // every seed is suppressed.  Skipping the filter in that case
+            // let a state that is in the DFA state only because of a
+            // break that never happened seed a counter.
+            let filter_seeds = t.is_counting && from_contaminated;
             if filter_seeds {
                 self.tail_epoch = self.tail_epoch.wrapping_add(1);
-                let cn_t = &self.cache.transitions[self.clean_nb_trans_slot.unwrap()];
-                for &(_, cn_origin, _) in &cn_t.seeds {
-                    self.tail_seen[cn_origin.idx()] = self.tail_epoch;
+                if let Some(cn_slot) = self.clean_nb_trans_slot {
+                    let cn_t = &self.cache.transitions[cn_slot];
+                    for &(_, cn_origin, _) in &cn_t.seeds {
+                        self.tail_seen[cn_origin.idx()] = self.tail_epoch;
+                    }
                 }
             }
             for &(counter, origin, value) in &t.seeds {
