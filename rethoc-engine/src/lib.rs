@@ -12904,6 +12904,28 @@ mod tests {
                 ("c111111111110c111111111111111111111111111111111111111110c11111", false),
             ],
         }
+        // Bug 58: a guarded tail (the `b` of `bc`) that cannot consume the byte
+        // it was resolved against is dead.
+        test_tier3_resolved_tail_must_consume {
+            pattern: "^ {2,3}\\b(a|bc){2,3}$",
+            memory: 1452,
+            min_tier: 1,
+            inputs: [
+                ("  abcaa", false),
+                ("   abcaa", false),
+                ("  abcabc", false),
+                ("  abca", true),
+                ("  aa", true),
+                ("  bcbc", true),
+                ("  aaa", true),
+                ("  aaaa", false),
+                ("  abc", true),
+                ("  a", false),
+                ("   bca", true),
+                (" aa", false),
+                ("  bcabca", false),
+            ],
+        }
     }
 
     // -----------------------------------------------------------------------
