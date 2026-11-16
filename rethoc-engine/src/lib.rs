@@ -13014,6 +13014,94 @@ mod tests {
                 ("", false),
             ],
         }
+        // Bug 60: every iteration of the counted body can be empty, so a
+        // match can start at the byte after the repetition.  The prefilter
+        // only looked for the body's bytes and skipped everything else.
+        test_nfa_nullable_counter_body_optional {
+            pattern: "(e?){3}d",
+            memory: 1056,
+            min_tier: 1,
+            inputs: [
+                ("d", true),
+                ("ed", true),
+                ("eed", true),
+                ("eeed", true),
+                ("eeeed", true),
+                ("xd", true),
+                ("xxxxd", true),
+                ("e", false),
+                ("eee", false),
+                ("x", false),
+                ("", false),
+            ],
+        }
+        test_nfa_nullable_counter_body_star {
+            pattern: "(e*){1,3}d",
+            memory: 1122,
+            min_tier: 1,
+            inputs: [
+                ("d", true),
+                ("ed", true),
+                ("eeeeeeeed", true),
+                ("xd", true),
+                ("e", false),
+                ("", false),
+            ],
+        }
+        test_nfa_nullable_counter_body_empty_alternative {
+            pattern: "(e|){2,3}d",
+            memory: 1089,
+            min_tier: 1,
+            inputs: [
+                ("d", true),
+                ("ed", true),
+                ("eed", true),
+                ("xyzd", true),
+                ("xyz", false),
+                ("ee", false),
+            ],
+        }
+        // Too large to unroll with the default settings: the counter is kept
+        // and the pattern runs on the NFA.
+        test_nfa_nullable_counter_body_kept_counter {
+            pattern: "(e?){40}d",
+            memory: 991,
+            min_tier: 0,
+            inputs: [
+                ("d", true),
+                ("ed", true),
+                ("xxd", true),
+                ("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeed", true),
+                ("eeee", false),
+                ("x", false),
+                ("", false),
+            ],
+        }
+        test_nfa_nullable_counter_body_then_counter {
+            pattern: "((e*|[y])){9,41}d{4,47}",
+            memory: 1124,
+            min_tier: 0,
+            inputs: [
+                ("dddd", true),
+                ("ddd", false),
+                ("eyeydddd", true),
+                ("xdddd", true),
+                ("xddd", false),
+                ("eeee", false),
+            ],
+        }
+        test_nfa_nullable_nested_counter_body {
+            pattern: "a*{10,10}{1,47}.+ *",
+            memory: 1651,
+            min_tier: 0,
+            inputs: [
+                ("b", true),
+                ("ab", true),
+                ("a", true),
+                ("aaaa   ", true),
+                ("", false),
+            ],
+        }
     }
 
     // -----------------------------------------------------------------------
