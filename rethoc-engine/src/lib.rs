@@ -12792,6 +12792,86 @@ mod tests {
                 ("xxaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!", true),
             ],
         }
+
+        // -----------------------------------------------------------------
+        // Tier 3 regressions from the differential fuzz run of 2026-11
+        // (docs/bugs/055 to 059).
+        // -----------------------------------------------------------------
+        // Bug 55: `\b` in front of the counter resolves on the first body byte,
+        // whose target is a split (`c?`).  The seeded instance has to take
+        // that step, not sit at the body's first state.
+        test_tier3_resolved_seed_split_target {
+            pattern: "^\\b(1c?e){2,40}$",
+            memory: 1133,
+            min_tier: 3,
+            inputs: [
+                ("1e1e", true),
+                ("1ce1e", true),
+                ("1e1ce", true),
+                ("1ce1ce1e", true),
+                ("1e", false),
+                ("1ce", false),
+                ("1e1", false),
+                ("1e1e1e", true),
+                (" 1e1e", false),
+                ("1e1e ", false),
+                ("1e 1e", false),
+                ("", false),
+                ("1c1e", false),
+                ("11e1e", false),
+            ],
+        }
+        // Bug 55: same, with a self-looping first body state (`b+`).
+        test_tier3_resolved_seed_loop_target {
+            pattern: " \\b(b+ad?a{3,14}1?){9,43}d$",
+            memory: 1711,
+            min_tier: 3,
+            inputs: [
+                (" baaaabaaaabaaaabaaaabaaaabaaaabaaaabaaaabaaaad", true),
+                (" baaaabaaaabaaaabaaaabaaaabaaaabaaaabaaaad", false),
+                (" bbaaaabbaaaabbaaaabbaaaabbaaaabbaaaabbaaaabbaaaabbaaaad", true),
+                (" baaaabaaaabaaaabaaaabaaaabaaaabaaaabaaaabaaaabaaaad", true),
+                ("xbaaaabaaaabaaaabaaaabaaaabaaaabaaaabaaaabaaaad", false),
+                (" baaaabaaaabaaaabaaaabaaaabaaaabaaaabaaaabaaaa", false),
+                (" baada1baada1baada1baada1baada1baada1baada1baada1baada1d", false),
+            ],
+        }
+        // Bug 55: seeds whose first body byte does not match the byte at hand
+        // are dead; they must not wait for the next byte.
+        test_tier3_resolved_seed_unconsumed {
+            pattern: "^( ?\\B((f|y+|.)){5,6}a?(a?a?)?)?$",
+            memory: 2277,
+            min_tier: 1,
+            inputs: [
+                (" ffyffd", false),
+                (" ffyyffd", false),
+                (" ffyyffda", false),
+                (" fgyyffda", false),
+                ("", true),
+                (" ", false),
+                ("fffff", false),
+                (" fffff", true),
+                ("  ffff", true),
+                ("  fffff", true),
+                ("ffyyyffaaa", false),
+            ],
+        }
+        // Bug 55: optional body prefix and an optional element after the first
+        // byte, at exactly the minimum count.
+        test_tier3_resolved_seed_optional_prefix {
+            pattern: "^(\\b(f?y*1c?e{6,12}){7,40}(e\\b.?[aa]?a?)?)?$",
+            memory: 3007,
+            min_tier: 3,
+            inputs: [
+                ("1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee", true),
+                ("1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee", false),
+                ("1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee", true),
+                ("fy1ceeeeeefy1ceeeeeefy1ceeeeeefy1ceeeeeefy1ceeeeeefy1ceeeeeefy1ceeeeee", true),
+                ("", true),
+                ("1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee ", false),
+                (" 1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee", false),
+            ],
+        }
     }
 
     // -----------------------------------------------------------------------
