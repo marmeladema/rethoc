@@ -1,0 +1,6 @@
+# Run every binary cargo executes (tests, benches, `cargo run`) under the
+# memory and time cap of scripts/capped; see AGENTS.md, "Resource caps".
+# AddressSanitizer builds (cargo fuzz) are left out: ASan reserves far
+# more address space than any `ulimit -v` allows.
+[target.'cfg(all(unix, not(sanitize = "address")))']
+runner = "scripts/capped"
