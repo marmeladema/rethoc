@@ -286,6 +286,26 @@ pub(crate) fn byte_match_ci(input: u8, target: u8) -> bool {
 pub(crate) use prefilter::Prefilter;
 
 impl AssertKind {
+    /// True for the assertions that the DFA tiers defer: the word-boundary
+    /// family and `EndLF`.
+    ///
+    /// Their outcome depends on the next input byte, so a thread that
+    /// reaches one right after consuming a byte has to wait for the byte
+    /// that follows.  The CRLF-aware line anchors can defer too (see
+    /// [`eval`](Self::eval)), but a pattern containing them never runs on
+    /// a DFA tier, so they are not part of this set.
+    #[inline]
+    pub(crate) fn is_dfa_deferrable(self) -> bool {
+        matches!(
+            self,
+            AssertKind::WordAscii
+                | AssertKind::WordAsciiNegate
+                | AssertKind::WordStartAscii
+                | AssertKind::WordEndAscii
+                | AssertKind::EndLF
+        )
+    }
+
     /// Evaluate this assertion.
     ///
     /// * `at_start` — true when at position 0.
@@ -1063,17 +1083,7 @@ impl Regex {
         let n_deferred = self
             .states
             .iter()
-            .filter(|s| {
-                matches!(s,
-                    State::Assert { kind, .. } if matches!(kind,
-                        AssertKind::WordAscii
-                        | AssertKind::WordAsciiNegate
-                        | AssertKind::WordStartAscii
-                        | AssertKind::WordEndAscii
-                        | AssertKind::EndLF
-                    )
-                )
-            })
+            .filter(|s| matches!(s, State::Assert { kind, .. } if kind.is_dfa_deferrable()))
             .count();
 
         // -- Execution tier --
@@ -12924,6 +12934,84 @@ mod tests {
                 ("   bca", true),
                 (" aa", false),
                 ("  bcabca", false),
+            ],
+        }
+        // Bug 57: after the break, `1` is consumed and `\b` stands in front of
+        // the loop back into the counter.  The thread may only re-enter if
+        // the assertion holds.
+        test_tier3_tail_into_counter_behind_assert {
+            pattern: "^(.{2,3}1\\b)+$",
+            memory: 1089,
+            min_tier: 1,
+            inputs: [
+                ("111111", false),
+                ("1111a1", false),
+                ("111 1", false),
+                ("111 111", true),
+                ("111 1111", false),
+                ("aa1", true),
+                ("aa1 a1", true),
+                ("aa1  a1", true),
+                ("aa1 aa1", true),
+                ("a1", false),
+                ("", false),
+                ("aa1aa1", false),
+                ("aa1 aa1 aa1", true),
+                ("aa1 aa1aa1", false),
+            ],
+        }
+        // Bug 57: the same with a second counter behind the assertion.
+        test_tier3_tail_into_other_counter_behind_assert {
+            pattern: "^.{2,4}1\\b.{2,3}$",
+            memory: 1188,
+            min_tier: 1,
+            inputs: [
+                ("111 111", false),
+                ("111 11a", false),
+                ("111 11 ", false),
+                ("111 11", true),
+                ("aa1 aa", true),
+                ("aa1aa", false),
+                ("aaaa1 aaa", false),
+                ("aaaa1 aaaa", false),
+                ("a1 aa", false),
+                ("1111 11", true),
+                ("11111 11", true),
+            ],
+        }
+        // Bug 57: two assertions in a row on the way back into the counter (the
+        // fuzz case).
+        test_tier3_tail_into_counter_behind_two_asserts {
+            pattern: "^(\\b.{4,9}1\\b)+$",
+            memory: 1320,
+            min_tier: 1,
+            inputs: [
+                ("cx c1adday1", false),
+                ("1c1bc b1e e01xx c1adday1", false),
+                ("abcd1", true),
+                ("abcd1 abcd1", true),
+                ("abcd1abcd1", true),
+                ("abcd1 abcd1 ", false),
+                ("abc1", false),
+                ("abcd1 efgh1 ijkl1", true),
+            ],
+        }
+        // Bug 59: a nullable loop after the counter is an epsilon cycle on the
+        // break path; analysing it must terminate.
+        test_tier3_break_path_epsilon_cycle {
+            pattern: "^y{4,30}((x| *| +))*$",
+            memory: 2112,
+            min_tier: 1,
+            inputs: [
+                ("yyyy", true),
+                ("yyyyx  x", true),
+                ("yyy", false),
+                ("yyyy!", false),
+                ("yyyyy   ", true),
+                ("yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy", true),
+                ("yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy", false),
+                ("yyyyxx x x", true),
+                ("", false),
             ],
         }
     }

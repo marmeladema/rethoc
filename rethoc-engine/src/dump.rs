@@ -528,6 +528,7 @@ impl DumpRegex<'_> {
             writeln!(f)?;
             writeln!(f, "Tier 3 Analysis:")?;
             writeln!(f, "  all_counters_rangeable: {}", t3.all_counters_rangeable)?;
+            writeln!(f, "  effects_exact: {}", t3.effects_exact)?;
             writeln!(f, "  max_body_origins: {}", t3.max_body_origins)?;
             writeln!(f, "  max_instance_stride: {}", t3.max_instance_stride)?;
 

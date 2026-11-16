@@ -170,6 +170,13 @@ pub(crate) struct Tier3Analysis {
     /// over-approximate, so the per-instance fallback is used instead.
     pub(crate) all_counters_rangeable: bool,
 
+    /// `false` when [`target_effects`](Self::target_effects) could not be
+    /// compiled exactly: a counter's break path or some `Advance` has too
+    /// many alternative assertion sets in front of its consuming states
+    /// to enumerate.  Such a pattern is not Tier 3 eligible (see
+    /// [`tier3_effects::check_break_deferred_soundness`]).
+    pub(crate) effects_exact: bool,
+
     /// Typed effects for each target state — **runtime authoritative source**
     /// for all nonlocal Tier 3 effects (since Patch 8E).
     ///
@@ -372,6 +379,7 @@ pub(crate) fn compute_tier3_analysis(
         per_tail_deferred: Box<[tier3_effects::DeferredTail]>,
     }
     let mut per_counter_break: Vec<Option<PerCounterBreakData>> = (0..64).map(|_| None).collect();
+    let mut break_tails_exact = true;
 
     for idx in 0..n {
         if let Some(Tier3OriginKind::Increment { counter, .. }) = &targets_vec[idx] {
@@ -408,8 +416,17 @@ pub(crate) fn compute_tier3_analysis(
             }
             // Compute break closure (deferred asserts) and consuming tails.
             let bc = break_closure(&cinc_break_outs, states, state_can_reach_match);
-            let (all_tails, pure_tails, per_tail_deferred) = if !cinc_break_outs.is_empty() {
-                let (a, p, d) = break_consuming_tails(&cinc_break_outs, states, &targets_vec);
+            let tails = if cinc_break_outs.is_empty() {
+                None
+            } else {
+                let tails = break_consuming_tails(&cinc_break_outs, states, &targets_vec);
+                // Bug 59: too many alternative assertion sets on the
+                // break path.  The analysis is left without tails and
+                // flagged, which keeps the pattern off Tier 3.
+                break_tails_exact &= tails.is_some();
+                tails
+            };
+            let (all_tails, pure_tails, per_tail_deferred) = if let Some((a, p, d)) = tails {
                 (
                     a.into_boxed_slice(),
                     p.into_boxed_slice(),
@@ -502,14 +519,7 @@ pub(crate) fn compute_tier3_analysis(
                     // by the break closure (break_is_match_at_end).
                     if kind != AssertKind::End {
                         debug_assert!(
-                            matches!(
-                                kind,
-                                AssertKind::WordAscii
-                                    | AssertKind::WordAsciiNegate
-                                    | AssertKind::WordStartAscii
-                                    | AssertKind::WordEndAscii
-                                    | AssertKind::EndLF
-                            ),
+                            kind.is_dfa_deferrable(),
                             "unexpected deferred assert kind {:?} in break-seed closure; \
                              PendingEffect.prev_was_word only supports word-boundary \
                              family and EndLF",
@@ -825,14 +835,7 @@ pub(crate) fn compute_tier3_analysis(
                         // End asserts are handled by target_is_match_at_end.
                         if kind != AssertKind::End {
                             debug_assert!(
-                                matches!(
-                                    kind,
-                                    AssertKind::WordAscii
-                                        | AssertKind::WordAsciiNegate
-                                        | AssertKind::WordStartAscii
-                                        | AssertKind::WordEndAscii
-                                        | AssertKind::EndLF
-                                ),
+                                kind.is_dfa_deferrable(),
                                 "unexpected deferred assert kind {:?} in target deferred; \
                                  PendingEffect.prev_was_word only supports word-boundary \
                                  family and EndLF",
@@ -961,6 +964,7 @@ pub(crate) fn compute_tier3_analysis(
         reachable_without_break: rwb.into_boxed_slice(),
         max_instance_stride,
         all_counters_rangeable,
+        effects_exact: break_tails_exact,
         // Placeholders — filled in below.
         target_effects: Box::new([]),
         origin_effects: Box::new([]),
@@ -1037,10 +1041,11 @@ pub(crate) fn compute_tier3_analysis(
     }
 
     // -- Step 10: compile typed target effects ---------------------------------
-    let (target_effects, origin_effects) =
+    let (target_effects, origin_effects, effects_exact) =
         tier3_effects::compile_all_target_effects(&analysis, states, &mut assert_chain_arena);
     analysis.target_effects = target_effects;
     analysis.origin_effects = origin_effects;
+    analysis.effects_exact &= effects_exact;
     analysis.assert_chain_arena = assert_chain_arena;
 
     // -- Validate EOI seed invariant ------------------------------------------
@@ -2644,90 +2649,56 @@ fn break_closure(
 ///   Multiple entries may share the same `origin` with different assertion
 ///   chains (OR alternatives — Bug 51/52 lesson applied to tails).
 ///   Each entry becomes a separate `GuardedEffect` with `AddTail`.
+///   Only minimal assertion sets are listed (Bug 49): a chain that
+///   contains another chain for the same origin is implied by it.
 ///
 /// Bug 45: pure consuming states should be deposited immediately at runtime,
 /// while deferred-only states need assertion resolution first.
+///
+/// Returns `None` when the break path has too many alternative assertion
+/// sets to enumerate (see
+/// [`tier3_effects::consuming_by_assertion_set`]).  Bug 59: the walk used
+/// to prune by chain length only, which neither bounded it nor ended it
+/// on an epsilon cycle.
+#[allow(clippy::type_complexity)]
 fn break_consuming_tails(
     break_seeds: &[StateIdx],
     states: &[State],
     targets: &[Option<Tier3OriginKind>],
-) -> (
+) -> Option<(
     Vec<StateIdx>,
     Vec<StateIdx>,
     Vec<tier3_effects::DeferredTail>,
-) {
+)> {
+    let reached = tier3_effects::consuming_by_assertion_set(break_seeds, states, |kind| {
+        // End assertions are NOT deferred — they're handled statically
+        // by break_is_match_at_end.  Non-End asserts (\b, \B, etc.) are
+        // deferred.
+        if kind == AssertKind::End {
+            return false;
+        }
+        debug_assert!(
+            kind.is_dfa_deferrable(),
+            "unexpected deferred assert kind {:?} in break-tail closure; \
+             PendingEffect.prev_was_word only supports word-boundary \
+             family and EndLF",
+            kind
+        );
+        true
+    })?;
+
     let mut all_result = Vec::new();
     let mut pure_result = Vec::new();
-    // Collect (origin, normalized_deferred) pairs.  Multiple entries
-    // for the same origin with different deferred chains are preserved
-    // (OR semantics — Bug 51/52 lesson applied to tails).
-    let mut per_tail_raw: Vec<(StateIdx, Vec<StateIdx>)> = Vec::new();
-    // Track (state, accumulated_deferred_asserts) pairs.
-    let mut stack: Vec<(StateIdx, Vec<StateIdx>)> =
-        break_seeds.iter().map(|&s| (s, Vec::new())).collect();
-    let n = states.len();
-    // Bug 49: track minimum deferred length at each visited node.
-    // A node reachable via path with N deferred asserts may also be
-    // reachable via a shorter path with M < N deferred asserts.  The
-    // shorter path must be explored so that downstream consuming states
-    // get the minimal deferred set.  `best_deferred[i]` holds the
-    // smallest deferred length seen so far (u32::MAX = unvisited).
-    let mut best_deferred: Vec<u32> = vec![u32::MAX; n];
-    while let Some((idx, mut deferred)) = stack.pop() {
-        let i = idx.idx();
-        // Normalize deferred asserts early so the length-based pruning
-        // and later dedup compare canonical forms.
-        deferred.sort_unstable();
-        deferred.dedup();
-        let d_len = deferred.len() as u32;
-        // Skip if already visited via a path with strictly fewer
-        // deferred asserts.  Equal-length paths must be explored
-        // because they may carry different assertion sets (OR
-        // alternatives) — only strictly shorter paths dominate.
-        if d_len > best_deferred[i] {
-            continue;
-        }
-        if d_len < best_deferred[i] {
-            best_deferred[i] = d_len;
-        }
-        let is_pure = deferred.is_empty();
-        match states[idx] {
-            State::Split { out, out1 } => {
-                stack.push((out1, deferred.clone()));
-                stack.push((out, deferred));
-            }
-            State::Assert { kind, out } => {
-                // End assertions are NOT deferred — they're handled
-                // statically by break_is_match_at_end.  Non-End asserts
-                // (\b, \B, etc.) are deferred.
-                if kind != AssertKind::End {
-                    debug_assert!(
-                        matches!(
-                            kind,
-                            AssertKind::WordAscii
-                                | AssertKind::WordAsciiNegate
-                                | AssertKind::WordStartAscii
-                                | AssertKind::WordEndAscii
-                                | AssertKind::EndLF
-                        ),
-                        "unexpected deferred assert kind {:?} in break-tail closure; \
-                         PendingEffect.prev_was_word only supports word-boundary \
-                         family and EndLF",
-                        kind
-                    );
-                    deferred.push(idx);
-                }
-                stack.push((out, deferred));
-            }
-            State::CounterInstance { out, .. } => stack.push((out, deferred)),
+    let mut per_tail: Vec<tier3_effects::DeferredTail> = Vec::new();
+    for r in reached {
+        // Only include a state if at least one of its targets is NOT an
+        // Increment.  Increment targets are handled by counter seeding.
+        let is_tail = match states[r.origin] {
             State::Byte { out, out_exit, .. }
             | State::ByteCI { out, out_exit, .. }
             | State::Wildcard { out, out_exit }
             | State::ByteClassStatic { out, out_exit, .. }
             | State::ByteClassCustom { out, out_exit, .. } => {
-                // Only include if at least one target's analysis is NOT
-                // Increment.  Increment targets are handled by counter
-                // seeding.
                 let all_targets_inc =
                     matches!(targets[out.idx()], Some(Tier3OriginKind::Increment { .. }))
                         && (out_exit == StateIdx::NONE
@@ -2735,47 +2706,30 @@ fn break_consuming_tails(
                                 targets[out_exit.idx()],
                                 Some(Tier3OriginKind::Increment { .. })
                             ));
-                if !all_targets_inc {
-                    if is_pure && !pure_result.contains(&idx) {
-                        pure_result.push(idx);
-                    }
-                    if !all_result.contains(&idx) {
-                        all_result.push(idx);
-                    }
-                    per_tail_raw.push((idx, deferred));
-                }
+                !all_targets_inc
             }
-            State::ByteTable { .. } => {
-                if is_pure && !pure_result.contains(&idx) {
-                    pure_result.push(idx);
-                }
-                if !all_result.contains(&idx) {
-                    all_result.push(idx);
-                }
-                per_tail_raw.push((idx, deferred));
-            }
-            _ => {}
+            _ => true,
+        };
+        if !is_tail {
+            continue;
         }
+        if r.asserts.is_empty() && !pure_result.contains(&r.origin) {
+            pure_result.push(r.origin);
+        }
+        if !all_result.contains(&r.origin) {
+            all_result.push(r.origin);
+        }
+        // The chain_id is a placeholder (NONE) — populated after the
+        // assertion chain arena is built in Step 9.
+        per_tail.push(tier3_effects::DeferredTail {
+            origin: r.origin,
+            assert_states: r.asserts.into_boxed_slice(),
+            chain_id: tier3_effects::AssertChainId::NONE,
+        });
     }
     all_result.sort_unstable();
     pure_result.sort_unstable();
-    // Dedup per-tail entries: keep distinct (origin, deferred) pairs
-    // but remove true duplicates.  This is the same OR-preserving
-    // dedup pattern used for break seeds (Bug 52).
-    per_tail_raw.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    per_tail_raw.dedup();
-    // Build per-tail deferred asserts list.
-    // The chain_id is a placeholder (NONE) — populated after the
-    // assertion chain arena is built in Step 9.
-    let per_tail: Vec<tier3_effects::DeferredTail> = per_tail_raw
-        .into_iter()
-        .map(|(origin, deferred)| tier3_effects::DeferredTail {
-            origin,
-            assert_states: deferred.into_boxed_slice(),
-            chain_id: tier3_effects::AssertChainId::NONE,
-        })
-        .collect();
-    (all_result, pure_result, per_tail)
+    Some((all_result, pure_result, per_tail))
 }
 
 // ---------------------------------------------------------------------------
@@ -3060,6 +3014,13 @@ macro_rules! step_slow_impl {
                                         &self.analysis.origin_effects[pbo.idx()].guarded,
                                         byte_is_word,
                                     );
+                                    // Bug 57: origins behind a deferrable
+                                    // assertion are reached only if it holds.
+                                    tier3_effects::enqueue_guarded_effects(
+                                        &mut self.pending_effects_current,
+                                        &effects.guarded,
+                                        byte_is_word,
+                                    );
                                     // Bug 37 + Bug 47: apply byte-specific
                                     // immediate effects from the compiled Advance.
                                     tier3_effects::apply_immediate_atoms(
@@ -3212,6 +3173,10 @@ macro_rules! step_slow_impl {
                         match effects {
                             Some(effects) => match &effects.step {
                                 tier3_effects::TargetStep::Advance { new_origins } => {
+                                    // An instance advances inside its
+                                    // counter body, where Tier 3 admits no
+                                    // deferrable assertion.
+                                    debug_assert!(effects.guarded.is_empty());
                                     for &new_o in new_origins {
                                         self.$next.advance(c_idx, entry, new_o);
                                     }
@@ -4098,6 +4063,13 @@ impl<'a> Tier3DfaMatcher<'a> {
                                 tier3_effects::enqueue_guarded_effects(
                                     &mut self.pending_effects_next,
                                     &self.analysis.origin_effects[tail.idx()].guarded,
+                                    b_is_word,
+                                );
+                                // Bug 57: so do the origins behind a
+                                // deferrable assertion.
+                                tier3_effects::enqueue_guarded_effects(
+                                    &mut self.pending_effects_next,
+                                    &effects.guarded,
                                     b_is_word,
                                 );
                             }
