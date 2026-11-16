@@ -13219,6 +13219,54 @@ mod tests {
                 ("", false),
             ],
         }
+        // Bug 62: a transition resolved the `\b` in front of the counter
+        // while the space after the counter took the byte.  That was
+        // mistaken for the counter's own first byte, so the finished count
+        // of the previous run was kept and a single `a` could break.
+        test_tier2_break_tail_is_not_body_progress {
+            pattern: "\\ba{2,3}\\b c",
+            memory: 1056,
+            min_tier: 1,
+            inputs: [
+                ("aa a c", false),
+                ("aaa a c", false),
+                ("aa a  c", false),
+                ("aa c", true),
+                ("a aa c", true),
+                ("aa a aaa c", true),
+                ("aaaa c", false),
+                ("a c", false),
+                ("", false),
+            ],
+        }
+        test_tier2_break_tail_is_not_body_progress_loop {
+            pattern: "\\b(a{2,3}\\b c)+$",
+            memory: 1122,
+            min_tier: 1,
+            inputs: [
+                ("aa a c", false),
+                ("aa c", true),
+                ("aa caaa c", true),
+                ("aa caa a c", false),
+                ("aa c ", false),
+            ],
+        }
+        // The same with a count too large to unroll: tier 2 with the
+        // default settings.
+        test_tier2_break_tail_is_not_body_progress_kept_counter {
+            pattern: "\\b\\d{40,60}\\b USD",
+            memory: 1133,
+            min_tier: 2,
+            inputs: [
+                ("7777777777777777777777777777777777777777 7 USD", false),
+                ("7777777777777777777777777777777777777777 77 777 USD", false),
+                ("7777777777777777777777777777777777777777 USD", true),
+                ("7 7777777777777777777777777777777777777777 USD", true),
+                ("7777777777777777777777777777777777777777 7 7777777777777777777777777777777777777777 USD", true),
+                ("77777777777777777777777777777777777777777777777777777777777777777777777777777777 USD", false),
+                ("7 USD", false),
+            ],
+        }
     }
 
     /// Bug 61: an unbounded counter saturates at `min`, so the number of

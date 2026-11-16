@@ -826,7 +826,6 @@ impl Tier2DfaCache {
     ) -> Transition {
         let mut targets: Vec<StateIdx> = Vec::new();
 
-        let mut resolved_seeds: Vec<(CounterIdx, u32)> = Vec::new();
         let mut resolved_cinc = false;
         let mut resolved_cinc_mask: u64 = 0;
         let mut resolved_is_match = false;
@@ -839,11 +838,14 @@ impl Tier2DfaCache {
         // Match reachable through CInc break path in Phase 1 resolution.
         // Only valid when any_can_break is true (counter >= min).
         let mut resolved_break_match = false;
-        // Whether Phase 1 resolution actually produced consuming targets
-        // (the first counter body byte was consumed on this transition).
-        // When false, resolved_seeds are speculative and should NOT be
-        // used on non-counting transitions (the body byte doesn't match).
-        let mut resolved_body_consumed = false;
+        // Counters entered through Phase 1 resolution whose first body
+        // byte was consumed on this transition (bit `i` = counter `i`).
+        // Only these get a pre-seed and are spared by `counter_reset`.
+        // A counter that was entered but whose body did not take the byte
+        // is speculative and must not be seeded (Bug 14).  Another
+        // resolved thread taking the byte — a state after the counter's
+        // break, say — says nothing about the body (Bug 62).
+        let mut resolved_body_mask: u64 = 0;
         // Targets from consuming states on CInc break paths, consumed on
         // this transition.  These states are only reachable when the
         // deferred assertion passes AND the counter breaks, so they are
@@ -870,7 +872,12 @@ impl Tier2DfaCache {
                     Some(byte),
                     false,
                 );
-                resolved_seeds = cr.seed_instances.iter().map(|&(c, _s)| (c, 0u32)).collect();
+                for &(counter, first) in cr.seed_instances.iter() {
+                    if cr.nfa_states.contains(&first) && consume_byte(first, byte, regex).is_some()
+                    {
+                        resolved_body_mask |= 1u64 << counter.idx();
+                    }
+                }
 
                 resolved_cinc = cr.encountered_cinc;
                 resolved_cinc_mask = cr.cinc_mask;
@@ -918,7 +925,6 @@ impl Tier2DfaCache {
                         if te != StateIdx::NONE {
                             targets.push(te);
                         }
-                        resolved_body_consumed = true;
                     }
                 }
             }
@@ -1056,15 +1062,7 @@ impl Tier2DfaCache {
             // When the body was NOT consumed (e.g. `\B {7,12}` on `!`),
             // the resolved seeds are speculative and must be discarded
             // to avoid false positives (Bug 14).
-            let mut resolved_body_mask: u64 = 0;
-            let mut pre_seed_list: Vec<(CounterIdx, u32)> = Vec::new();
-            if resolved_body_consumed {
-                for &(counter, _val) in &resolved_seeds {
-                    let ci = counter.idx();
-                    resolved_body_mask |= 1u64 << ci;
-                    pre_seed_list.push((counter, 0));
-                }
-            }
+            let pre_seed_list = Self::pre_seeds_for(resolved_body_mask);
             let counter_reset = counter_reset & !resolved_body_mask;
 
             Transition {
@@ -1090,15 +1088,7 @@ impl Tier2DfaCache {
             // Resolved seeds from deferred assertions go to pre_seeds
             // for correct phase alignment (same rationale as counting
             // transitions — see comment above).
-            let mut resolved_body_mask: u64 = 0;
-            let mut pre_seed_list: Vec<(CounterIdx, u32)> = Vec::new();
-            if resolved_body_consumed {
-                for &(counter, _val) in &resolved_seeds {
-                    let ci = counter.idx();
-                    resolved_body_mask |= 1u64 << ci;
-                    pre_seed_list.push((counter, 0));
-                }
-            }
+            let pre_seed_list = Self::pre_seeds_for(resolved_body_mask);
             let counter_reset = counter_reset & !resolved_body_mask;
 
             // Counters reachable from deferred assertions (for pre-reset
@@ -1148,6 +1138,18 @@ impl Tier2DfaCache {
                 counter_reset,
             }
         }
+    }
+
+    /// One pre-seed (value 0) per counter in `mask`, in counter order.
+    fn pre_seeds_for(mask: u64) -> Vec<(CounterIdx, u32)> {
+        let mut seeds = Vec::new();
+        let mut mask = mask;
+        while mask != 0 {
+            let ci = mask.trailing_zeros();
+            mask &= mask - 1;
+            seeds.push((CounterIdx(ci as u8), 0));
+        }
+        seeds
     }
 
     /// Compute the `counter_reset` bitmask for a transition.
