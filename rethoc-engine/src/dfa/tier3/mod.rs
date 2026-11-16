@@ -3817,8 +3817,8 @@ impl<'a> Tier3DfaMatcher<'a> {
             //   assertion chain passes and downstream Match is reachable.
             // - MatchAtEnd: set `resolved_mae` for end-of-input match.
             //
-            // Tails that can't consume `b` are kept as post_break_tails
-            // for the next step (injected after step_slow).
+            // Tails that can't consume `b` are dropped: the thread was
+            // waiting for exactly this byte (Bug 58).
             self.resolved_tails.clear();
             self.tail_epoch = self.tail_epoch.wrapping_add(1);
             let resolved_mae = if !self.pending_effects_current.is_empty() {
@@ -4193,11 +4193,11 @@ impl<'a> Tier3DfaMatcher<'a> {
                     }
                 } // end for tgt in targets_to_process
             }
-            // Tail can't consume this byte — keep as post_break_tail.
-            else if self.tail_seen[tail.idx()] != self.tail_epoch {
-                self.tail_seen[tail.idx()] = self.tail_epoch;
-                self.resolved_tails.push(tail);
-            }
+            // Bug 58: a tail that cannot consume this byte is dead.  The
+            // assertion in front of it was resolved against `b`, so the
+            // thread stands right before `b` and has no other byte to
+            // take.  Keeping it (as was done) let it consume a later
+            // byte instead, starting a second thread one position late.
         }
         // Clear resolved effects, then swap next→current so
         // second-order deferred effects survive to the next
@@ -4752,8 +4752,10 @@ mod tests {
         with_matcher(TWO_GAPS, &[b"fx"], |m| {
             assert!(m.fresh, "plain landing on the start state re-arms");
             let start_id = m.cache.inner.start_id;
-            // A consuming state outside the start closure that cannot
-            // take `x`: the `b` of the second anchor.
+            // A consuming state outside the start closure: the `b` of the
+            // second anchor.  Consuming `b` moves the tail on to the `a`
+            // that follows, while the DFA goes from the start state back
+            // to the start state.
             let tail = (0..m.regex.states.len() as u32)
                 .map(StateIdx)
                 .find(|&s| {
@@ -4761,6 +4763,7 @@ mod tests {
                         && consume_byte(s, b'x', m.regex).is_none()
                 })
                 .expect("pattern has a `b` state");
+            let (after_b, _) = consume_byte(tail, b'b', m.regex).unwrap();
 
             m.fresh = false;
             m.pending_effects_current
@@ -4770,10 +4773,38 @@ mod tests {
                     atom: tier3_effects::EffectAtom::AddTail { origin: tail },
                     prev_was_word: false,
                 });
-            m.chunk(b"x");
+            m.chunk(b"b");
             assert_eq!(m.current, start_id);
-            assert_eq!(m.post_break_tails, vec![tail]);
+            assert_eq!(m.post_break_tails, vec![after_b]);
             assert!(!m.fresh);
+        });
+    }
+
+    #[test]
+    fn test_resolved_tail_that_cannot_consume_is_dropped() {
+        // A guarded tail is resolved against the byte it has to consume.
+        // If it cannot take that byte the thread is dead; it must not
+        // wait for a later byte (Bug 58).
+        with_matcher(TWO_GAPS, &[b"fx"], |m| {
+            let tail = (0..m.regex.states.len() as u32)
+                .map(StateIdx)
+                .find(|&s| {
+                    consume_byte(s, b'b', m.regex).is_some()
+                        && consume_byte(s, b'x', m.regex).is_none()
+                })
+                .expect("pattern has a `b` state");
+            m.fresh = false;
+            m.pending_effects_current
+                .push(tier3_effects::PendingEffect {
+                    timing: tier3_effects::EffectTiming::NextByte,
+                    guard: tier3_effects::EffectGuard::ALWAYS,
+                    atom: tier3_effects::EffectAtom::AddTail { origin: tail },
+                    prev_was_word: false,
+                });
+            m.chunk(b"x");
+            assert!(m.post_break_tails.is_empty());
+            assert!(m.pending_effects_current.is_empty());
+            assert!(m.fresh, "nothing is live any more");
         });
     }
 
