@@ -2678,12 +2678,7 @@ impl RegexBuilder {
                                 }
                                 stack.push(out);
                             }
-                            State::CounterIncrement {
-                                counter,
-                                out: _,
-                                out1: _,
-                                ..
-                            } => {
+                            State::CounterIncrement { counter, .. } => {
                                 if counter == own_counter {
                                     // Reached our own CInc — don't follow further
                                     // (we only check the body, not past the break).
@@ -5294,10 +5289,10 @@ mod tests {
         let mut inputs: Vec<Vec<u8>> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for schedule in &schedules {
-            if let Some(input) = gen_walk_nfa(regex, schedule) {
-                if seen.insert(input.clone()) {
-                    inputs.push(input);
-                }
+            if let Some(input) = gen_walk_nfa(regex, schedule)
+                && seen.insert(input.clone())
+            {
+                inputs.push(input);
             }
             if inputs.len() >= max_inputs {
                 break;
@@ -5472,8 +5467,9 @@ mod tests {
                     return false;
                 }
                 // Prefer 'a' (word char), then '0', ' ', then first match.
-                let byte = [b'a', b'0', b' ']
-                    .into_iter()
+                let byte = b"a0 "
+                    .iter()
+                    .copied()
                     .find(|&b| table[b as usize])
                     .or_else(|| (0..=255u8).find(|&b| table[b as usize]));
                 let Some(byte) = byte else { return false };
@@ -5502,8 +5498,9 @@ mod tests {
                 }
                 let bc = &regex.classes[class.idx()];
                 // Prefer 'a' (word char), then '0', ' ', then first match.
-                let byte = [b'a', b'0', b' ']
-                    .into_iter()
+                let byte = b"a0 "
+                    .iter()
+                    .copied()
                     .find(|&b| bc.contains(b))
                     .or_else(|| (0..=255u8).find(|&b| bc.contains(b)));
                 let Some(byte) = byte else { return false };
@@ -5530,8 +5527,7 @@ mod tests {
                 }
                 let bt = &regex.byte_tables[table.idx()];
                 // Try preferred bytes first, then scan.
-                let candidates = [b'a', b'0', b' '];
-                for &byte in &candidates {
+                for &byte in b"a0 " {
                     let target = bt[byte];
                     if target != StateIdx::NONE {
                         out.push(byte);
@@ -5552,7 +5548,7 @@ mod tests {
                     }
                 }
                 for byte in 0..=255u8 {
-                    if candidates.contains(&byte) {
+                    if b"a0 ".contains(&byte) {
                         continue;
                     }
                     let target = bt[byte];

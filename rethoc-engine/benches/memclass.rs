@@ -13,10 +13,10 @@ fn bench_no_match(c: &mut Criterion) {
 
     // Benchmark different class sizes (number of target bytes).
     let cases: &[(&str, &[u8])] = &[
-        ("2_bytes", &[b'a', b'A']),
-        ("4_bytes", &[b'a', b'A', b'b', b'B']),
-        ("6_bytes", &[b'a', b'A', b'b', b'B', b'c', b'C']),
-        ("8_bytes", &[b'a', b'A', b'b', b'B', b'c', b'C', b'd', b'D']),
+        ("2_bytes", b"aA"),
+        ("4_bytes", b"aAbB"),
+        ("6_bytes", b"aAbBcC"),
+        ("8_bytes", b"aAbBcCdD"),
     ];
 
     for &size in &[1024, 16384, 65536] {
@@ -54,10 +54,10 @@ fn bench_match_at_end(c: &mut Criterion) {
     let mut group = c.benchmark_group("memclass/match_at_end");
 
     let cases: &[(&str, &[u8])] = &[
-        ("2_bytes", &[b'a', b'A']),
-        ("4_bytes", &[b'a', b'A', b'b', b'B']),
-        ("6_bytes", &[b'a', b'A', b'b', b'B', b'c', b'C']),
-        ("8_bytes", &[b'a', b'A', b'b', b'B', b'c', b'C', b'd', b'D']),
+        ("2_bytes", b"aA"),
+        ("4_bytes", b"aAbB"),
+        ("6_bytes", b"aAbBcC"),
+        ("8_bytes", b"aAbBcCdD"),
     ];
 
     for &size in &[1024, 16384, 65536] {
@@ -96,7 +96,7 @@ fn bench_vs_memchr3(c: &mut Criterion) {
     let mut group = c.benchmark_group("memclass/vs_memchr3");
 
     // Compare memclass with 3 bytes against memchr3 with the same 3 bytes.
-    let bytes_3 = [b'a', b'b', b'c'];
+    let bytes_3 = *b"abc";
     let table = MemclassTable::new(&bytes_3);
 
     for &size in &[1024, 16384, 65536] {

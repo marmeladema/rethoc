@@ -72,49 +72,55 @@ mod imp {
             return memrange_fallback(lo, hi, haystack);
         }
 
-        let ptr = haystack.as_ptr();
-        let v_lo = _mm_set1_epi8(lo as i8);
-        let v_hi = _mm_set1_epi8(hi as i8);
+        // SAFETY: SSE2 is enabled on this function; every load stays within `haystack` (len >= 16): the first and last loads cover [0, 16) and [len-16, len), aligned loads stay below `aligned_end`.
+        unsafe {
+            let ptr = haystack.as_ptr();
+            let v_lo = _mm_set1_epi8(lo as i8);
+            let v_hi = _mm_set1_epi8(hi as i8);
 
-        // First unaligned load: [0, 16)
-        let chunk = _mm_loadu_si128(ptr as *const __m128i);
-        let bits = test_sse2(chunk, v_lo, v_hi);
-        if bits != 0 {
-            return Some(bits.trailing_zeros() as usize);
-        }
-
-        // Aligned middle loop.
-        let aligned_start = (ptr as usize + SSE2_WIDTH) & !(SSE2_WIDTH - 1);
-        let aligned_end = (ptr as usize + len) & !(SSE2_WIDTH - 1);
-        let mut p = aligned_start as *const __m128i;
-        let p_end = aligned_end as *const __m128i;
-
-        while p < p_end {
-            let chunk = _mm_load_si128(p);
+            // First unaligned load: [0, 16)
+            let chunk = _mm_loadu_si128(ptr as *const __m128i);
             let bits = test_sse2(chunk, v_lo, v_hi);
             if bits != 0 {
-                let offset = (p as usize) - (ptr as usize);
-                return Some(offset + bits.trailing_zeros() as usize);
+                return Some(bits.trailing_zeros() as usize);
             }
-            p = p.add(1);
-        }
 
-        // Final unaligned load: [len-16, len)
-        let chunk = _mm_loadu_si128(ptr.add(len - SSE2_WIDTH) as *const __m128i);
-        let bits = test_sse2(chunk, v_lo, v_hi);
-        if bits != 0 {
-            return Some(len - SSE2_WIDTH + bits.trailing_zeros() as usize);
-        }
+            // Aligned middle loop.
+            let aligned_start = (ptr as usize + SSE2_WIDTH) & !(SSE2_WIDTH - 1);
+            let aligned_end = (ptr as usize + len) & !(SSE2_WIDTH - 1);
+            let mut p = aligned_start as *const __m128i;
+            let p_end = aligned_end as *const __m128i;
 
-        None
+            while p < p_end {
+                let chunk = _mm_load_si128(p);
+                let bits = test_sse2(chunk, v_lo, v_hi);
+                if bits != 0 {
+                    let offset = (p as usize) - (ptr as usize);
+                    return Some(offset + bits.trailing_zeros() as usize);
+                }
+                p = p.add(1);
+            }
+
+            // Final unaligned load: [len-16, len)
+            let chunk = _mm_loadu_si128(ptr.add(len - SSE2_WIDTH) as *const __m128i);
+            let bits = test_sse2(chunk, v_lo, v_hi);
+            if bits != 0 {
+                return Some(len - SSE2_WIDTH + bits.trailing_zeros() as usize);
+            }
+
+            None
+        }
     }
 
     /// Test 16 bytes: returns a bitmask where bit `i` is set if byte `i`
     /// is in `[lo, hi]`.
     #[inline(always)]
     unsafe fn test_sse2(chunk: __m128i, v_lo: __m128i, v_hi: __m128i) -> i32 {
-        let clamped = _mm_min_epu8(_mm_max_epu8(chunk, v_lo), v_hi);
-        _mm_movemask_epi8(_mm_cmpeq_epi8(clamped, chunk))
+        // SAFETY: the caller has the required target feature enabled; these are register-only intrinsics.
+        unsafe {
+            let clamped = _mm_min_epu8(_mm_max_epu8(chunk, v_lo), v_hi);
+            _mm_movemask_epi8(_mm_cmpeq_epi8(clamped, chunk))
+        }
     }
 
     // -- AVX2 (32 bytes per iteration) --
@@ -126,52 +132,59 @@ mod imp {
         let len = haystack.len();
         if len < AVX2_WIDTH {
             // Fall through to SSE2 for 16–31 byte inputs.
-            return memrange_sse2(lo, hi, haystack);
+            // SAFETY: AVX2 implies SSE2 and SSSE3.
+            return unsafe { memrange_sse2(lo, hi, haystack) };
         }
 
-        let ptr = haystack.as_ptr();
-        let v_lo = _mm256_set1_epi8(lo as i8);
-        let v_hi = _mm256_set1_epi8(hi as i8);
+        // SAFETY: AVX2 is enabled on this function; every load stays within `haystack` (len >= 32): the first and last loads cover [0, 32) and [len-32, len), aligned loads stay below `aligned_end`.
+        unsafe {
+            let ptr = haystack.as_ptr();
+            let v_lo = _mm256_set1_epi8(lo as i8);
+            let v_hi = _mm256_set1_epi8(hi as i8);
 
-        // First unaligned load: [0, 32)
-        let chunk = _mm256_loadu_si256(ptr as *const __m256i);
-        let bits = test_avx2(chunk, v_lo, v_hi);
-        if bits != 0 {
-            return Some(bits.trailing_zeros() as usize);
-        }
-
-        // Aligned middle loop.
-        let aligned_start = (ptr as usize + AVX2_WIDTH) & !(AVX2_WIDTH - 1);
-        let aligned_end = (ptr as usize + len) & !(AVX2_WIDTH - 1);
-        let mut p = aligned_start as *const __m256i;
-        let p_end = aligned_end as *const __m256i;
-
-        while p < p_end {
-            let chunk = _mm256_load_si256(p);
+            // First unaligned load: [0, 32)
+            let chunk = _mm256_loadu_si256(ptr as *const __m256i);
             let bits = test_avx2(chunk, v_lo, v_hi);
             if bits != 0 {
-                let offset = (p as usize) - (ptr as usize);
-                return Some(offset + bits.trailing_zeros() as usize);
+                return Some(bits.trailing_zeros() as usize);
             }
-            p = p.add(1);
-        }
 
-        // Final unaligned load: [len-32, len)
-        let chunk = _mm256_loadu_si256(ptr.add(len - AVX2_WIDTH) as *const __m256i);
-        let bits = test_avx2(chunk, v_lo, v_hi);
-        if bits != 0 {
-            return Some(len - AVX2_WIDTH + bits.trailing_zeros() as usize);
-        }
+            // Aligned middle loop.
+            let aligned_start = (ptr as usize + AVX2_WIDTH) & !(AVX2_WIDTH - 1);
+            let aligned_end = (ptr as usize + len) & !(AVX2_WIDTH - 1);
+            let mut p = aligned_start as *const __m256i;
+            let p_end = aligned_end as *const __m256i;
 
-        None
+            while p < p_end {
+                let chunk = _mm256_load_si256(p);
+                let bits = test_avx2(chunk, v_lo, v_hi);
+                if bits != 0 {
+                    let offset = (p as usize) - (ptr as usize);
+                    return Some(offset + bits.trailing_zeros() as usize);
+                }
+                p = p.add(1);
+            }
+
+            // Final unaligned load: [len-32, len)
+            let chunk = _mm256_loadu_si256(ptr.add(len - AVX2_WIDTH) as *const __m256i);
+            let bits = test_avx2(chunk, v_lo, v_hi);
+            if bits != 0 {
+                return Some(len - AVX2_WIDTH + bits.trailing_zeros() as usize);
+            }
+
+            None
+        }
     }
 
     /// Test 32 bytes: returns a bitmask where bit `i` is set if byte `i`
     /// is in `[lo, hi]`.
     #[inline(always)]
     unsafe fn test_avx2(chunk: __m256i, v_lo: __m256i, v_hi: __m256i) -> i32 {
-        let clamped = _mm256_min_epu8(_mm256_max_epu8(chunk, v_lo), v_hi);
-        _mm256_movemask_epi8(_mm256_cmpeq_epi8(clamped, chunk))
+        // SAFETY: the caller has the required target feature enabled; these are register-only intrinsics.
+        unsafe {
+            let clamped = _mm256_min_epu8(_mm256_max_epu8(chunk, v_lo), v_hi);
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(clamped, chunk))
+        }
     }
 }
 

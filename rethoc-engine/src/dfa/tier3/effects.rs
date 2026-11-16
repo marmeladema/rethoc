@@ -1553,6 +1553,14 @@ fn gate_advance_origins(
     Some(effects)
 }
 
+/// Result of [`compile_all_target_effects`]: per-target effects,
+/// per-origin effects, and whether the effects are exact.
+pub(crate) type CompiledEffects = (
+    Box<[Option<CompiledTargetEffects>]>,
+    Box<[CompiledOriginEffects]>,
+    bool,
+);
+
 /// Compile all target effects for a [`Tier3Analysis`].
 ///
 /// Iterates over all targets in the analysis and compiles a
@@ -1576,11 +1584,7 @@ pub(crate) fn compile_all_target_effects(
     analysis: &super::Tier3Analysis,
     states: &[crate::State],
     arena: &mut AssertChainArena,
-) -> (
-    Box<[Option<CompiledTargetEffects>]>,
-    Box<[CompiledOriginEffects]>,
-    bool,
-) {
+) -> CompiledEffects {
     let mut exact = true;
     let effects: Vec<Option<CompiledTargetEffects>> = analysis
         .targets
@@ -1845,10 +1849,10 @@ mod tests {
     /// matching the given `AssertKind`.
     fn find_assert_state(regex: &crate::Regex, target_kind: crate::AssertKind) -> StateIdx {
         for (i, state) in regex.states.0.iter().enumerate() {
-            if let crate::State::Assert { kind, .. } = state {
-                if *kind == target_kind {
-                    return StateIdx(i as u32);
-                }
+            if let crate::State::Assert { kind, .. } = state
+                && *kind == target_kind
+            {
+                return StateIdx(i as u32);
             }
         }
         panic!("no Assert({target_kind:?}) state found in regex");
@@ -2765,7 +2769,7 @@ mod tests {
         // Such a pattern must not run on Tier 3: its effects are not exact.
         let analysis = four.tier3_analysis.as_ref().expect("analysis is kept");
         assert!(!analysis.effects_exact);
-        assert!(!check_break_deferred_soundness(&analysis, &four.states.0));
+        assert!(!check_break_deferred_soundness(analysis, &four.states.0));
         assert!(!four.tier3_eligible);
     }
 

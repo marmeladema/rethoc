@@ -122,42 +122,45 @@ mod imp {
             return memclass_fallback(table, haystack);
         }
 
-        let ptr = haystack.as_ptr();
-        let v_lo_table = _mm_loadu_si128(table.lo.as_ptr() as *const __m128i);
-        let v_hi_table = _mm_loadu_si128(table.hi.as_ptr() as *const __m128i);
-        let v_mask_lo = _mm_set1_epi8(0x0F);
+        // SAFETY: SSE2/SSSE3 are enabled on this function; the tables are 16 bytes and every haystack load stays within `haystack` (len >= 16).
+        unsafe {
+            let ptr = haystack.as_ptr();
+            let v_lo_table = _mm_loadu_si128(table.lo.as_ptr() as *const __m128i);
+            let v_hi_table = _mm_loadu_si128(table.hi.as_ptr() as *const __m128i);
+            let v_mask_lo = _mm_set1_epi8(0x0F);
 
-        // First unaligned load: [0, 16)
-        let chunk = _mm_loadu_si128(ptr as *const __m128i);
-        let bits = test_sse2(chunk, v_lo_table, v_hi_table, v_mask_lo);
-        if bits != 0 {
-            return Some(bits.trailing_zeros() as usize);
-        }
-
-        // Aligned middle loop.
-        let aligned_start = (ptr as usize + SSE2_WIDTH) & !(SSE2_WIDTH - 1);
-        let aligned_end = (ptr as usize + len) & !(SSE2_WIDTH - 1);
-        let mut p = aligned_start as *const __m128i;
-        let p_end = aligned_end as *const __m128i;
-
-        while p < p_end {
-            let chunk = _mm_load_si128(p);
+            // First unaligned load: [0, 16)
+            let chunk = _mm_loadu_si128(ptr as *const __m128i);
             let bits = test_sse2(chunk, v_lo_table, v_hi_table, v_mask_lo);
             if bits != 0 {
-                let offset = (p as usize) - (ptr as usize);
-                return Some(offset + bits.trailing_zeros() as usize);
+                return Some(bits.trailing_zeros() as usize);
             }
-            p = p.add(1);
-        }
 
-        // Final unaligned load: [len-16, len)
-        let chunk = _mm_loadu_si128(ptr.add(len - SSE2_WIDTH) as *const __m128i);
-        let bits = test_sse2(chunk, v_lo_table, v_hi_table, v_mask_lo);
-        if bits != 0 {
-            return Some(len - SSE2_WIDTH + bits.trailing_zeros() as usize);
-        }
+            // Aligned middle loop.
+            let aligned_start = (ptr as usize + SSE2_WIDTH) & !(SSE2_WIDTH - 1);
+            let aligned_end = (ptr as usize + len) & !(SSE2_WIDTH - 1);
+            let mut p = aligned_start as *const __m128i;
+            let p_end = aligned_end as *const __m128i;
 
-        None
+            while p < p_end {
+                let chunk = _mm_load_si128(p);
+                let bits = test_sse2(chunk, v_lo_table, v_hi_table, v_mask_lo);
+                if bits != 0 {
+                    let offset = (p as usize) - (ptr as usize);
+                    return Some(offset + bits.trailing_zeros() as usize);
+                }
+                p = p.add(1);
+            }
+
+            // Final unaligned load: [len-16, len)
+            let chunk = _mm_loadu_si128(ptr.add(len - SSE2_WIDTH) as *const __m128i);
+            let bits = test_sse2(chunk, v_lo_table, v_hi_table, v_mask_lo);
+            if bits != 0 {
+                return Some(len - SSE2_WIDTH + bits.trailing_zeros() as usize);
+            }
+
+            None
+        }
     }
 
     /// Test 16 bytes: returns a bitmask where bit `i` is set if byte `i`
@@ -169,22 +172,25 @@ mod imp {
         v_hi_table: __m128i,
         v_mask_lo: __m128i,
     ) -> i32 {
-        // Split each byte into nibbles.
-        let lo_nibbles = _mm_and_si128(chunk, v_mask_lo);
-        let hi_nibbles = _mm_and_si128(_mm_srli_epi16(chunk, 4), v_mask_lo);
-        // Shuffle-lookup each nibble in its table.
-        let lo_bits = _mm_shuffle_epi8(v_lo_table, lo_nibbles);
-        let hi_bits = _mm_shuffle_epi8(v_hi_table, hi_nibbles);
-        // A byte matches iff both nibble lookups share a bit.
-        let matched = _mm_and_si128(lo_bits, hi_bits);
-        // Convert to bitmask: any non-zero byte → bit set.
-        // _mm_cmpeq_epi8 with zero gives 0xFF for zero bytes;
-        // we want the inverse (non-zero = match).
-        let zero = _mm_setzero_si128();
-        let is_zero = _mm_cmpeq_epi8(matched, zero);
-        // Invert: matched bytes have 0 in is_zero → bit clear in movemask.
-        // So we invert the movemask.
-        !_mm_movemask_epi8(is_zero) & 0xFFFF
+        // SAFETY: the caller has the required target feature enabled; these are register-only intrinsics.
+        unsafe {
+            // Split each byte into nibbles.
+            let lo_nibbles = _mm_and_si128(chunk, v_mask_lo);
+            let hi_nibbles = _mm_and_si128(_mm_srli_epi16(chunk, 4), v_mask_lo);
+            // Shuffle-lookup each nibble in its table.
+            let lo_bits = _mm_shuffle_epi8(v_lo_table, lo_nibbles);
+            let hi_bits = _mm_shuffle_epi8(v_hi_table, hi_nibbles);
+            // A byte matches iff both nibble lookups share a bit.
+            let matched = _mm_and_si128(lo_bits, hi_bits);
+            // Convert to bitmask: any non-zero byte → bit set.
+            // _mm_cmpeq_epi8 with zero gives 0xFF for zero bytes;
+            // we want the inverse (non-zero = match).
+            let zero = _mm_setzero_si128();
+            let is_zero = _mm_cmpeq_epi8(matched, zero);
+            // Invert: matched bytes have 0 in is_zero → bit clear in movemask.
+            // So we invert the movemask.
+            !_mm_movemask_epi8(is_zero) & 0xFFFF
+        }
     }
 
     // -- AVX2 (32 bytes per iteration) --
@@ -195,48 +201,52 @@ mod imp {
     unsafe fn memclass_avx2(table: &MemclassTable, haystack: &[u8]) -> Option<usize> {
         let len = haystack.len();
         if len < AVX2_WIDTH {
-            return memclass_sse2(table, haystack);
+            // SAFETY: AVX2 implies SSE2 and SSSE3.
+            return unsafe { memclass_sse2(table, haystack) };
         }
 
-        let ptr = haystack.as_ptr();
-        // Broadcast 16-byte tables to both 128-bit lanes of a 256-bit register.
-        let lo_128 = _mm_loadu_si128(table.lo.as_ptr() as *const __m128i);
-        let hi_128 = _mm_loadu_si128(table.hi.as_ptr() as *const __m128i);
-        let v_lo_table = _mm256_broadcastsi128_si256(lo_128);
-        let v_hi_table = _mm256_broadcastsi128_si256(hi_128);
-        let v_mask_lo = _mm256_set1_epi8(0x0F);
+        // SAFETY: AVX2 is enabled on this function; the tables are 16 bytes and every haystack load stays within `haystack` (len >= 32).
+        unsafe {
+            let ptr = haystack.as_ptr();
+            // Broadcast 16-byte tables to both 128-bit lanes of a 256-bit register.
+            let lo_128 = _mm_loadu_si128(table.lo.as_ptr() as *const __m128i);
+            let hi_128 = _mm_loadu_si128(table.hi.as_ptr() as *const __m128i);
+            let v_lo_table = _mm256_broadcastsi128_si256(lo_128);
+            let v_hi_table = _mm256_broadcastsi128_si256(hi_128);
+            let v_mask_lo = _mm256_set1_epi8(0x0F);
 
-        // First unaligned load: [0, 32)
-        let chunk = _mm256_loadu_si256(ptr as *const __m256i);
-        let bits = test_avx2(chunk, v_lo_table, v_hi_table, v_mask_lo);
-        if bits != 0 {
-            return Some(bits.trailing_zeros() as usize);
-        }
-
-        // Aligned middle loop.
-        let aligned_start = (ptr as usize + AVX2_WIDTH) & !(AVX2_WIDTH - 1);
-        let aligned_end = (ptr as usize + len) & !(AVX2_WIDTH - 1);
-        let mut p = aligned_start as *const __m256i;
-        let p_end = aligned_end as *const __m256i;
-
-        while p < p_end {
-            let chunk = _mm256_load_si256(p);
+            // First unaligned load: [0, 32)
+            let chunk = _mm256_loadu_si256(ptr as *const __m256i);
             let bits = test_avx2(chunk, v_lo_table, v_hi_table, v_mask_lo);
             if bits != 0 {
-                let offset = (p as usize) - (ptr as usize);
-                return Some(offset + bits.trailing_zeros() as usize);
+                return Some(bits.trailing_zeros() as usize);
             }
-            p = p.add(1);
-        }
 
-        // Final unaligned load: [len-32, len)
-        let chunk = _mm256_loadu_si256(ptr.add(len - AVX2_WIDTH) as *const __m256i);
-        let bits = test_avx2(chunk, v_lo_table, v_hi_table, v_mask_lo);
-        if bits != 0 {
-            return Some(len - AVX2_WIDTH + bits.trailing_zeros() as usize);
-        }
+            // Aligned middle loop.
+            let aligned_start = (ptr as usize + AVX2_WIDTH) & !(AVX2_WIDTH - 1);
+            let aligned_end = (ptr as usize + len) & !(AVX2_WIDTH - 1);
+            let mut p = aligned_start as *const __m256i;
+            let p_end = aligned_end as *const __m256i;
 
-        None
+            while p < p_end {
+                let chunk = _mm256_load_si256(p);
+                let bits = test_avx2(chunk, v_lo_table, v_hi_table, v_mask_lo);
+                if bits != 0 {
+                    let offset = (p as usize) - (ptr as usize);
+                    return Some(offset + bits.trailing_zeros() as usize);
+                }
+                p = p.add(1);
+            }
+
+            // Final unaligned load: [len-32, len)
+            let chunk = _mm256_loadu_si256(ptr.add(len - AVX2_WIDTH) as *const __m256i);
+            let bits = test_avx2(chunk, v_lo_table, v_hi_table, v_mask_lo);
+            if bits != 0 {
+                return Some(len - AVX2_WIDTH + bits.trailing_zeros() as usize);
+            }
+
+            None
+        }
     }
 
     /// Test 32 bytes: returns a bitmask where bit `i` is set if byte `i`
@@ -248,14 +258,17 @@ mod imp {
         v_hi_table: __m256i,
         v_mask_lo: __m256i,
     ) -> i32 {
-        let lo_nibbles = _mm256_and_si256(chunk, v_mask_lo);
-        let hi_nibbles = _mm256_and_si256(_mm256_srli_epi16(chunk, 4), v_mask_lo);
-        let lo_bits = _mm256_shuffle_epi8(v_lo_table, lo_nibbles);
-        let hi_bits = _mm256_shuffle_epi8(v_hi_table, hi_nibbles);
-        let matched = _mm256_and_si256(lo_bits, hi_bits);
-        let zero = _mm256_setzero_si256();
-        let is_zero = _mm256_cmpeq_epi8(matched, zero);
-        !_mm256_movemask_epi8(is_zero)
+        // SAFETY: the caller has the required target feature enabled; these are register-only intrinsics.
+        unsafe {
+            let lo_nibbles = _mm256_and_si256(chunk, v_mask_lo);
+            let hi_nibbles = _mm256_and_si256(_mm256_srli_epi16(chunk, 4), v_mask_lo);
+            let lo_bits = _mm256_shuffle_epi8(v_lo_table, lo_nibbles);
+            let hi_bits = _mm256_shuffle_epi8(v_hi_table, hi_nibbles);
+            let matched = _mm256_and_si256(lo_bits, hi_bits);
+            let zero = _mm256_setzero_si256();
+            let is_zero = _mm256_cmpeq_epi8(matched, zero);
+            !_mm256_movemask_epi8(is_zero)
+        }
     }
 }
 
@@ -379,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_table_single_byte() {
-        let t = MemclassTable::new(&[b'a']);
+        let t = MemclassTable::new(b"a");
         assert!(t.contains(b'a'));
         assert!(!t.contains(b'b'));
         assert!(!t.contains(0));
@@ -387,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_table_case_insensitive_pair() {
-        let t = MemclassTable::new(&[b'a', b'A']);
+        let t = MemclassTable::new(b"aA");
         assert!(t.contains(b'a'));
         assert!(t.contains(b'A'));
         assert!(!t.contains(b'b'));
@@ -396,8 +409,8 @@ mod tests {
     #[test]
     fn test_table_six_bytes() {
         // 3 case-insensitive letters
-        let t = MemclassTable::new(&[b'a', b'A', b'b', b'B', b'c', b'C']);
-        for &b in &[b'a', b'A', b'b', b'B', b'c', b'C'] {
+        let t = MemclassTable::new(b"aAbBcC");
+        for &b in b"aAbBcC" {
             assert!(t.contains(b), "should contain {}", b as char);
         }
         assert!(!t.contains(b'd'));
@@ -408,8 +421,8 @@ mod tests {
 
     #[test]
     fn test_table_eight_bytes() {
-        let t = MemclassTable::new(&[b'a', b'A', b'b', b'B', b'c', b'C', b'd', b'D']);
-        for &b in &[b'a', b'A', b'b', b'B', b'c', b'C', b'd', b'D'] {
+        let t = MemclassTable::new(b"aAbBcCdD");
+        for &b in b"aAbBcCdD" {
             assert!(t.contains(b));
         }
         assert!(!t.contains(b'e'));
@@ -431,38 +444,38 @@ mod tests {
 
     #[test]
     fn test_empty_haystack() {
-        let t = MemclassTable::new(&[b'x']);
+        let t = MemclassTable::new(b"x");
         assert_eq!(memclass(&t, &[]), None);
     }
 
     #[test]
     fn test_no_match() {
-        let t = MemclassTable::new(&[b'x', b'y']);
+        let t = MemclassTable::new(b"xy");
         assert_eq!(memclass(&t, b"abcdefghijklmnop"), None);
     }
 
     #[test]
     fn test_first_byte_matches() {
-        let t = MemclassTable::new(&[b'a', b'A']);
+        let t = MemclassTable::new(b"aA");
         assert_eq!(memclass(&t, b"abcdef"), Some(0));
     }
 
     #[test]
     fn test_last_byte_matches() {
-        let t = MemclassTable::new(&[b'f']);
+        let t = MemclassTable::new(b"f");
         assert_eq!(memclass(&t, b"abcdef"), Some(5));
     }
 
     #[test]
     fn test_match_in_middle() {
-        let t = MemclassTable::new(&[b'x', b'X']);
+        let t = MemclassTable::new(b"xX");
         let hay = b"0123456789abcdefXhij";
         assert_eq!(memclass(&t, hay), Some(16));
     }
 
     #[test]
     fn test_six_byte_class() {
-        let t = MemclassTable::new(&[b'a', b'A', b'b', b'B', b'c', b'C']);
+        let t = MemclassTable::new(b"aAbBcC");
         assert_eq!(memclass(&t, b"0123456789B"), Some(10));
         assert_eq!(memclass(&t, b"0123456789"), None);
     }
@@ -471,14 +484,14 @@ mod tests {
 
     #[test]
     fn test_large_no_match() {
-        let t = MemclassTable::new(&[b'x']);
+        let t = MemclassTable::new(b"x");
         let hay = vec![b'a'; 1024];
         assert_eq!(memclass(&t, &hay), None);
     }
 
     #[test]
     fn test_large_match_at_start() {
-        let t = MemclassTable::new(&[b'x']);
+        let t = MemclassTable::new(b"x");
         let mut hay = vec![b'a'; 1024];
         hay[0] = b'x';
         assert_eq!(memclass(&t, &hay), Some(0));
@@ -486,7 +499,7 @@ mod tests {
 
     #[test]
     fn test_large_match_at_end() {
-        let t = MemclassTable::new(&[b'x']);
+        let t = MemclassTable::new(b"x");
         let mut hay = vec![b'a'; 1024];
         hay[1023] = b'x';
         assert_eq!(memclass(&t, &hay), Some(1023));
@@ -494,7 +507,7 @@ mod tests {
 
     #[test]
     fn test_large_match_past_simd_boundary() {
-        let t = MemclassTable::new(&[b'x', b'X']);
+        let t = MemclassTable::new(b"xX");
         let mut hay = vec![b'a'; 1024];
         hay[500] = b'X';
         assert_eq!(memclass(&t, &hay), Some(500));
@@ -502,7 +515,7 @@ mod tests {
 
     #[test]
     fn test_all_bytes_match() {
-        let t = MemclassTable::new(&[b'a']);
+        let t = MemclassTable::new(b"a");
         let hay = vec![b'a'; 256];
         assert_eq!(memclass(&t, &hay), Some(0));
     }
@@ -511,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_scalar_matches_simd() {
-        let t = MemclassTable::new(&[b'a', b'A', b'b', b'B', b'x', b'X']);
+        let t = MemclassTable::new(b"aAbBxX");
         for pos in 0..256 {
             let mut hay = vec![b'.'; 256];
             hay[pos] = b'X';

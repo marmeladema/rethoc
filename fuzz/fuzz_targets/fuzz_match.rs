@@ -18,10 +18,10 @@ use rethoc_engine::{MatcherMemory, RegexBuilder};
 use std::cell::RefCell;
 
 thread_local! {
-    static CURRENT_PATTERN: RefCell<String> = RefCell::new(String::new());
-    static CURRENT_INPUT: RefCell<Vec<u8>> = RefCell::new(Vec::new());
-    static CURRENT_PHASE: RefCell<String> = RefCell::new(String::new());
-    static HOOK_INSTALLED: RefCell<bool> = RefCell::new(false);
+    static CURRENT_PATTERN: RefCell<String> = const { RefCell::new(String::new()) };
+    static CURRENT_INPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static CURRENT_PHASE: RefCell<String> = const { RefCell::new(String::new()) };
+    static HOOK_INSTALLED: RefCell<bool> = const { RefCell::new(false) };
 }
 
 fn install_panic_hook() {

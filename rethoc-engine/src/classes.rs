@@ -469,7 +469,7 @@ mod tests {
         }
         let bits = ByteClassBits::from_bools(&bools);
         for b in 0..=255u8 {
-            assert_eq!(bits.contains(b), b >= b'a' && b <= b'z', "byte {b}");
+            assert_eq!(bits.contains(b), b.is_ascii_lowercase(), "byte {b}");
         }
     }
 
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn test_static_hex_lower_correctness() {
         for b in 0..=255u8 {
-            let expected = b.is_ascii_digit() || (b >= b'a' && b <= b'f');
+            let expected = b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
             assert_eq!(
                 static_classes::HEX_LOWER[b as usize],
                 expected,

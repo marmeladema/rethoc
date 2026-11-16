@@ -717,12 +717,11 @@ impl Tier4DfaCache {
         self.closure_result.sort_unstable();
         self.closure_result.dedup();
 
+        // Drain rather than `mem::take`: the scratch buffer keeps its
+        // capacity for the next closure.
+        #[expect(clippy::drain_collect, reason = "keep scratch capacity")]
         let ops = self.closure_ops.drain(..).collect();
-        let result = self
-            .closure_result
-            .drain(..)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let result: Box<[StateIdx]> = self.closure_result.as_slice().into();
 
         (result, is_match, is_match_at_end, ops)
     }
@@ -861,6 +860,7 @@ impl Tier4DfaCache {
         }
 
         debug_assert_eq!(self.closure_end_levels.len(), 1);
+        #[expect(clippy::drain_collect, reason = "keep scratch capacity")]
         let mut ops: Vec<CounterOp> = self.closure_end_ops.drain(..).collect();
         rewrite_match_to_match_at_end(&mut ops);
         ops
