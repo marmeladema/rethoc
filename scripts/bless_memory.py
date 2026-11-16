@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bless memory sizes in match_tests! entries.
 
-Scans ``src/lib.rs`` for ``match_tests!`` entries, compiles each pattern
+Scans ``rethoc-engine/src/lib.rs`` for ``match_tests!`` entries, compiles each pattern
 with ``rethoc --format json info``, and updates the expected memory size
 in-place if it has changed.
 
@@ -10,7 +10,7 @@ masking tier regressions).
 
 Usage::
 
-    python3 scripts/bless_memory.py          # update src/lib.rs in-place
+    python3 scripts/bless_memory.py          # update rethoc-engine/src/lib.rs in-place
     python3 scripts/bless_memory.py --check  # exit 1 if any are stale
     python3 scripts/bless_memory.py --dry-run # show what would change
 """
@@ -28,6 +28,11 @@ from typing import Optional
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB_RS = REPO_ROOT / "rethoc-engine" / "src" / "lib.rs"
 RETHOC = REPO_ROOT / "target" / "release" / "rethoc"
+
+# The tests compile with ``max_estimated_states: usize::MAX`` (see
+# ``build_regex_with_unroll()`` in lib.rs); match that instead of the CLI
+# default, or patterns over the default budget fail to compile here.
+TEST_MAX_STATES = 2**64 - 1
 
 # ---------------------------------------------------------------------------
 # Pattern extraction
@@ -113,7 +118,7 @@ def get_memory_size(pattern: str, unroll_limit: Optional[int]) -> int:
 
     Returns -1 on failure.
     """
-    cmd = [str(RETHOC), "--format", "json"]
+    cmd = [str(RETHOC), "--format", "json", "--max-states", str(TEST_MAX_STATES)]
     if unroll_limit is not None:
         cmd.extend(["--unroll-limit", str(unroll_limit)])
     cmd.extend(["info", pattern])
@@ -150,14 +155,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # Ensure rethoc is built
-    if not RETHOC.exists():
-        print("Building rethoc (release)...", file=sys.stderr)
-        subprocess.run(
-            ["cargo", "build", "--release"],
-            cwd=REPO_ROOT,
-            check=True,
-        )
+    # Always (re)build: a stale binary would report stale sizes.  This is a
+    # no-op when the release build is up to date.
+    subprocess.run(
+        ["cargo", "build", "--release", "--quiet", "-p", "rethoc-cli"],
+        cwd=REPO_ROOT,
+        check=True,
+    )
 
     content = LIB_RS.read_text()
 
