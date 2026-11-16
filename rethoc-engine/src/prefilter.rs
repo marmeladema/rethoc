@@ -203,14 +203,7 @@ mod tests {
 
     /// Helper: compile a pattern and return its prefilter.
     fn prefilter_for(pattern: &str) -> Prefilter {
-        let re = Regex::with_config(
-            pattern,
-            RegexConfig {
-                max_estimated_states: usize::MAX,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let re = Regex::new(pattern).unwrap();
         re.prefilter
     }
 
@@ -220,7 +213,6 @@ mod tests {
             pattern,
             RegexConfig {
                 max_unroll_states: 0,
-                max_estimated_states: usize::MAX,
                 ..Default::default()
             },
         )

@@ -61,9 +61,7 @@ never touches `min_tier:`; a tier change is a regression to look at).
 ### Resource caps
 
 Everything runs under a memory and time cap. A regressed engine bug can
-allocate without bound and take the machine down with it, and the test
-helpers compile with `max_estimated_states: usize::MAX`, so the compile
-budget does not protect them.
+allocate without bound and take the machine down with it.
 
 - **Automatic.** `.cargo/config.toml` makes `scripts/capped` the cargo
   runner: every binary run by `cargo test`, `cargo bench` and `cargo run`
@@ -156,8 +154,15 @@ test_name {
 ```
 
 Each entry checks every eligible tier, whole and byte by byte, against
-the `regex` crate. It then re-runs everything with unrolling and merging
-disabled. So a Tier 3 failure can come from a `min_tier: 1` entry.
+the `regex` crate. It then re-runs everything with unrolling off, and
+with unrolling and merging off (the same three configurations as the
+`rethoc` checking commands). So a Tier 3 failure can come from a
+`min_tier: 1` entry; the failure message names the configuration.
+
+Entries compile with the engine's default compile limit
+(`max_estimated_states`), like user code. A pattern estimated above it
+needs `max_states: N` (after `unroll_limit:`, if any) and a comment
+saying why; `bless_memory.py` reads it too.
 
 **Never write `unroll_limit: 0`**: the macro already runs that
 configuration, and setting it skips the default one.

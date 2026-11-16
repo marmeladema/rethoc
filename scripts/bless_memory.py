@@ -29,18 +29,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB_RS = REPO_ROOT / "rethoc-engine" / "src" / "lib.rs"
 RETHOC = REPO_ROOT / "target" / "release" / "rethoc"
 
-# The tests compile with ``max_estimated_states: usize::MAX`` (see
-# ``build_regex_with_unroll()`` in lib.rs); match that instead of the CLI
-# default, or patterns over the default budget fail to compile here.
-TEST_MAX_STATES = 2**64 - 1
-
 # ---------------------------------------------------------------------------
 # Pattern extraction
 # ---------------------------------------------------------------------------
 
 # Matches a test entry header inside match_tests!{ ... }.
 # Groups: 1=test_name, pat=pattern literal, mem=memory value,
-#         unroll=optional unroll_limit.
+#         unroll=optional unroll_limit, states=optional max_states.
 ENTRY_RE = re.compile(
     r"""
     (\w+)                                      # test name
@@ -49,6 +44,7 @@ ENTRY_RE = re.compile(
     \s*memory:\s*(?P<mem>\d+),                 # memory value
     \s*min_tier:\s*\d+,                        # min_tier (not touched)
     (?:\s*unroll_limit:\s*(?P<unroll>\d+),)?    # optional unroll_limit
+    (?:\s*max_states:\s*(?P<states>[\d_]+),)?    # optional max_states
     """,
     re.VERBOSE,
 )
@@ -113,14 +109,20 @@ def parse_rust_string(literal: str) -> str:
     raise ValueError(f"Cannot parse Rust string literal: {literal!r}")
 
 
-def get_memory_size(pattern: str, unroll_limit: Optional[int]) -> int:
+def get_memory_size(
+    pattern: str, unroll_limit: Optional[int], max_states: Optional[int]
+) -> int:
     """Run ``rethoc info --format json`` and return ``memory.total``.
 
     Returns -1 on failure.
     """
-    cmd = [str(RETHOC), "info", "--format", "json", "--max-states", str(TEST_MAX_STATES)]
+    # Compile like the test does: the default limits unless the entry
+    # overrides them.
+    cmd = [str(RETHOC), "info", "--format", "json"]
     if unroll_limit is not None:
         cmd.extend(["--unroll-limit", str(unroll_limit)])
+    if max_states is not None:
+        cmd.extend(["--max-states", str(max_states)])
     cmd.extend(["--", pattern])
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
@@ -177,6 +179,8 @@ def main() -> int:
         old_memory = int(m.group("mem"))
         unroll_str = m.group("unroll")
         unroll_limit = int(unroll_str) if unroll_str else None
+        states_str = m.group("states")
+        max_states = int(states_str.replace("_", "")) if states_str else None
 
         try:
             pattern = parse_rust_string(pat_literal)
@@ -184,7 +188,7 @@ def main() -> int:
             print(f"  SKIP {test_name}: {e}", file=sys.stderr)
             continue
 
-        actual = get_memory_size(pattern, unroll_limit)
+        actual = get_memory_size(pattern, unroll_limit, max_states)
         if actual < 0:
             errors += 1
             continue
