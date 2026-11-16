@@ -115,6 +115,7 @@ impl Run {
             "MISMATCH",
             "ABORT",
             "memory allocation",
+            "Cannot allocate memory",
             "panicked",
             "error",
         ];
@@ -192,7 +193,7 @@ fn try_run_capped(args: &[String], caps: Caps, start: Instant) -> Result<Run, St
 
     let verdict = if timed_out {
         Verdict::Timeout
-    } else if stderr.contains("memory allocation of") {
+    } else if caps.mem_kib.is_some() && is_out_of_memory(&stderr) {
         Verdict::OutOfMemory
     } else {
         match status.code() {
@@ -210,6 +211,20 @@ fn try_run_capped(args: &[String], caps: Caps, start: Instant) -> Result<Run, St
         stderr,
         elapsed,
     })
+}
+
+/// Whether `stderr` shows an allocation failing.  Same patterns as
+/// `scripts/capped`: Rust's allocation-failure abort, and ENOMEM
+/// surfacing as an error (failed thread spawn or `mmap`).
+fn is_out_of_memory(stderr: &str) -> bool {
+    [
+        "memory allocation of",
+        "Cannot allocate memory",
+        "out of memory",
+        "Out of memory",
+    ]
+    .iter()
+    .any(|p| stderr.contains(p))
 }
 
 /// Read a child's stdout or stderr to the end on a separate thread.
@@ -252,4 +267,22 @@ pub(crate) fn parallel<T: Sync, R: Send>(
             done(&tasks[i], result);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_out_of_memory;
+
+    #[test]
+    fn out_of_memory_patterns() {
+        assert!(is_out_of_memory(
+            "memory allocation of 268435456 bytes failed\n"
+        ));
+        assert!(is_out_of_memory(
+            "failed to spawn thread: Os { code: 12, kind: OutOfMemory, message: \"Cannot allocate memory\" }"
+        ));
+        assert!(!is_out_of_memory(
+            "thread 'main' panicked at src/lib.rs:1:1"
+        ));
+    }
 }
