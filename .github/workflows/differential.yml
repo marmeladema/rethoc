@@ -1,0 +1,102 @@
+# Slower checks: differential fuzzing and sweeps against the regex crate,
+# and the Callgrind performance gate.  `rethoc fuzz --batch` and
+# `rethoc sweep` cap each child process themselves; scripts/capped caps
+# the parent.
+name: Differential
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --release -p rethoc-cli
+      - name: Fuzz seeds 0..9000
+        run: >-
+          scripts/capped --time 1800
+          target/release/rethoc fuzz --batch 250
+          --allow-slow ci/known-slow-seeds.txt 0 9000
+      # Disabled until #5 is fixed: one MatcherMemory reused across regexes
+      # panics (from seed 6).  Enable it in the PR that fixes #5.
+      # - name: Fuzz seeds 0..9000, one MatcherMemory per run
+      #   run: >-
+      #     scripts/capped --time 1800
+      #     target/release/rethoc fuzz --shared-memory --batch 250
+      #     --allow-slow ci/known-slow-seeds.txt 0 9000
+
+  sweep:
+    name: sweep (${{ matrix.family }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # tier3-assert finds 108 known false positives on Tier 3 and Tier 2:
+    # its result is reported but does not block until they are fixed.
+    continue-on-error: ${{ matrix.allow-failure }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: nullable-counter
+            allow-failure: false
+          - family: tier3-assert
+            allow-failure: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --release -p rethoc-cli
+      - run: scripts/capped --time 1800 target/release/rethoc sweep ${{ matrix.family }}
+
+  callgrind:
+    # Compares instruction and branch-miss counts of this PR against its
+    # base branch, measured in the same job (same machine and toolchain).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GUNGRAUN_RUNNER_VERSION: 0.20.0 # must match the gungraun dev-dependency
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: Cache gungraun-runner
+        id: runner-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/gungraun-runner
+          key: gungraun-runner-${{ env.GUNGRAUN_RUNNER_VERSION }}-${{ runner.os }}
+      - if: steps.runner-cache.outputs.cache-hit != 'true'
+        run: cargo install gungraun-runner --version "$GUNGRAUN_RUNNER_VERSION" --locked
+      - name: Baseline from the base branch
+        run: |
+          git worktree add "$RUNNER_TEMP/base" "origin/$GITHUB_BASE_REF"
+          cd "$RUNNER_TEMP/base"
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+            cargo bench --bench reengage_profile -- --save-baseline=main
+      - name: Compare this PR against the baseline
+        run: cargo bench --bench reengage_profile -- --baseline=main
