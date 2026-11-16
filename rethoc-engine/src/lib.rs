@@ -1362,7 +1362,7 @@ impl Default for RegexConfig {
             max_repetition: 1000,
             max_unroll_states: DEFAULT_MAX_UNROLL_STATES,
             merge_repetitions: true,
-            max_estimated_states: 2048,
+            max_estimated_states: DEFAULT_MAX_ESTIMATED_STATES,
         }
     }
 }
@@ -3173,6 +3173,11 @@ use dfa::tier2::MAX_TIER2_COUNTERS;
 /// Used by [`RegexBuilder::default()`].
 const DEFAULT_MAX_UNROLL_STATES: usize = 32;
 
+/// Default compile limit: the most NFA states a pattern may need if every
+/// bounded repetition were fully unrolled (`estimate_nfa_states`).
+/// Used by [`RegexConfig::default()`].
+const DEFAULT_MAX_ESTIMATED_STATES: usize = 2048;
+
 /// Sentinel value: this counter slot is inactive (thread is not inside
 /// this counter's repetition body).
 const COUNTER_INACTIVE: usize = usize::MAX;
@@ -4943,27 +4948,26 @@ mod tests {
     /// asserting a specific memory size.  Used by dedup tests that
     /// compare sizes relatively rather than absolutely.
     fn build_regex_unchecked(pattern: &str) -> Regex {
-        Regex::with_config(
-            pattern,
-            RegexConfig {
-                max_estimated_states: usize::MAX,
-                ..Default::default()
-            },
-        )
-        .expect("our builder should accept the pattern")
+        Regex::new(pattern).expect("our builder should accept the pattern")
     }
 
-    /// Build a compiled [`Regex`] with a specific unroll limit.
+    /// Build a compiled [`Regex`] with a specific unroll limit and the
+    /// default compile limit (`max_estimated_states`).
     fn build_regex_with_unroll(pattern: &str, max_unroll_states: usize) -> Regex {
-        Regex::with_config(
+        build_regex_with_config(
             pattern,
             RegexConfig {
                 max_unroll_states,
-                max_estimated_states: usize::MAX,
                 ..Default::default()
             },
         )
-        .expect("our builder should accept the pattern")
+    }
+
+    /// Build a compiled [`Regex`] with `config`.  Tests keep the default
+    /// compile limit unless they need more (`max_states:` in
+    /// `match_tests!`), so they compile what users can.
+    fn build_regex_with_config(pattern: &str, config: RegexConfig) -> Regex {
+        Regex::with_config(pattern, config).expect("our builder should accept the pattern")
     }
     // -----------------------------------------------------------------------
     // Data-driven test infrastructure
@@ -4986,15 +4990,15 @@ mod tests {
     }
 
     /// Test a pattern+input via the NFA simulator (full-chunk + byte-at-a-time).
-    fn test_nfa(pattern: &str, re: &Regex, input: &str, expected: bool, unroll: usize) {
+    fn test_nfa(pattern: &str, re: &Regex, input: &str, expected: bool, config: &str) {
         let mut memory = MatcherMemory::default();
         let mut m = memory.nfa_matcher(re);
         m.chunk(input.as_bytes());
         let actual = m.finish();
         assert_eq!(
             actual, expected,
-            "NFA chunk mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
-            pattern, input, unroll, actual, expected
+            "NFA chunk mismatch for `{}` on {:?} ({}): got={}, expected={}",
+            pattern, input, config, actual, expected
         );
         let mut m = memory.nfa_matcher(re);
         for &b in input.as_bytes() {
@@ -5003,13 +5007,13 @@ mod tests {
         let actual = m.finish();
         assert_eq!(
             actual, expected,
-            "NFA single-byte mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
-            pattern, input, unroll, actual, expected
+            "NFA single-byte mismatch for `{}` on {:?} ({}): got={}, expected={}",
+            pattern, input, config, actual, expected
         );
     }
 
     /// Test a pattern+input via Tier 1 DFA (full-chunk + byte-at-a-time).
-    fn test_tier1(pattern: &str, re: &Regex, input: &str, expected: bool, unroll: usize) {
+    fn test_tier1(pattern: &str, re: &Regex, input: &str, expected: bool, config: &str) {
         use crate::dfa::{DfaMatcher, DfaMemory, Tier1DfaCache};
         let mut memory = DfaMemory::default();
         let mut cache = Tier1DfaCache::new();
@@ -5019,8 +5023,8 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier1 chunk mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
-            pattern, input, unroll, actual, expected
+            "Tier1 chunk mismatch for `{}` on {:?} ({}): got={}, expected={}",
+            pattern, input, config, actual, expected
         );
         let mut d = DfaMatcher::new(&mut cache, &mut memory, re);
         for &b in input.as_bytes() {
@@ -5029,13 +5033,13 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier1 single-byte mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
-            pattern, input, unroll, actual, expected
+            "Tier1 single-byte mismatch for `{}` on {:?} ({}): got={}, expected={}",
+            pattern, input, config, actual, expected
         );
     }
 
     /// Test a pattern+input via Tier 2 DFA (full-chunk + byte-at-a-time).
-    fn test_tier2(pattern: &str, re: &Regex, input: &str, expected: bool, unroll: usize) {
+    fn test_tier2(pattern: &str, re: &Regex, input: &str, expected: bool, config: &str) {
         use crate::dfa::{DfaMemory, Tier2DfaCache, Tier2DfaMatcher};
         let analysis = re
             .tier2_analysis
@@ -5049,8 +5053,8 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier2 chunk mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
-            pattern, input, unroll, actual, expected
+            "Tier2 chunk mismatch for `{}` on {:?} ({}): got={}, expected={}",
+            pattern, input, config, actual, expected
         );
         let mut d = Tier2DfaMatcher::new(&mut cache, &mut memory, re, analysis);
         for &b in input.as_bytes() {
@@ -5059,13 +5063,13 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier2 single-byte mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
-            pattern, input, unroll, actual, expected
+            "Tier2 single-byte mismatch for `{}` on {:?} ({}): got={}, expected={}",
+            pattern, input, config, actual, expected
         );
     }
 
     /// Test a pattern+input via Tier 3 DFA (full-chunk + byte-at-a-time).
-    fn test_tier3(pattern: &str, re: &Regex, input: &str, expected: bool, unroll: usize) {
+    fn test_tier3(pattern: &str, re: &Regex, input: &str, expected: bool, config: &str) {
         use crate::dfa::{DfaMemory, Tier3DfaCache, Tier3DfaMatcher};
         let analysis = re
             .tier3_analysis
@@ -5079,8 +5083,8 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier3 chunk mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
-            pattern, input, unroll, actual, expected
+            "Tier3 chunk mismatch for `{}` on {:?} ({}): got={}, expected={}",
+            pattern, input, config, actual, expected
         );
         let mut d = Tier3DfaMatcher::new(&mut cache, &mut memory, re, analysis);
         for &b in input.as_bytes() {
@@ -5089,13 +5093,13 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier3 single-byte mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
-            pattern, input, unroll, actual, expected
+            "Tier3 single-byte mismatch for `{}` on {:?} ({}): got={}, expected={}",
+            pattern, input, config, actual, expected
         );
     }
 
     /// Test a pattern+input via Tier 4 DFA (full-chunk + byte-at-a-time).
-    fn test_tier4(pattern: &str, re: &Regex, input: &str, expected: bool, unroll: usize) {
+    fn test_tier4(pattern: &str, re: &Regex, input: &str, expected: bool, config: &str) {
         use crate::dfa::{Tier4DfaCache, Tier4DfaMatcher};
         let mut cache = Tier4DfaCache::new(re.states.len());
         cache.prepare(re);
@@ -5109,8 +5113,8 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier4 chunk mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
-            pattern, input, unroll, actual, expected
+            "Tier4 chunk mismatch for `{}` on {:?} ({}): got={}, expected={}",
+            pattern, input, config, actual, expected
         );
         pool.clear();
         pool.num_counters = re.num_counters;
@@ -5121,8 +5125,8 @@ mod tests {
         let actual = d.finish();
         assert_eq!(
             actual, expected,
-            "Tier4 single-byte mismatch for `{}` on {:?} (unroll={}): got={}, expected={}",
-            pattern, input, unroll, actual, expected
+            "Tier4 single-byte mismatch for `{}` on {:?} ({}): got={}, expected={}",
+            pattern, input, config, actual, expected
         );
     }
 
@@ -5133,7 +5137,7 @@ mod tests {
         re: &Regex,
         oracle: &regex::bytes::Regex,
         inputs: &[(&str, bool)],
-        unroll: usize,
+        config: &str,
     ) {
         for &(input, expected_hint) in inputs {
             let expected = oracle.is_match(input.as_bytes());
@@ -5141,25 +5145,25 @@ mod tests {
             // Sanity-check the hint against the oracle.
             assert_eq!(
                 expected, expected_hint,
-                "Oracle/hint mismatch for `{}` on {:?} (unroll={}): oracle={}, hint={}",
-                pattern, input, unroll, expected, expected_hint
+                "Oracle/hint mismatch for `{}` on {:?} ({}): oracle={}, hint={}",
+                pattern, input, config, expected, expected_hint
             );
 
             // Always test NFA.
-            test_nfa(pattern, re, input, expected, unroll);
+            test_nfa(pattern, re, input, expected, config);
 
             // Test each DFA tier the regex is actually eligible for.
             if re.dfa_eligible {
-                test_tier1(pattern, re, input, expected, unroll);
+                test_tier1(pattern, re, input, expected, config);
             }
             if re.tier2_eligible {
-                test_tier2(pattern, re, input, expected, unroll);
+                test_tier2(pattern, re, input, expected, config);
             }
             if re.tier3_eligible {
-                test_tier3(pattern, re, input, expected, unroll);
+                test_tier3(pattern, re, input, expected, config);
             }
             if re.tier4_eligible {
-                test_tier4(pattern, re, input, expected, unroll);
+                test_tier4(pattern, re, input, expected, config);
             }
         }
     }
@@ -5169,18 +5173,29 @@ mod tests {
     /// For each input, queries the regex crate oracle for the expected
     /// result, then tests NFA and all compatible DFA tiers.
     ///
-    /// Two builds are exercised:
+    /// Three builds are exercised, all with the compile limit `max_states`:
     /// 1. With the specified `unroll_limit` — verifies `min_tier` and memory.
-    /// 2. With `unroll_limit=0` (disabled) — ensures counter-based DFA tiers
-    ///    are still tested even when unrolling would promote the pattern.
+    /// 2. With unrolling disabled (skipped when `unroll_limit` is already
+    ///    0) — counter-based tiers are tested even when unrolling would
+    ///    promote the pattern.
+    /// 3. With unrolling and repetition merging disabled — keeps the
+    ///    multi-counter structure that merging would collapse (e.g.
+    ///    `.{0,200}.{0,200}` stays two counters).
     fn run_match_test(
         pattern: &str,
         memory: usize,
         min_tier: u8,
         unroll_limit: usize,
+        max_states: usize,
         inputs: &[(&str, bool)],
     ) {
-        let re = build_regex_with_unroll(pattern, unroll_limit);
+        let config = |max_unroll_states, merge_repetitions| RegexConfig {
+            max_unroll_states,
+            merge_repetitions,
+            max_estimated_states: max_states,
+            ..Default::default()
+        };
+        let re = build_regex_with_config(pattern, config(unroll_limit, true));
 
         // Verify declared min_tier matches the compiled regex.
         let actual_tier = compute_min_tier(&re);
@@ -5207,31 +5222,32 @@ mod tests {
             );
         }
 
+        // Assert memory size matches the compiled regex.
+        assert_memory_size(pattern, &re, memory);
+
         // Oracle: regex crate is the source of truth.
         let full = format!("(?s-u){}", pattern);
         let oracle = regex::bytes::Regex::new(&full).expect("regex crate should parse pattern");
 
-        // Run with the configured unroll limit.
-        test_all_tiers(pattern, &re, &oracle, inputs, unroll_limit);
-
-        // Run again with unrolling disabled to exercise counter-based tiers.
+        let mut builds = vec![(format!("unroll={unroll_limit} merge=true"), re)];
         if unroll_limit > 0 {
-            let re_no_unroll = build_regex_with_unroll(pattern, 0);
-            test_all_tiers(pattern, &re_no_unroll, &oracle, inputs, 0);
+            builds.push((
+                "unroll=0 merge=true".to_string(),
+                build_regex_with_config(pattern, config(0, true)),
+            ));
         }
-
-        // Assert memory size matches the compiled regex.
-        assert_memory_size(pattern, &re, memory);
-
-        // NFA-guided input generation: walk the NFA with counter-boundary
-        // schedules to produce structurally meaningful inputs.  The regex
-        // crate oracle determines expected results — no manual hints needed.
-        let generated = generate_nfa_inputs(&re, 1000);
-        test_generated(pattern, &re, &oracle, &generated, unroll_limit);
-        if unroll_limit > 0 {
-            let re_nu = build_regex_with_unroll(pattern, 0);
-            let generated_nu = generate_nfa_inputs(&re_nu, 1000);
-            test_generated(pattern, &re_nu, &oracle, &generated_nu, 0);
+        builds.push((
+            "unroll=0 merge=false".to_string(),
+            build_regex_with_config(pattern, config(0, false)),
+        ));
+        for (label, re) in &builds {
+            test_all_tiers(pattern, re, &oracle, inputs, label);
+            // NFA-guided input generation: walk the NFA with
+            // counter-boundary schedules to produce structurally
+            // meaningful inputs.  The regex crate oracle determines
+            // expected results — no manual hints needed.
+            let generated = generate_nfa_inputs(re, 1000);
+            test_generated(pattern, re, &oracle, &generated, label);
         }
     }
 
@@ -5607,7 +5623,7 @@ mod tests {
         re: &Regex,
         oracle: &regex::bytes::Regex,
         inputs: &[Vec<u8>],
-        unroll: usize,
+        config: &str,
     ) {
         for input_bytes in inputs {
             let input = match std::str::from_utf8(input_bytes) {
@@ -5615,18 +5631,18 @@ mod tests {
                 Err(_) => continue,
             };
             let expected = oracle.is_match(input.as_bytes());
-            test_nfa(pattern, re, input, expected, unroll);
+            test_nfa(pattern, re, input, expected, config);
             if re.dfa_eligible {
-                test_tier1(pattern, re, input, expected, unroll);
+                test_tier1(pattern, re, input, expected, config);
             }
             if re.tier2_eligible {
-                test_tier2(pattern, re, input, expected, unroll);
+                test_tier2(pattern, re, input, expected, config);
             }
             if re.tier3_eligible {
-                test_tier3(pattern, re, input, expected, unroll);
+                test_tier3(pattern, re, input, expected, config);
             }
             if re.tier4_eligible {
-                test_tier4(pattern, re, input, expected, unroll);
+                test_tier4(pattern, re, input, expected, config);
             }
         }
     }
@@ -5641,11 +5657,24 @@ mod tests {
         };
     }
 
+    /// Resolve max_states: if specified use it, otherwise the default
+    /// compile limit users get.
+    macro_rules! max_states {
+        () => {
+            DEFAULT_MAX_ESTIMATED_STATES
+        };
+        ($val:literal) => {
+            $val
+        };
+    }
+
     /// Generate one `#[test]` function per entry in the table.
     ///
     /// Each entry specifies `pattern`, `memory` (0 to skip), `min_tier`,
     /// an optional `unroll_limit` (defaults to `DEFAULT_MAX_UNROLL_STATES`),
-    /// and a list of `(input, expected)` pairs.
+    /// an optional `max_states` (the compile limit,
+    /// `RegexConfig::max_estimated_states`; defaults to the engine
+    /// default), and a list of `(input, expected)` pairs.
     macro_rules! match_tests {
         ($(
             $name:ident {
@@ -5653,6 +5682,7 @@ mod tests {
                 memory: $memory:literal,
                 min_tier: $tier:literal,
                 $(unroll_limit: $unroll:literal,)?
+                $(max_states: $max_states:literal,)?
                 inputs: [$(($input:literal, $expected:literal)),* $(,)?],
             }
         )*) => {
@@ -5664,6 +5694,7 @@ mod tests {
                         $memory,
                         $tier,
                         unroll_limit!($($unroll)?),
+                        max_states!($($max_states)?),
                         &[$(($input, $expected)),*],
                     );
                 }
@@ -5734,6 +5765,7 @@ mod tests {
             pattern: "((ab{1,100}|cb{1,100}|db{1,100})){1,100}",
             memory: 2381,
             min_tier: 4,
+            max_states: 32_768, // estimated 30,599 states, over the default
             inputs: [
                 ("ab", true),
                 ("abbbcbbb", true),
@@ -10080,7 +10112,8 @@ mod tests {
 
         // Pure wildcard overlap — maximally ambiguous.
         // Note: with default merge, .{0,200}.{0,200} becomes .{0,400} (Tier 2).
-        // The unroll=0+no-merge re-run exercises the multi-counter path.
+        // The unroll=0 merge=false pass of match_tests! exercises the
+        // multi-counter path.
         test_tier2_overlap_unsafe_wildcard {
             pattern: r"^.{0,200}.{0,200}$",
             memory: 1031,
@@ -10382,6 +10415,7 @@ mod tests {
             pattern: ".{0,1000}(.{1,10}){0,1000}c",
             memory: 1440,
             min_tier: 3,
+            max_states: 16_384, // estimated 12,002 states, over the default
             inputs: [
                 ("c", true),
                 ("xc", true),
@@ -13875,8 +13909,8 @@ mod tests {
         for n in 0..130 {
             let input: String = "a".repeat(n);
             let expected = oracle.is_match(input.as_bytes());
-            test_nfa(pattern, &re, &input, expected, 0);
-            test_tier3(pattern, &re, &input, expected, 0);
+            test_nfa(pattern, &re, &input, expected, "unroll=0");
+            test_tier3(pattern, &re, &input, expected, "unroll=0");
         }
     }
 
@@ -13892,9 +13926,9 @@ mod tests {
         for n in 0..70 {
             let input: String = "a".repeat(n);
             let expected = oracle.is_match(input.as_bytes());
-            test_nfa(pattern, &re, &input, expected, DEFAULT_MAX_UNROLL_STATES);
+            test_nfa(pattern, &re, &input, expected, "default");
             if re.tier3_eligible {
-                test_tier3(pattern, &re, &input, expected, DEFAULT_MAX_UNROLL_STATES);
+                test_tier3(pattern, &re, &input, expected, "default");
             }
         }
     }

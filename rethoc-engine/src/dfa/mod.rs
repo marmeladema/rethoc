@@ -747,7 +747,6 @@ mod tests {
             pattern,
             crate::RegexConfig {
                 max_unroll_states: 0,
-                max_estimated_states: usize::MAX,
                 ..Default::default()
             },
         )
