@@ -18,6 +18,7 @@ proptest-regressions/
 # Cargo-fuzz artifacts and corpus
 fuzz/artifacts/
 fuzz/corpus/
+fuzz/target/
 
 # Bisect binaries (built by scripts/build-bisect-bins.sh)
 /bins/

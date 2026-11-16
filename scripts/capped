@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+#
+# Run a command under a memory and time cap, and say so loudly when a cap
+# is hit.
+#
+# Usage:
+#   scripts/capped [--mem KIB] [--time SECS] [--] COMMAND [ARGS...]
+#
+# Defaults come from the environment; 0 disables a cap:
+#   RETHOC_CAP_MEM   virtual memory, in KiB (`ulimit -v`)   default 8000000
+#   RETHOC_CAP_TIME  wall clock, in seconds (`timeout`)     default 600,
+#                    or 3600 for bench binaries (an argument is `--bench`)
+#
+# This is also the cargo runner (.cargo/config.toml): every binary run by
+# `cargo test`, `cargo bench` and `cargo run` goes through it.  The
+# compiler is not capped.
+#
+# stderr is passed through unchanged and scanned at the end: an
+# allocation failure or a timeout prints a RESOURCE CAP HIT banner.  The
+# exit status is the command's (124, or 137 if it ignored SIGTERM, after
+# a timeout).
+
+set -u
+
+usage() {
+    sed -n '3,20s/^# \{0,1\}//p' "$0" >&2
+    exit 2
+}
+
+mem=${RETHOC_CAP_MEM:-8000000}
+time=${RETHOC_CAP_TIME:-}
+while [ $# -gt 0 ]; do
+    case $1 in
+        --mem) [ $# -ge 2 ] || usage; mem=$2; shift 2 ;;
+        --time) [ $# -ge 2 ] || usage; time=$2; shift 2 ;;
+        --) shift; break ;;
+        -h | --help) usage ;;
+        *) break ;;
+    esac
+done
+[ $# -gt 0 ] || usage
+if [ -z "$time" ]; then
+    time=600
+    for arg in "$@"; do
+        if [ "$arg" = --bench ]; then
+            time=3600
+            break
+        fi
+    done
+fi
+for value in "$mem" "$time"; do
+    case $value in
+        '' | *[!0-9]*) echo "capped: not a number: '$value'" >&2; exit 2 ;;
+    esac
+done
+
+errlog=$(mktemp "${TMPDIR:-/tmp}/capped.XXXXXX") || exit 2
+trap 'rm -f "$errlog"' EXIT
+
+# Copy stderr to the log through fd 3; remember tee's pid to wait for it.
+exec 3> >(tee -- "$errlog" >&2)
+tee_pid=$!
+start=$SECONDS
+# The inner `sh` does not `exec` the command: a command killed by a signal
+# is then reported by `sh` in one word, not by bash with a source dump.
+# shellcheck disable=SC2016  # $1... expand in the inner shell
+sh -c '
+    mem=$1 time=$2
+    shift 2
+    if [ "$mem" -gt 0 ] && ! ulimit -v "$mem" 2>/dev/null; then
+        echo "capped: warning: ulimit -v is not supported here; no memory cap" >&2
+    fi
+    if [ "$time" -gt 0 ]; then
+        if command -v timeout >/dev/null; then
+            timeout --kill-after=10 "$time" "$@"
+            exit $?
+        fi
+        echo "capped: warning: no timeout command; no time cap" >&2
+    fi
+    "$@"
+' capped "$mem" "$time" "$@" 2>&3
+status=$?
+elapsed=$((SECONDS - start))
+# Let tee finish copying stderr before scanning it.
+exec 3>&-
+wait "$tee_pid" 2>/dev/null
+
+# banner WHAT HINT COMMAND...
+banner() {
+    local what=$1 hint=$2
+    shift 2
+    {
+        echo "capped: ==================== RESOURCE CAP HIT ===================="
+        echo "capped: $what"
+        echo "capped: command: $*" | cut -c1-200
+        echo "capped: $hint"
+        echo "capped: =============================================================="
+    } >&2
+}
+
+# `timeout` exits 124 (TERM) or 137 (KILL after the grace period).
+if [ "$time" -gt 0 ] && [ "$elapsed" -ge "$time" ] && { [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; }; then
+    banner "TIME: killed after ${time} s (exit status $status)" \
+        "raise or disable with RETHOC_CAP_TIME=<seconds> (0 = no cap)" "$@"
+elif [ "$mem" -gt 0 ] && grep -Eq 'memory allocation of [0-9]+ bytes failed|Cannot allocate memory|[Oo]ut of memory' "$errlog"; then
+    banner "MEMORY: allocation failed under ulimit -v ${mem} KiB (exit status $status)" \
+        "raise or disable with RETHOC_CAP_MEM=<KiB> (0 = no cap)" "$@"
+fi
+exit "$status"
