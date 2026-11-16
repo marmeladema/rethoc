@@ -3182,6 +3182,23 @@ const DEFAULT_MAX_UNROLL_STATES: usize = 32;
 /// this counter's repetition body).
 const COUNTER_INACTIVE: usize = usize::MAX;
 
+/// The value of a counter after one more iteration of its body.
+///
+/// An unbounded counter (`{min,}`) never fails the `< max` test, so every
+/// value at or above `min` behaves the same: continue and break are both
+/// always taken.  The value saturates there.  This keeps the number of
+/// distinct contexts per state at `min + 1`.  Without it each start
+/// position of a long run would keep its own ever-growing count, and a
+/// body that can match empty would go round its increment forever.
+#[inline(always)]
+pub(crate) fn counter_step(value: usize, min: usize, max: usize) -> usize {
+    if max == usize::MAX {
+        (value + 1).min(min)
+    } else {
+        value + 1
+    }
+}
+
 /// Arena allocator for counter context slots.
 ///
 /// All [`CounterCtx`] slot data lives here in a flat `Vec<usize>`.
@@ -3946,7 +3963,7 @@ impl<'a> NfaMatcher<'a> {
                             let value = ctx
                                 .get(counter, self.counter_pool)
                                 .expect("counter must be active at CInc");
-                            let new_value = value + 1;
+                            let new_value = counter_step(value, min, max);
                             let take_continue = new_value < max;
                             let take_break = new_value >= min;
 
@@ -13101,6 +13118,106 @@ mod tests {
                 ("aaaa   ", true),
                 ("", false),
             ],
+        }
+        // Bug 61: an unbounded counter whose body can match empty looped
+        // through its increment forever, with a new count each time round.
+        test_nfa_unbounded_nullable_counter_body {
+            pattern: "(e*){2,}d",
+            memory: 1023,
+            min_tier: 1,
+            inputs: [
+                ("d", true),
+                ("ed", true),
+                ("eeeeeeeed", true),
+                ("xd", true),
+                ("eeee", false),
+                ("", false),
+            ],
+        }
+        test_nfa_unbounded_nullable_counter_body_kept_counter {
+            pattern: "(e*|y){40,}d",
+            memory: 1057,
+            min_tier: 0,
+            inputs: [
+                ("d", true),
+                ("eyeyd", true),
+                ("xd", true),
+                ("yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyd", true),
+                ("eyey", false),
+                ("", false),
+            ],
+        }
+        test_nfa_unbounded_nested_nullable_counter_bodies {
+            pattern: "^((e*){30,}f?){30,}d$",
+            memory: 1190,
+            min_tier: 0,
+            inputs: [
+                ("d", true),
+                ("efefd", true),
+                ("ffffffffffffffffffffffffffffffffffffd", true),
+                ("xd", false),
+                ("efef", false),
+                ("", false),
+            ],
+        }
+        // Bug 61, ordinary body: the count used to grow past `min`, so each
+        // start position in a long run kept a distinct thread.
+        test_nfa_unbounded_counter_saturates {
+            pattern: "(?:ab){3,}c",
+            memory: 1089,
+            min_tier: 1,
+            inputs: [
+                ("ababc", false),
+                ("abababc", true),
+                ("ababababababababababababababababababc", true),
+                ("abababababababababababababababababab", false),
+                ("abababxabababc", true),
+                ("ababxababc", false),
+            ],
+        }
+        // Bug 61 on the counter-program DFA: nested loops with an unbounded
+        // inner counter select tier 4 with the default settings.
+        test_tier4_unbounded_inner_counter_saturates {
+            pattern: "(?:a{40,}b){2,5}c",
+            memory: 1058,
+            min_tier: 4,
+            inputs: [
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabc", true),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabc", true),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabc", false),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabc", false),
+                ("", false),
+            ],
+        }
+    }
+
+    /// Bug 61: an unbounded counter saturates at `min`, so the number of
+    /// live NFA threads does not grow with the length of the run.
+    #[test]
+    fn test_nfa_unbounded_counter_thread_count_is_bounded() {
+        for (pattern, min) in [("a{40,}b", 40), ("(?:a|aa){7,}b", 7)] {
+            let re = build_regex_with_unroll(pattern, 0);
+            let mut memory = MatcherMemory::default();
+            let mut m = memory.nfa_matcher(&re);
+            let mut most = 0;
+            for _ in 0..5_000 {
+                m.chunk(b"a");
+                most = most.max(m.clist.len());
+            }
+            assert!(!m.ismatch(), "{pattern}");
+            // One thread per count in `0..=min` for each consuming state
+            // of the body, plus the one waiting on `b` after the break.
+            let body_states = re
+                .states
+                .iter()
+                .filter(|s| matches!(s, State::Byte { byte: b'a', .. }))
+                .count();
+            assert!(
+                most <= (min + 1) * body_states + 1,
+                "{pattern}: {most} threads for {body_states} body states",
+            );
+            m.chunk(b"b");
+            assert!(m.ismatch(), "{pattern}");
         }
     }
 
