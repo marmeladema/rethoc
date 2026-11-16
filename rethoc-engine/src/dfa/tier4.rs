@@ -11,7 +11,7 @@ use std::fmt;
 
 use crate::{
     AssertKind, CounterCtx, CounterIdx, CounterPool, CtxDedupTable, Regex, State, StateIdx,
-    byte_match_ci,
+    byte_match_ci, counter_step,
 };
 
 use super::{DfaState, DfaStateId, DfaStateRef};
@@ -179,7 +179,7 @@ fn execute_program(
                     Some(v) => v,
                     None => continue,
                 };
-                let new_val = cur + 1;
+                let new_val = counter_step(cur, *min, *max);
                 let do_continue = new_val < *max;
                 let do_break = new_val >= *min;
                 if do_continue && do_break {
@@ -252,7 +252,7 @@ fn try_execute_inplace(
     ] = prog
     {
         let cur = ctx.get(*counter, pool)?;
-        let new_val = cur + 1;
+        let new_val = counter_step(cur, *min, *max);
         let do_continue = new_val < *max;
         let do_break = new_val >= *min;
         if do_continue && !do_break {
@@ -1572,6 +1572,34 @@ fn dedup_contexts_hash(
         } else {
             seen.insert(hash, i);
             i += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bug 61: an unbounded counter saturates at `min`, so the number of
+    /// live contexts does not grow with the length of the run.
+    #[test]
+    fn test_unbounded_counter_context_count_is_bounded() {
+        for pattern in ["a{40,}b", "(?:a{40,}b){2,5}c", "(?:(?:a|b){40,}c){2,}d"] {
+            let re = Regex::new(pattern).unwrap();
+            assert!(re.tier4_eligible, "`{pattern}` must be tier 4 eligible");
+            let mut cache = Tier4DfaCache::new(re.states.len());
+            cache.prepare(&re);
+            let mut pool = CounterPool::default();
+            let mut m = Tier4DfaMatcher::new(&mut cache, &re, &mut pool);
+            let mut most = 0;
+            for _ in 0..5_000 {
+                m.chunk(b"a");
+                most = most.max(m.contexts.len());
+            }
+            assert!(!m.ismatch(), "{pattern}");
+            // One context per count in `0..=40` on the loop body, plus the
+            // one waiting on the byte after the loop.
+            assert!(most <= 42, "{pattern}: {most} live contexts");
         }
     }
 }
