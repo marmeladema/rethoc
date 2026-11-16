@@ -7,7 +7,7 @@ Cargo workspace, Rust 2024:
   module; start with `src/lib.rs` and `src/dfa/mod.rs`.
 - `rethoc-cli/` — the `rethoc` debugging CLI (`rethoc --help`).
 - `fuzz/` — cargo-fuzz targets (separate workspace, nightly).
-- `scripts/` — `bless_memory.py`, `build-bisect-bins.sh`.
+- `scripts/` — `capped` (cargo runner), `bless_memory.py`, `build-bisect-bins.sh`.
 - `docs/` — design notes; `docs/bugs/` — one post-mortem per bug.
 
 ## Invariants
@@ -60,19 +60,26 @@ never touches `min_tier:`; a tier change is a regression to look at).
 
 ### Resource caps
 
-Probes, fuzzers and sweeps run under a memory and time cap, one pattern
-at a time. A regressed engine bug can allocate without bound and take the
-machine down with it. The test helpers compile with
-`max_estimated_states: usize::MAX`, so the compile-time budget does not
-protect them either.
+Everything runs under a memory and time cap. A regressed engine bug can
+allocate without bound and take the machine down with it, and the test
+helpers compile with `max_estimated_states: usize::MAX`, so the compile
+budget does not protect them.
 
-```bash
-(ulimit -v 8000000; timeout 600 cargo test)
-(ulimit -v 1500000; timeout 90 <probe>)
-```
-
-`rethoc fuzz --batch` and `rethoc sweep` cap each child process
-themselves (`--mem-limit`, `--timeout`).
+- **Automatic.** `.cargo/config.toml` makes `scripts/capped` the cargo
+  runner: every binary run by `cargo test`, `cargo bench` and `cargo run`
+  is capped (default 8 GB of virtual memory; 600 s, or 3600 s for
+  benches). The compiler is not. cargo-fuzz (ASan) builds are left out.
+- **Anything else** goes through the script directly:
+  `scripts/capped [--mem KIB] [--time SECS] -- <command>`.
+- **Changing the caps:** `RETHOC_CAP_MEM=<KiB>`, `RETHOC_CAP_TIME=<s>`;
+  `0` disables one, for example for a long `cargo run -- grep`.
+- **When a cap is hit** the script prints a `RESOURCE CAP HIT` banner
+  naming the cap (MEMORY or TIME) and the command, and the run fails. A
+  memory hit in `cargo test` aborts the whole test binary; rerun the
+  tests one by one, or with a filter, to find the culprit.
+- `rethoc fuzz --batch` and `rethoc sweep` also cap each of their child
+  processes (`--mem-limit`, `--timeout`), so one pattern that blows up
+  is counted and the run goes on.
 
 ## Debugging with the CLI
 
@@ -211,7 +218,7 @@ git checkout branch && cargo bench --bench reengage_profile -- --baseline=main
 from a seed; the oracle is the `regex` crate or the NFA.
 
 ```bash
-cargo test test_fuzz -- --ignored     # proptest: oracle + cross-tier (run under caps)
+cargo test test_fuzz -- --ignored     # proptest: oracle + cross-tier
 cargo +nightly fuzz run fuzz_match         # vs regex crate
 cargo +nightly fuzz run fuzz_differential  # tiers vs NFA
 cargo +nightly fuzz run fuzz_compile       # compilation robustness
