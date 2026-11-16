@@ -13267,6 +13267,66 @@ mod tests {
                 ("7 USD", false),
             ],
         }
+        // Bug 63: with a two-byte body, threads that entered at even and at
+        // odd offsets are counted in separate phases.  A thread that died
+        // left its count behind while a thread of the other phase was still
+        // inside the body, and the next thread to enter at its offset
+        // inherited it.
+        test_tier2_dead_phase_count_is_not_inherited {
+            pattern: "(?:a[ab]){2,3}c",
+            memory: 1121,
+            min_tier: 1,
+            inputs: [
+                ("aabaaac", false),
+                ("aaabc", true),
+                ("abaac", true),
+                ("ababababc", true),
+                ("aac", false),
+                ("aabac", false),
+                ("", false),
+            ],
+        }
+        // The dying thread fails on the last byte of its iteration.
+        test_tier2_dead_phase_fails_on_last_body_byte {
+            pattern: "(?:[ab]a){2,3}c",
+            memory: 1121,
+            min_tier: 1,
+            inputs: [
+                ("aaabaac", false),
+                ("aabac", true),
+                ("babac", true),
+                ("babaac", false),
+                ("bac", false),
+                ("abbac", false),
+            ],
+        }
+        test_tier2_dead_phase_alternation_body {
+            pattern: "(?:ab|ba){2,3}",
+            memory: 1353,
+            min_tier: 1,
+            inputs: [
+                ("abaaab", false),
+                ("abab", true),
+                ("abba", true),
+                ("baab", true),
+                ("aabb", false),
+                ("ab", false),
+            ],
+        }
+        // The same with a count too large to unroll: tier 2 with the
+        // default settings.
+        test_tier2_dead_phase_kept_counter {
+            pattern: "(?:a.){40,60}c",
+            memory: 997,
+            min_tier: 2,
+            inputs: [
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabaaac", false),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac", true),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac", false),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabaac", true),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaababc", true),
+            ],
+        }
     }
 
     /// Bug 61: an unbounded counter saturates at `min`, so the number of

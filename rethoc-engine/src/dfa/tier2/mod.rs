@@ -235,6 +235,13 @@ struct Transition {
     /// states in the DFA successor (only re-seeded first-byte states).
     /// Existing instances for that counter must be cleared before seeding.
     counter_reset: u64,
+    /// Bitmask: bit `i` set means the *active phase* of counter `i` must
+    /// be cleared.  The threads of the active phase stand on the last body
+    /// byte: on this byte they cross the increment or die.  The bit is set
+    /// for a multi-byte body when this transition does not cross counter
+    /// `i`'s increment, so those threads died.  Their counts must not be
+    /// inherited by the threads seeded into the same phase next (Bug 63).
+    phase_reset: u64,
 }
 
 impl Transition {
@@ -250,6 +257,7 @@ impl Transition {
             pre_seeds: Box::new([]),
             seeds: Box::new([]),
             counter_reset: 0,
+            phase_reset: 0,
         }
     }
 }
@@ -643,6 +651,18 @@ impl CounterState {
                 self.live_count -= 1;
                 p.clear();
             }
+        }
+    }
+
+    /// Clear the active phase of counter `c_idx`: the instances whose
+    /// threads stand on the last body byte.
+    #[inline]
+    fn reset_active_phase(&mut self, c_idx: usize) {
+        let m = &self.meta[c_idx];
+        let phase = &mut self.phases[m.phase_start + m.active_phase];
+        if !phase.is_empty() {
+            self.live_count -= 1;
+            phase.clear();
         }
     }
 
@@ -1064,6 +1084,7 @@ impl Tier2DfaCache {
             // to avoid false positives (Bug 14).
             let pre_seed_list = Self::pre_seeds_for(resolved_body_mask);
             let counter_reset = counter_reset & !resolved_body_mask;
+            let phase_reset = Self::compute_phase_reset(analysis, counting_mask, counter_reset);
 
             Transition {
                 no_break: nb_id,
@@ -1076,6 +1097,7 @@ impl Tier2DfaCache {
                 pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
                 counter_reset,
+                phase_reset,
             }
         } else {
             let id = self.intern_closure_result(&probe, byte);
@@ -1124,6 +1146,7 @@ impl Tier2DfaCache {
                 }
                 seed_list.sort_by_key(|&(c, _)| c);
             }
+            let phase_reset = Self::compute_phase_reset(analysis, 0, counter_reset);
 
             Transition {
                 no_break: id,
@@ -1136,6 +1159,7 @@ impl Tier2DfaCache {
                 pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
                 counter_reset,
+                phase_reset,
             }
         }
     }
@@ -1150,6 +1174,26 @@ impl Tier2DfaCache {
             seeds.push((CounterIdx(ci as u8), 0));
         }
         seeds
+    }
+
+    /// Compute the `phase_reset` bitmask for a transition: every counter
+    /// with a multi-byte body whose increment is not crossed
+    /// (`counting_mask`) and that is not cleared as a whole anyway
+    /// (`counter_reset`).
+    fn compute_phase_reset(
+        analysis: &Tier2Analysis,
+        counting_mask: u64,
+        counter_reset: u64,
+    ) -> u64 {
+        let mut mask: u64 = 0;
+        for ci in 0..analysis.body_ranges.len() {
+            let bit = 1u64 << ci;
+            // A one-byte body has a single phase, handled by counter_reset.
+            if !analysis.interior(ci).is_empty() && (counting_mask | counter_reset) & bit == 0 {
+                mask |= bit;
+            }
+        }
+        mask
     }
 
     /// Compute the `counter_reset` bitmask for a transition.
@@ -1756,6 +1800,19 @@ impl<'a> Tier2DfaMatcher<'a> {
             mask &= mask - 1;
             if c_idx < self.cache.counters.meta.len() {
                 self.cache.counters.reset_counter(c_idx);
+            }
+        }
+
+        // Apply phase_reset: clear the active phase of counters whose
+        // increment this transition does not cross.  Must run before the
+        // phase clock advances and before new instances are seeded into
+        // that phase.
+        let mut mask = t.phase_reset;
+        while mask != 0 {
+            let c_idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if c_idx < self.cache.counters.meta.len() {
+                self.cache.counters.reset_active_phase(c_idx);
             }
         }
 
