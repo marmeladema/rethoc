@@ -71,6 +71,9 @@ protect them either.
 (ulimit -v 1500000; timeout 90 <probe>)
 ```
 
+`rethoc fuzz --batch` and `rethoc sweep` cap each child process
+themselves (`--mem-limit`, `--timeout`).
+
 ## Debugging with the CLI
 
 ```bash
@@ -83,6 +86,37 @@ cargo run --release -- dump --dfa '<pattern>'  # NFA, classes, tier analysis
 `--debug` prints matcher state after every chunk. Run the same input with
 `--tier 0` and the suspect tier and look for the first step where they
 diverge. `--unroll-limit 0 --no-merge` forces counter execution.
+Options go after the command name; `rethoc <command> --help` lists them.
+
+## Differential tools
+
+`brute`, `fuzz`, `shrink` and `sweep` check rethoc against the `regex`
+crate: the NFA and every eligible tier, each fed whole and byte by byte.
+Unless given `--unroll-limit` or `--no-merge`, they compile each pattern
+three ways: default, unrolling off, unrolling and merging off. Inputs are
+read and printed with byte escapes (`\n`, `\xNN`), and every mismatch
+comes with a `repro:` command. Exit codes: 0 clean, 1 mismatch, 2 usage,
+3 aborted (watchdog, timeout, OOM, crash), 4 pattern rejected.
+
+```bash
+rethoc brute --alphabet 'ab ' --max-len 6 '<pattern>'  # every input up to length 6
+rethoc shrink --unroll-limit 0 '<pattern>' '<input>'    # minimise a mismatching input
+rethoc fuzz 0 500                                       # seeds 0..500, in process
+rethoc fuzz --batch 250 --allow-slow ci/known-slow-seeds.txt 0 9000   # capped children
+rethoc fuzz --shared-memory 0 500     # one MatcherMemory for every regex of the run
+rethoc sweep nullable-counter         # brute over a pattern family, each run capped
+rethoc sweep tier3-assert
+rethoc sweep --tier 3 tier3-assert    # only the NFA and Tier 3
+rethoc sweep --list tier3-assert      # print the runs instead
+```
+
+- `fuzz` seed numbers are stable: a seed is a pattern plus inputs anyone
+  can re-run. `--trace` prints every step.
+- Seeds that are correct but slower than the watchdog go in
+  `ci/known-slow-seeds.txt` with their pattern. `fuzz --batch` reports
+  them as `KNOWN-SLOW`, and says when one no longer is.
+- Run `fuzz` with at most one job per core (the default): a seed near the
+  watchdog limit aborts under load.
 
 ## Bug-fix workflow
 
@@ -95,7 +129,9 @@ diverge. `--unroll-limit 0 --no-merge` forces counter execution.
    hard, and tooling that would have helped.
 6. Fix, test and post-mortem go in one commit. Tooling changes go in
    separate commits. Ask before committing.
-7. New fields on matcher or analysis structs must show up in `Display` /
+7. Before committing a tier or compiler change, run the sweeps and a
+   `fuzz --batch` range. They catch what the unit tests do not.
+8. New fields on matcher or analysis structs must show up in `Display` /
    `Debug` and `dump.rs`. The `--debug` trace is the main debugging tool.
 
 ## Tests
