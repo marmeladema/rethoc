@@ -1107,6 +1107,11 @@ pub(crate) fn check_break_deferred_soundness(
     analysis: &super::Tier3Analysis,
     states: &[crate::State],
 ) -> bool {
+    // Bug 57: an `Advance` whose origins could not be split by assertion
+    // would let threads cross assertions unchecked.
+    if !analysis.effects_exact {
+        return false;
+    }
     for be in &*analysis.break_effects {
         for &chain_id in &be.break_deferred_chain_ids {
             let chain = analysis.assert_chain_arena.get(chain_id);
@@ -1322,6 +1327,232 @@ pub(crate) fn compile_target_effects(
     }
 }
 
+/// A consuming state reached by epsilon transitions, with the assertions
+/// that gate the path to it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct GatedOrigin {
+    pub(crate) origin: StateIdx,
+    /// The gating assertions on the path, sorted (all must hold).  Empty
+    /// when the origin is reached unconditionally.
+    pub(crate) asserts: Vec<StateIdx>,
+    /// The counter whose `CounterInstance` lies on the path, if any: the
+    /// origin is then the first state of that counter's body.
+    pub(crate) entered: Option<CounterIdx>,
+}
+
+/// Upper bound on the number of incomparable assertion sets remembered
+/// per NFA state by [`consuming_by_assertion_set`].  Alternations of
+/// assertions multiply the sets (`(\\b|\\B)(\\b|\\B)…`), and the pattern
+/// is attacker-controlled.
+const MAX_ASSERT_SETS_PER_STATE: usize = 8;
+
+/// True if every element of `small` is in `big`.
+///
+/// Both slices must be strictly increasing (sorted, no duplicates).  The
+/// two are scanned once, in step: `big` is never rewound, and the scan
+/// stops at the first element of `big` that is greater than the element
+/// of `small` it is looking for.  O(`small.len() + big.len()`).
+fn is_sorted_subset(small: &[StateIdx], big: &[StateIdx]) -> bool {
+    debug_assert!(small.windows(2).all(|w| w[0] < w[1]));
+    debug_assert!(big.windows(2).all(|w| w[0] < w[1]));
+    if small.len() > big.len() {
+        return false;
+    }
+    let mut big = big.iter();
+    'next: for s in small {
+        for b in big.by_ref() {
+            match b.cmp(s) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => continue 'next,
+                // `big` is sorted: `s` cannot appear further on.
+                std::cmp::Ordering::Greater => return false,
+            }
+        }
+        // `big` ran out before `s` was found.
+        return false;
+    }
+    true
+}
+
+/// Collect the consuming states reachable from `starts` by epsilon
+/// transitions, each with the sets of gating assertions under which it is
+/// reached.
+///
+/// `gates(kind)` says whether an assertion of that kind gates the path
+/// (it is recorded) or is simply walked through.  The walk follows
+/// `Split`, `Assert` and `CounterInstance`, and stops at
+/// `CounterIncrement` and `Match`.
+///
+/// An origin with several alternative assertion sets is reported once
+/// per *minimal* set: OR across entries, AND within a set.  A path that
+/// needs a superset of another path's assertions adds nothing, so a
+/// state is only revisited with a set that none of its earlier sets is
+/// contained in.  That rule is also what ends the walk on an epsilon
+/// cycle (a nullable loop such as `( *)*`): coming back with the same
+/// set is not a new visit.
+///
+/// Returns `None` if some state collects more than
+/// [`MAX_ASSERT_SETS_PER_STATE`] incomparable sets.  The caller must then
+/// treat the analysis as inexact.
+pub(crate) fn consuming_by_assertion_set(
+    starts: &[StateIdx],
+    states: &[State],
+    gates: impl Fn(crate::AssertKind) -> bool,
+) -> Option<Vec<GatedOrigin>> {
+    let mut reached: Vec<GatedOrigin> = Vec::new();
+    let mut stack: Vec<(StateIdx, Vec<StateIdx>, Option<CounterIdx>)> =
+        starts.iter().map(|&s| (s, Vec::new(), None)).collect();
+    // Per state: the minimal assertion sets it has been reached with.
+    let mut seen: Vec<Vec<Vec<StateIdx>>> = vec![Vec::new(); states.len()];
+    while let Some((idx, mut asserts, entered)) = stack.pop() {
+        asserts.sort_unstable();
+        asserts.dedup();
+        let known = &mut seen[idx.idx()];
+        if known.iter().any(|k| is_sorted_subset(k, &asserts)) {
+            continue;
+        }
+        known.retain(|k| !is_sorted_subset(&asserts, k));
+        if known.len() == MAX_ASSERT_SETS_PER_STATE {
+            return None;
+        }
+        known.push(asserts.clone());
+        match states[idx.idx()] {
+            State::Split { out, out1 } => {
+                stack.push((out1, asserts.clone(), entered));
+                stack.push((out, asserts, entered));
+            }
+            State::Assert { kind, out } => {
+                if gates(kind) {
+                    asserts.push(idx);
+                }
+                stack.push((out, asserts, entered));
+            }
+            State::CounterInstance { counter, out } => stack.push((out, asserts, Some(counter))),
+            State::CounterIncrement { .. } | State::Match => {}
+            State::Byte { .. }
+            | State::ByteCI { .. }
+            | State::Wildcard { .. }
+            | State::ByteClassStatic { .. }
+            | State::ByteClassCustom { .. }
+            | State::ByteTable { .. } => reached.push(GatedOrigin {
+                origin: idx,
+                asserts,
+                entered,
+            }),
+        }
+    }
+
+    // Keep, per origin, only the assertion sets that are still minimal:
+    // an entry recorded before a smaller set reached the same origin is
+    // implied by that smaller set.
+    let mut minimal: Vec<GatedOrigin> = reached
+        .iter()
+        .filter(|r| {
+            !reached.iter().any(|other| {
+                other.origin == r.origin
+                    && other.asserts.len() < r.asserts.len()
+                    && is_sorted_subset(&other.asserts, &r.asserts)
+            })
+        })
+        .cloned()
+        .collect();
+    minimal.sort();
+    minimal.dedup();
+    Some(minimal)
+}
+
+/// Split the consuming states reachable from `target` by epsilon
+/// transitions into those reachable without crossing a deferrable
+/// assertion (`plain`) and those reachable *only* through deferrable
+/// assertions (`gated`, one entry per minimal assertion set).
+///
+/// Returns `None` if [`consuming_by_assertion_set`] gives up.
+fn split_advance_origins(
+    target: StateIdx,
+    states: &[State],
+) -> Option<(Vec<StateIdx>, Vec<GatedOrigin>)> {
+    let reached =
+        consuming_by_assertion_set(&[target], states, crate::AssertKind::is_dfa_deferrable)?;
+    let plain: Vec<StateIdx> = reached
+        .iter()
+        .filter(|r| r.asserts.is_empty())
+        .map(|r| r.origin)
+        .collect();
+    let gated: Vec<GatedOrigin> = reached
+        .into_iter()
+        .filter(|r| !r.asserts.is_empty())
+        .collect();
+    Some((plain, gated))
+}
+
+/// Restrict an `Advance` step to the origins that are reached
+/// unconditionally, and turn the origins behind deferrable assertions
+/// into guarded effects.
+///
+/// The analysis that produces `Advance { new_origins }` follows every
+/// assertion.  That over-approximation used to be handed to the runtime
+/// as it was, on the grounds that a tail advanced past an assertion that
+/// later fails would not find its origin in the next transition and die.
+/// That only holds when nothing else keeps the origin in the DFA state.
+/// A counter-body origin is kept there by the counter's own instances, so
+/// a post-break thread that consumed a byte and then met `\b` in front of
+/// a counter entered the counter whether or not the assertion held
+/// (Bug 57: `^(.{2,3}1\b)+$` matched `111111`).
+///
+/// A gated origin becomes:
+///
+/// - a guarded `AddSeed` with value 0 when the path enters a counter: the
+///   thread has not consumed anything inside the body yet, and a seed is
+///   applied before the next step, which then counts the next byte once
+///   (the same encoding as a break seed behind an assertion);
+/// - a guarded `AddTail` otherwise.
+///
+/// Both are resolved at the next byte like the guarded effects of a
+/// counter break.  `Increment` steps are left alone: their origins lie
+/// inside a counter body, where Tier 3 admits no deferrable assertion.
+///
+/// Returns `None` when the split gives up on a pattern with too many
+/// alternative assertion sets; Tier 3 must then not be used.
+fn gate_advance_origins(
+    mut effects: CompiledTargetEffects,
+    target: StateIdx,
+    states: &[State],
+    arena: &mut AssertChainArena,
+) -> Option<CompiledTargetEffects> {
+    let TargetStep::Advance { new_origins } = &mut effects.step else {
+        return Some(effects);
+    };
+    let (plain, gated) = split_advance_origins(target, states)?;
+    if gated.is_empty() {
+        return Some(effects);
+    }
+    *new_origins = new_origins
+        .iter()
+        .copied()
+        .filter(|origin| plain.contains(origin))
+        .collect();
+    let mut guarded = effects.guarded.into_vec();
+    for g in gated {
+        let atom = match g.entered {
+            Some(counter) => EffectAtom::AddSeed {
+                counter,
+                origin: g.origin,
+                value: 0,
+            },
+            None => EffectAtom::AddTail { origin: g.origin },
+        };
+        guarded.push(GuardedEffect {
+            timing: EffectTiming::NextByte,
+            guard: EffectGuard {
+                assert_chain: arena.intern(&g.asserts),
+            },
+            atom,
+        });
+    }
+    effects.guarded = guarded.into_boxed_slice();
+    Some(effects)
+}
+
 /// Compile all target effects for a [`Tier3Analysis`].
 ///
 /// Iterates over all targets in the analysis and compiles a
@@ -1336,7 +1567,10 @@ pub(crate) fn compile_target_effects(
 /// the same arena during compilation.
 ///
 /// Returns `(per-target effects, per-state chain IDs for target deferred
-/// asserts)`.  The caller retains ownership of the arena.
+/// asserts, exact)`.  The caller retains ownership of the arena.  `exact`
+/// is `false` when some `Advance` could not be split by assertion (see
+/// [`gate_advance_origins`]); the effects are then an over-approximation
+/// and the pattern must not run on Tier 3.
 #[cfg_attr(not(debug_assertions), allow(unused_variables))]
 pub(crate) fn compile_all_target_effects(
     analysis: &super::Tier3Analysis,
@@ -1345,7 +1579,9 @@ pub(crate) fn compile_all_target_effects(
 ) -> (
     Box<[Option<CompiledTargetEffects>]>,
     Box<[CompiledOriginEffects]>,
+    bool,
 ) {
+    let mut exact = true;
     let effects: Vec<Option<CompiledTargetEffects>> = analysis
         .targets
         .iter()
@@ -1359,6 +1595,14 @@ pub(crate) fn compile_all_target_effects(
                     &analysis.break_effects,
                     arena,
                 );
+                let eff = match gate_advance_origins(eff.clone(), StateIdx(i as u32), states, arena)
+                {
+                    Some(gated) => gated,
+                    None => {
+                        exact = false;
+                        eff
+                    }
+                };
                 #[cfg(debug_assertions)]
                 debug_assert_origins_consuming(&eff, |s| {
                     matches!(
@@ -1428,6 +1672,7 @@ pub(crate) fn compile_all_target_effects(
     (
         effects.into_boxed_slice(),
         origin_effects.into_boxed_slice(),
+        exact,
     )
 }
 
@@ -2341,5 +2586,247 @@ mod tests {
             .expect("tier3_analysis should be computed");
         let sound = check_break_deferred_soundness(analysis, &regex.states.0);
         assert!(sound, "pure \\b$ pattern should be accepted");
+    }
+
+    // -----------------------------------------------------------------------
+    // Assertion-set walk and guarded Advance origins (Bugs 57, 59)
+    // -----------------------------------------------------------------------
+
+    /// Indices of the consuming states that accept `byte` only (not `!`),
+    /// i.e. the literal states for that byte.
+    fn literal_states(re: &crate::Regex, byte: u8) -> Vec<StateIdx> {
+        (0..re.states.0.len() as u32)
+            .map(StateIdx)
+            .filter(|&s| match re.states[s] {
+                State::Byte { byte: b, .. } => b == byte,
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// The break output of the pattern's first `CounterIncrement`.
+    fn first_break_out(re: &crate::Regex) -> StateIdx {
+        re.states
+            .0
+            .iter()
+            .find_map(|s| match *s {
+                State::CounterIncrement { out1, .. } => Some(out1),
+                _ => None,
+            })
+            .expect("pattern has a counter")
+    }
+
+    /// Indices of the assertion states of the given kind.
+    fn assert_states(re: &crate::Regex, kind: crate::AssertKind) -> Vec<StateIdx> {
+        (0..re.states.0.len() as u32)
+            .map(StateIdx)
+            .filter(|&s| matches!(re.states[s], State::Assert { kind: k, .. } if k == kind))
+            .collect()
+    }
+
+    /// Shorthand: a sorted set of state indices.
+    fn set(indices: &[u32]) -> Vec<StateIdx> {
+        indices.iter().map(|&i| StateIdx(i)).collect()
+    }
+
+    #[test]
+    fn test_is_sorted_subset() {
+        // The empty set is a subset of everything, including itself.
+        assert!(is_sorted_subset(&set(&[]), &set(&[])));
+        assert!(is_sorted_subset(&set(&[]), &set(&[3])));
+        assert!(!is_sorted_subset(&set(&[3]), &set(&[])));
+
+        // Equal sets, and proper subsets taken from the start, the
+        // middle and the end.
+        assert!(is_sorted_subset(&set(&[1, 4, 9]), &set(&[1, 4, 9])));
+        assert!(is_sorted_subset(&set(&[1]), &set(&[1, 4, 9])));
+        assert!(is_sorted_subset(&set(&[4]), &set(&[1, 4, 9])));
+        assert!(is_sorted_subset(&set(&[9]), &set(&[1, 4, 9])));
+        assert!(is_sorted_subset(&set(&[1, 9]), &set(&[1, 4, 9])));
+        assert!(is_sorted_subset(&set(&[4, 9]), &set(&[1, 4, 9])));
+
+        // A missing element below, between and above the elements of
+        // the larger set.
+        assert!(!is_sorted_subset(&set(&[0]), &set(&[1, 4, 9])));
+        assert!(!is_sorted_subset(&set(&[2]), &set(&[1, 4, 9])));
+        assert!(!is_sorted_subset(&set(&[10]), &set(&[1, 4, 9])));
+        assert!(!is_sorted_subset(&set(&[1, 5]), &set(&[1, 4, 9])));
+        assert!(!is_sorted_subset(&set(&[1, 4, 10]), &set(&[1, 4, 9])));
+
+        // More elements than the other set, a superset, disjoint sets.
+        assert!(!is_sorted_subset(&set(&[1, 4, 9]), &set(&[1, 4])));
+        assert!(!is_sorted_subset(&set(&[1, 4, 9]), &set(&[4, 9])));
+        assert!(!is_sorted_subset(&set(&[2, 3]), &set(&[1, 4])));
+    }
+
+    #[test]
+    fn test_is_sorted_subset_matches_naive_definition() {
+        // Every pair of subsets of a seven-element universe.
+        let universe: [u32; 7] = [0, 2, 3, 5, 8, 9, 13];
+        let subsets: Vec<Vec<StateIdx>> = (0u32..1 << universe.len())
+            .map(|mask| {
+                universe
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, &v)| StateIdx(v))
+                    .collect()
+            })
+            .collect();
+        for small in &subsets {
+            for big in &subsets {
+                let expected = small.iter().all(|s| big.contains(s));
+                assert_eq!(
+                    is_sorted_subset(small, big),
+                    expected,
+                    "{small:?} ⊆ {big:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_assertion_set_walk_ends_on_epsilon_cycle() {
+        // `( *)*` is a nullable loop: an epsilon cycle right after the
+        // counter's break.  The walk must come back with both consuming
+        // states, reached unconditionally (Bug 59).
+        let re = build_regex_unroll("x{2,3}( *)*y", 0);
+        let reached = consuming_by_assertion_set(&[first_break_out(&re)], &re.states.0, |_| true)
+            .expect("walk terminates within its bound");
+        let origins: Vec<StateIdx> = reached.iter().map(|r| r.origin).collect();
+        let mut expected = literal_states(&re, b' ');
+        expected.extend(literal_states(&re, b'y'));
+        expected.sort();
+        assert_eq!(origins, expected);
+        assert!(reached.iter().all(|r| r.asserts.is_empty()));
+
+        // The pattern from the fuzz run compiles, and with all counters
+        // kept (the configuration that used to run out of memory).
+        let re = build_regex_unroll("^y{4,30}((x| *| +))*$", 0);
+        assert!(re.tier3_analysis.as_ref().is_some_and(|a| a.effects_exact));
+    }
+
+    #[test]
+    fn test_assertion_set_walk_keeps_minimal_sets() {
+        // `y` is reached through `\b` alone or through `\b\B`.  The second
+        // path needs a superset of the first path's assertions, so it
+        // adds nothing.
+        let re = build_regex_unroll("x{2,3}\\b(\\B|)y", 0);
+        let reached = consuming_by_assertion_set(
+            &[first_break_out(&re)],
+            &re.states.0,
+            crate::AssertKind::is_dfa_deferrable,
+        )
+        .unwrap();
+        let word = assert_states(&re, crate::AssertKind::WordAscii);
+        assert_eq!(word.len(), 1);
+        assert_eq!(reached.len(), 1, "{reached:?}");
+        assert_eq!(reached[0].origin, literal_states(&re, b'y')[0]);
+        assert_eq!(reached[0].asserts, word);
+        assert_eq!(reached[0].entered, None);
+
+        // Two different assertions in front of the same state are
+        // alternatives: both sets are kept.
+        let re = build_regex_unroll("x{2,3}(\\b|\\B)y", 0);
+        let reached = consuming_by_assertion_set(
+            &[first_break_out(&re)],
+            &re.states.0,
+            crate::AssertKind::is_dfa_deferrable,
+        )
+        .unwrap();
+        assert_eq!(reached.len(), 2, "{reached:?}");
+        assert!(reached.iter().all(|r| r.asserts.len() == 1));
+        assert_ne!(reached[0].asserts, reached[1].asserts);
+    }
+
+    #[test]
+    fn test_assertion_set_walk_is_bounded() {
+        // Each `(\b|\B)` doubles the number of incomparable assertion
+        // sets in front of `y`.  Three groups give eight, which is the
+        // limit; four give sixteen and the walk gives up.
+        let three = build_regex_unroll("x{2,3}(\\b|\\B)(\\b|\\B)(\\b|\\B)y", 0);
+        let reached = consuming_by_assertion_set(
+            &[first_break_out(&three)],
+            &three.states.0,
+            crate::AssertKind::is_dfa_deferrable,
+        )
+        .expect("eight sets are within the bound");
+        assert_eq!(reached.len(), MAX_ASSERT_SETS_PER_STATE);
+
+        let four = build_regex_unroll("x{2,3}(\\b|\\B)(\\b|\\B)(\\b|\\B)(\\b|\\B)y", 0);
+        assert!(
+            consuming_by_assertion_set(
+                &[first_break_out(&four)],
+                &four.states.0,
+                crate::AssertKind::is_dfa_deferrable,
+            )
+            .is_none()
+        );
+        // Such a pattern must not run on Tier 3: its effects are not exact.
+        let analysis = four.tier3_analysis.as_ref().expect("analysis is kept");
+        assert!(!analysis.effects_exact);
+        assert!(!check_break_deferred_soundness(&analysis, &four.states.0));
+        assert!(!four.tier3_eligible);
+    }
+
+    #[test]
+    fn test_advance_behind_assertion_is_guarded_seed() {
+        // After the break, `1` is consumed and `\b` stands in front of
+        // the loop back into the counter.  The body state must not be an
+        // unconditional origin of that step; entering the counter is a
+        // seed guarded by the assertion (Bug 57).
+        let re = build_regex_unroll("^(.{2,3}1\\b)+$", 0);
+        let analysis = re.tier3_analysis.as_ref().unwrap();
+        let word = assert_states(&re, crate::AssertKind::WordAscii)[0];
+        let effects = analysis.target_effects[word.idx()]
+            .as_ref()
+            .expect("the assertion is the target of `1`");
+        let TargetStep::Advance { new_origins } = &effects.step else {
+            panic!("expected an Advance step, got {}", effects.step);
+        };
+        assert!(new_origins.is_empty(), "{new_origins:?}");
+        assert_eq!(effects.guarded.len(), 1);
+        let guarded = &effects.guarded[0];
+        assert_eq!(
+            analysis.assert_chain_arena.get(guarded.guard.assert_chain),
+            &[word][..]
+        );
+        let body = (0..re.states.0.len() as u32)
+            .map(StateIdx)
+            .find(|&s| matches!(re.states[s], State::Wildcard { .. }))
+            .unwrap();
+        assert!(
+            matches!(
+                guarded.atom,
+                EffectAtom::AddSeed { origin, value: 0, .. } if origin == body
+            ),
+            "{}",
+            guarded.atom
+        );
+    }
+
+    #[test]
+    fn test_advance_behind_assertion_is_guarded_tail() {
+        // Outside a counter the origin behind the assertion is a guarded
+        // tail; an origin that is also reachable without the assertion
+        // stays unconditional.
+        let re = build_regex_unroll("^a{2,3}b(\\bc|d)", 0);
+        let analysis = re.tier3_analysis.as_ref().unwrap();
+        let after_b = match re.states[literal_states(&re, b'b')[0]] {
+            State::Byte { out, .. } => out,
+            _ => unreachable!(),
+        };
+        let effects = analysis.target_effects[after_b.idx()].as_ref().unwrap();
+        let TargetStep::Advance { new_origins } = &effects.step else {
+            panic!("expected an Advance step, got {}", effects.step);
+        };
+        assert_eq!(&new_origins[..], &literal_states(&re, b'd')[..]);
+        assert_eq!(effects.guarded.len(), 1);
+        let c = literal_states(&re, b'c')[0];
+        assert!(
+            matches!(effects.guarded[0].atom, EffectAtom::AddTail { origin } if origin == c),
+            "{}",
+            effects.guarded[0].atom
+        );
     }
 }
