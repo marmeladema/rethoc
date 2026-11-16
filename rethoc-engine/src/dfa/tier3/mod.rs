@@ -1100,12 +1100,14 @@ struct Transition {
     with_break_is_match: bool,
     /// True if this transition crosses a CInc node.
     is_counting: bool,
-    /// Seeds applied BEFORE counter increment.
+    /// Seeds applied BEFORE the per-instance loop of the step.
     ///
-    /// From Phase 1 deferred-assertion resolution on counting transitions
-    /// with L=1 counter bodies.  The resolved path consumed the body byte,
-    /// so the counter must be non-empty when increment fires.  Value is 0
-    /// because the increment itself provides the +1.
+    /// From Phase 1 deferred-assertion resolution: a thread that passes
+    /// the assertion enters the counter body before this transition's
+    /// byte is consumed.  Its instance is seeded at the body's first
+    /// consuming state with value 0 and then takes the step like any
+    /// other instance (advance, increment, or die) — on counting and
+    /// non-counting transitions alike (Bug 55).
     pre_seeds: Box<[(CounterIdx, StateIdx, u32)]>,
     /// New counter instances from CI nodes reachable WITHOUT following
     /// any CInc break path (always applied after counter increment).
@@ -1776,9 +1778,6 @@ impl Tier3DfaCache {
         let mut resolved_seeds: Vec<(CounterIdx, StateIdx, u32)> = Vec::new();
         let mut resolved_cinc = false;
         let mut resolved_is_match = false;
-        // Map from resolved seed origin → post-consumption target.
-        // Used to remap L>1 seeds to the correct body position (Bug 16).
-        let mut resolved_body_targets: Vec<(StateIdx, StateIdx)> = Vec::new();
         // Note: we do NOT track resolved_is_match_at_end here.  That flag
         // means "the deferred assertion passed mid-stream (with next=byte) and
         // $ → Match was reachable."  But the assertion was evaluated with
@@ -1813,17 +1812,15 @@ impl Tier3DfaCache {
                 // Discard cr.is_match_at_end — see comment above.
                 //
                 // Phase 1 consumes the resolved closure's NFA states
-                // against `byte`.  Build a map from seed origin → target
-                // for later remapping of resolved seeds (Bug 16).
+                // against `byte`.  Their targets go into the transition
+                // like any other origin's, which is what lets the
+                // instances seeded from `resolved_seeds` take this very
+                // step (see `resolved_pre_seeds` below).
                 for &idx in &cr.nfa_states {
                     if let Some((t, te)) = consume_byte(idx, byte, regex) {
                         let mut ts = vec![t];
                         if te != StateIdx::NONE {
                             ts.push(te);
-                        }
-                        resolved_body_targets.push((idx, t));
-                        if te != StateIdx::NONE {
-                            resolved_body_targets.push((idx, te));
                         }
                         targets_per_origin.push((idx, ts));
                     }
@@ -1880,36 +1877,46 @@ impl Tier3DfaCache {
             }
         }
 
-        /// Check if ANY target for `origin` in the flattened origin/target
-        /// arrays has an Increment target effect.
-        fn origin_has_increment(
-            origin: StateIdx,
-            origin_keys: &[StateIdx],
-            origin_targets_vec: &[StateIdx],
-            targets: &[Option<Tier3OriginKind>],
-        ) -> bool {
-            origin_keys
-                .iter()
-                .zip(origin_targets_vec.iter())
-                .any(|(&k, &t)| {
-                    k == origin
-                        && matches!(targets[t.idx()], Some(Tier3OriginKind::Increment { .. }))
-                })
-        }
-
-        // Compute seed initial values for non-counting transitions.
-        // For counting transitions, resolved seeds on L=1 bodies go to
-        // pre_seeds (value 0) — the increment provides the +1.
-        // For non-counting transitions, bump to value 1 since there's
-        // no increment to provide the +1.
-        if !is_counting {
-            for rs in &mut resolved_seeds {
-                if origin_has_increment(rs.1, &origin_keys, &origin_targets_vec, &analysis.targets)
-                {
-                    rs.2 = 1;
-                }
-            }
-        }
+        // Seeds from resolved deferred assertions (e.g. `\b` in front of
+        // a counted group) — Bug 55.
+        //
+        // The assertion was parked on the previous byte and resolves now
+        // that `byte` is known, so a thread that passes it enters the
+        // counter body *before* `byte` is consumed: its instance must be
+        // seeded at the body's first consuming state with value 0 and then
+        // take this step like every other instance.  That is exactly what
+        // `pre_seeds` do — they are inserted before the per-instance loop
+        // of the step, which then advances the instance through this
+        // transition's `origin_keys` / `origin_targets`:
+        //
+        // - the first body state consumes `byte` and the body goes on
+        //   (possibly through a split): the instance advances to every
+        //   new origin;
+        // - it consumes `byte` and completes the body (single-byte body):
+        //   the instance is incremented, and can continue or break;
+        // - it cannot consume `byte`: the thread is dead and the instance
+        //   is dropped.
+        //
+        // Earlier versions seeded these instances AFTER the step, at an
+        // origin patched up case by case (single-byte bodies as pre_seeds,
+        // Bug 16's remap to the consumed byte's target, Bug 50's exception
+        // for non-consuming targets).  That left the instance at a stale
+        // origin whenever the first byte's target was a split, and kept
+        // instances alive whose first byte did not match.
+        //
+        // Break-gated origins are excluded (Bug 40): an origin that is
+        // NOT `reachable_without_break` sits behind some counter's break
+        // path, and the deferred assertion that led to it may be in the
+        // DFA state only because that state over-approximates.  Those
+        // seeds are delivered per instance, when the counter actually
+        // breaks, through the guarded atoms of `CompiledTargetEffects`.
+        // An origin that is reachable without a break is seeded here even
+        // if it also appears on a break path (Bug 17).
+        let resolved_pre_seeds: Vec<(CounterIdx, StateIdx, u32)> = resolved_seeds
+            .iter()
+            .filter(|rs| analysis.reachable_without_break[rs.1.idx()])
+            .cloned()
+            .collect();
 
         // Compute DFA successors: no_break and with_break.
         if is_counting {
@@ -1943,33 +1950,6 @@ impl Tier3DfaCache {
                 analysis,
                 byte,
             );
-
-            // Build pre_seeds: resolved seeds on counting transitions whose
-            // origin had an Increment action (L=1 body consumed on this
-            // transition via deferred assertion resolution).
-            //
-            // Resolved seeds that correspond to a break-gated seed
-            // (analysis.break_seeds) are excluded — they should only fire
-            // when the triggering counter actually breaks, not
-            // unconditionally on every transition from the with_break DFA
-            // state.  The break_seeds mechanism handles them instead.
-            let pre_seeds: Vec<(CounterIdx, StateIdx, u32)> = resolved_seeds
-                .iter()
-                .filter(|rs| {
-                    origin_has_increment(
-                        rs.1,
-                        &origin_keys,
-                        &origin_targets_vec,
-                        &analysis.targets,
-                    )
-                    // Bug 40: exclude break-gated seeds — origins NOT
-                    // reachable_without_break are counter-break-
-                    // dependent and should not be treated as
-                    // unconditional pre_seeds.
-                    && analysis.reachable_without_break[rs.1.idx()]
-                })
-                .cloned()
-                .collect();
 
             // Unconditional seeds: seeds that are reachable from
             // counter-free origins only.  When the DFA state includes
@@ -2009,86 +1989,12 @@ impl Tier3DfaCache {
                 );
                 cr_cf_nb.seed_instances
             };
-            let mut seeds: Vec<(CounterIdx, StateIdx, u32)> = cr_nb
+            let seeds: Vec<(CounterIdx, StateIdx, u32)> = cr_nb
                 .seed_instances
                 .iter()
                 .filter(|si| counter_free_seeds.iter().any(|cf| cf == *si))
                 .map(|&(c, s)| (c, s, 0u32))
                 .collect();
-            // Only merge resolved seeds that are NOT pre_seeds AND that
-            // don't correspond to a break-gated seed.  Resolved seeds
-            // from deferred assertions in with_break DFA states may come
-            // from counter break paths (e.g. CInc-0 break → \B → CI-1);
-            // treating them as unconditional would suppress the
-            // corresponding break_seed and fire the seed on every
-            // transition from the with_break state, even when the
-            // triggering counter didn't actually break (Bug 14).
-            //
-            // For L>1 bodies: the resolved seed's origin is the first
-            // body byte (consuming state from the resolved closure).
-            // Phase 1 already consumed that byte, so the instance has
-            // advanced one position into the body.  Remap the seed's
-            // origin to the post-consumption TARGET so it appears in
-            // the next transition's origin_keys.  Without remapping,
-            // the instance would be at a stale origin and get dropped
-            // by the counter loop (Bug 16).
-            for s in &resolved_seeds {
-                let is_pre = pre_seeds.iter().any(|p| p.0 == s.0 && p.1 == s.1);
-                // Bug 40: a resolved seed is break-gated whenever its
-                // origin is NOT reachable_without_break.  Origins only
-                // reachable through CInc break paths are counter-break-
-                // dependent regardless of whether they appear in
-                // analysis.break_seeds.  When the break path crosses a
-                // consuming state before reaching the downstream CI,
-                // the epsilon-only break_seeds walk doesn't find the
-                // CI and produces no break_seeds entry.  But the
-                // resolved seed from deferred assertion resolution
-                // (e.g. \B on the with_break DFA state) still reaches
-                // the downstream counter.  Treating it as unconditional
-                // would seed the counter on every transition, even when
-                // the triggering counter hasn't broken.
-                //
-                // If the origin IS reachable without break, the seed
-                // is unconditionally reachable even though it may also
-                // appear on a break path (Bug 17).
-                let is_break_gated = !analysis.reachable_without_break[s.1.idx()];
-                if !is_pre && !is_break_gated {
-                    // Remap origin if Phase 1 consumed this seed's
-                    // origin byte (Bug 16).
-                    //
-                    // Bug 50: only remap when the target is a consuming
-                    // state.  For L=1 bodies with a non-consuming loop
-                    // (e.g. `0*` preceding the counted body), the
-                    // post-consumption target is a Split/Assert/CI node
-                    // that will never appear in a subsequent transition's
-                    // origin_keys.  Remapping to such a target kills the
-                    // instance on the next step (action=None).  Keep the
-                    // original consuming origin so the instance survives.
-                    let remapped_origin = resolved_body_targets
-                        .iter()
-                        .find(|&&(from, _)| from == s.1)
-                        .filter(|&&(_, to)| {
-                            matches!(
-                                regex.states[to],
-                                State::Byte { .. }
-                                    | State::ByteCI { .. }
-                                    | State::Wildcard { .. }
-                                    | State::ByteClassStatic { .. }
-                                    | State::ByteClassCustom { .. }
-                                    | State::ByteTable { .. }
-                            )
-                        })
-                        .map_or(s.1, |&(_, to)| to);
-                    let rs = (s.0, remapped_origin, s.2);
-                    if !seeds
-                        .iter()
-                        .any(|e| e.0 == rs.0 && e.1 == rs.1 && e.2 == rs.2)
-                    {
-                        seeds.push(rs);
-                    }
-                }
-            }
-
             // Break-only seeds: reachable only through CInc break paths.
             // Each seed is tagged with the counter whose CInc break leads
             // to it — the seed is only applied when that specific counter's
@@ -2137,7 +2043,7 @@ impl Tier3DfaCache {
                 with_break: wb_id,
                 with_break_is_match: wb_m || resolved_is_match,
                 is_counting: true,
-                pre_seeds: pre_seeds.into(),
+                pre_seeds: resolved_pre_seeds.into(),
                 seeds: seeds.into(),
                 origin_keys: origin_keys.into_boxed_slice(),
                 origin_targets: origin_targets_vec.into_boxed_slice(),
@@ -2150,41 +2056,11 @@ impl Tier3DfaCache {
             let id = self.intern_closure_result(&probe, byte);
             let (m, mae) = self.match_flags(id);
 
-            let mut seeds: Vec<(CounterIdx, StateIdx, u32)> = probe
+            let seeds: Vec<(CounterIdx, StateIdx, u32)> = probe
                 .seed_instances
                 .iter()
                 .map(|&(c, s)| (c, s, 0u32))
                 .collect();
-            // Merge resolved seeds with origin remapping for L>1
-            // bodies (Bug 16): Phase 1 consumed the first body byte,
-            // so the seed should start at the post-consumption target.
-            //
-            // Bug 50: same guard as the counting path — only remap when
-            // the target is a consuming state.
-            for s in &resolved_seeds {
-                let remapped_origin = resolved_body_targets
-                    .iter()
-                    .find(|&&(from, _)| from == s.1)
-                    .filter(|&&(_, to)| {
-                        matches!(
-                            regex.states[to],
-                            State::Byte { .. }
-                                | State::ByteCI { .. }
-                                | State::Wildcard { .. }
-                                | State::ByteClassStatic { .. }
-                                | State::ByteClassCustom { .. }
-                                | State::ByteTable { .. }
-                        )
-                    })
-                    .map_or(s.1, |&(_, to)| to);
-                let rs = (s.0, remapped_origin, s.2);
-                if !seeds
-                    .iter()
-                    .any(|e| e.0 == rs.0 && e.1 == rs.1 && e.2 == rs.2)
-                {
-                    seeds.push(rs);
-                }
-            }
 
             let nb_counter_free_mae =
                 self.counter_free_nb_mae(memory, mae, &targets_per_origin, regex, analysis, byte);
@@ -2195,7 +2071,7 @@ impl Tier3DfaCache {
                 with_break: id,
                 with_break_is_match: m || resolved_is_match,
                 is_counting: false,
-                pre_seeds: Box::new([]),
+                pre_seeds: resolved_pre_seeds.into(),
                 seeds: seeds.into(),
                 origin_keys: origin_keys.into_boxed_slice(),
                 origin_targets: origin_targets_vec.into_boxed_slice(),
