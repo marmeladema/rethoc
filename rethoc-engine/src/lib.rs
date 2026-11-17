@@ -1711,7 +1711,6 @@ impl RegexBuilder {
         // To keep things efficient, we hash signatures on the fly.
         let mut class_map: HashMap<Vec<u32>, u8> = HashMap::default();
         let mut mapping = [0u8; 256];
-        let mut next_class: u8 = 0;
 
         for b in 0..=255u8 {
             let mut sig: Vec<u32> = Vec::with_capacity(consuming.len() + 1);
@@ -1796,17 +1795,17 @@ impl RegexBuilder {
             if let Some(&class) = class_map.get(&sig) {
                 mapping[b as usize] = class;
             } else {
-                let class = next_class;
+                // One class per distinct signature, and one signature per
+                // byte: at most 256 classes, numbered 0..=255.  The count
+                // itself can be 256 (every byte in a class of its own),
+                // which does not fit a `u8`.
+                let class = u8::try_from(class_map.len()).expect("at most 256 byte classes");
                 class_map.insert(sig, class);
                 mapping[b as usize] = class;
-                // Safety: we cannot have more than 256 distinct classes.
-                next_class = next_class
-                    .checked_add(1)
-                    .expect("more than 256 byte classes");
             }
         }
 
-        (mapping, next_class as usize)
+        (mapping, class_map.len())
     }
 
     /// Recursively lower a `regex-syntax` HIR node into a postfix sequence
@@ -14332,6 +14331,39 @@ mod tests {
                 }
                 assert_eq!(declared, matters, "{kind:?} and {prop:?}");
             }
+        }
+    }
+
+    /// A pattern can tell all 256 bytes apart.  That is 256 classes,
+    /// numbered up to 255: compiling it used to panic on the count.
+    #[test]
+    fn test_byte_classes_all_256_distinct() {
+        let pattern = format!(
+            "(?-u){}",
+            (0..=255u8)
+                .map(|b| format!("\\x{b:02x}yz"))
+                .collect::<Vec<_>>()
+                .join("|")
+        );
+        let re = Regex::new(&pattern).expect("256 alternatives compile");
+        assert!(re.states.len() >= DEFAULT_BYTE_CLASS_MIN_STATES);
+        assert_eq!(re.num_byte_classes, 256);
+        let mut seen = [false; 256];
+        for b in 0..=255u8 {
+            seen[re.byte_classes[b as usize] as usize] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "every byte in a class of its own");
+
+        let mut memory = MatcherMemory::default();
+        for (input, expected) in [
+            (&b"\x00yz"[..], true),
+            (&b"..\xffyz"[..], true),
+            (&b"\x7fy\x80yz"[..], true),
+            (&b"\x00y\xffz"[..], false),
+        ] {
+            let mut m = memory.matcher(&re);
+            m.chunk(input);
+            assert_eq!(m.finish(), expected, "{input:?}");
         }
     }
 
