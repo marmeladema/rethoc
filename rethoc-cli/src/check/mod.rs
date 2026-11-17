@@ -105,36 +105,61 @@ impl fmt::Display for Rejection {
     }
 }
 
+/// Which tiers a check runs, next to the NFA.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TierChoice {
+    /// Every tier the pattern is eligible for.
+    #[default]
+    All,
+    /// Only this tier; a pattern not eligible for it is rejected.
+    Only(u8),
+    /// Every eligible tier but this one.
+    Except(u8),
+}
+
+impl TierChoice {
+    /// From `--tier` and `--skip-tier`; `--tier` wins (the command line
+    /// is checked for both being given before this is called).
+    pub(crate) fn new(only: Option<u8>, skip: Option<u8>) -> Self {
+        match (only, skip) {
+            (Some(t), _) => Self::Only(t),
+            (None, Some(t)) => Self::Except(t),
+            (None, None) => Self::All,
+        }
+    }
+}
+
 /// A pattern compiled in one configuration, with the tiers to check.
 pub(crate) struct Subject {
     /// Configuration the pattern was compiled with.
     pub(crate) config: RegexConfig,
     /// The compiled pattern.
     pub(crate) regex: Regex,
-    /// Tier 0 first, then the eligible DFA tiers (or only the requested one).
+    /// Tier 0 first, then the eligible DFA tiers the [`TierChoice`] keeps.
     pub(crate) tiers: Vec<u8>,
 }
 
 impl Subject {
-    /// Compile `pattern` and find the tiers to check.  With `only_tier`,
-    /// check the NFA and that tier; otherwise every eligible tier.
+    /// Compile `pattern` and find the tiers to check: the NFA, and the
+    /// eligible tiers that `choice` keeps.
     pub(crate) fn compile(
         pattern: &str,
         config: &RegexConfig,
-        only_tier: Option<u8>,
+        choice: TierChoice,
         memory: &mut MatcherMemory,
     ) -> Result<Self, Rejection> {
         let regex = Regex::with_config(pattern, config.clone()).map_err(Rejection::Compile)?;
-        let candidates: Vec<u8> = match only_tier {
-            None => (0..=4).collect(),
-            Some(0) => vec![0],
-            Some(t) => vec![0, t],
+        let candidates: Vec<u8> = match choice {
+            TierChoice::All => (0..=4).collect(),
+            TierChoice::Only(0) => vec![0],
+            TierChoice::Only(t) => vec![0, t],
+            TierChoice::Except(skip) => (0..=4).filter(|&t| t == 0 || t != skip).collect(),
         };
         let tiers: Vec<u8> = candidates
             .into_iter()
             .filter(|&t| memory.matcher_for_tier(&regex, t).is_ok())
             .collect();
-        if let Some(t) = only_tier
+        if let TierChoice::Only(t) = choice
             && !tiers.contains(&t)
         {
             return Err(Rejection::NotEligible {
@@ -392,6 +417,28 @@ pub(crate) fn shell_join(args: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--skip-tier 3` keeps the NFA and every other eligible tier;
+    /// `--tier 3` keeps the NFA and tier 3.
+    #[test]
+    fn tier_choice_selects_tiers() {
+        let config = RegexConfig {
+            max_unroll_states: 0,
+            ..Default::default()
+        };
+        let tiers = |choice| {
+            Subject::compile("(?:a|bb){2,3}c", &config, choice, &mut new_memory())
+                .map(|s| s.tiers)
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(tiers(TierChoice::All), Ok(vec![0, 3, 4]));
+        assert_eq!(tiers(TierChoice::Except(3)), Ok(vec![0, 4]));
+        assert_eq!(tiers(TierChoice::Only(3)), Ok(vec![0, 3]));
+        assert!(tiers(TierChoice::Only(2)).is_err());
+        assert_eq!(TierChoice::new(Some(3), None), TierChoice::Only(3));
+        assert_eq!(TierChoice::new(None, Some(3)), TierChoice::Except(3));
+        assert_eq!(TierChoice::new(None, None), TierChoice::All);
+    }
 
     #[test]
     fn escape_round_trip() {

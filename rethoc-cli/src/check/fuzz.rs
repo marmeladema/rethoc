@@ -201,7 +201,12 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
             } else {
                 &mut own
             };
-            if let Ok(subject) = Subject::compile(&pattern, config, args.tier, memory) {
+            if let Ok(subject) = Subject::compile(
+                &pattern,
+                config,
+                super::TierChoice::new(args.tier, None),
+                memory,
+            ) {
                 if args.trace {
                     eprintln!(
                         "  {} min_tier={} tiers={:?}",

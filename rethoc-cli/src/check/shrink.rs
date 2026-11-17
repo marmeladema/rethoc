@@ -59,7 +59,12 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
     let mut subject = None;
     let mut compiled = 0;
     for config in args.compile.check_configs() {
-        match Subject::compile(pattern, &config, args.tier, &mut memory) {
+        match Subject::compile(
+            pattern,
+            &config,
+            super::TierChoice::new(args.tier, None),
+            &mut memory,
+        ) {
             Ok(s) => {
                 compiled += 1;
                 s.check(
