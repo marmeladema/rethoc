@@ -435,6 +435,12 @@ impl GroupedStream {
     pub(crate) fn raw(&self) -> &[u64] {
         &self.raw
     }
+
+    /// The boundary metadata: previous byte and at-start flag (for tests).
+    #[cfg(test)]
+    pub(crate) fn boundary_state(&self) -> (Option<u8>, bool) {
+        (self.prev, self.at_start)
+    }
 }
 
 struct DisplayStream<'a> {
