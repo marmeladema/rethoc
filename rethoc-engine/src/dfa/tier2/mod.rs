@@ -728,6 +728,8 @@ impl fmt::Debug for Tier2DfaCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Tier2DfaCache")
             .field("num_states", &self.inner.states.len())
+            .field("max_states", &self.inner.max_states)
+            .field("evictions", &self.inner.evictions)
             .finish()
     }
 }
@@ -746,6 +748,51 @@ impl Tier2DfaCache {
         }
     }
 
+    /// Set the state cap (see [`DfaCache::set_max_states`]).
+    pub(crate) fn set_max_states(&mut self, max_states: usize) {
+        self.inner.set_max_states(max_states);
+    }
+
+    /// Number of times the cache was emptied because it was full.
+    #[cfg(test)]
+    pub(crate) fn evictions(&self) -> u64 {
+        self.inner.evictions
+    }
+
+    /// Make room for the two states (break and no-break successor) a
+    /// missing transition out of `from` can add: when the cache is full,
+    /// empty it and put `from` back.  Returns the id `from` has
+    /// afterwards.
+    ///
+    /// The counters are the stream's own state and are left alone.
+    #[inline]
+    fn make_room(&mut self, from: DfaStateId) -> DfaStateId {
+        if self.inner.has_room(2) {
+            from
+        } else {
+            self.evict(from)
+        }
+    }
+
+    #[cold]
+    fn evict(&mut self, from: DfaStateId) -> DfaStateId {
+        let stride = self.stride;
+        let mut keep = [from];
+        self.transitions.clear();
+        self.settled.clear();
+        self.dead_transitions.clear();
+        self.dead_transitions.resize_with(stride, Transition::empty);
+        self.inner.evict(&mut keep, || {
+            self.transitions
+                .extend(std::iter::repeat_with(Transition::empty).take(stride));
+        });
+        keep[0]
+    }
+
+    /// Look up or insert a DFA state.  `None` when the state cap is
+    /// reached; transitions make room first
+    /// ([`make_room`](Self::make_room)), so only the optional settled
+    /// states ever see it.
     fn intern_state(
         &mut self,
         nfa_states: &[StateIdx],
@@ -1335,7 +1382,7 @@ impl Tier2DfaCache {
             cr.is_match_at_end,
             pw,
         )
-        .unwrap_or(DfaStateId::DEAD)
+        .expect("DFA state cap reached although room was made")
     }
 
     fn match_flags(&self, id: DfaStateId) -> (bool, bool) {
@@ -1393,7 +1440,7 @@ impl Tier2DfaCache {
                 cr.is_match_at_end,
                 false,
             )
-            .expect("start state exceeds DFA_MAX_STATES");
+            .expect("an empty cache has room for the start state");
         self.inner.start_is_match = self.inner.states[self.inner.start_id.idx()].is_match;
         self.inner.start_is_match_at_end =
             self.inner.states[self.inner.start_id.idx()].is_match_at_end;
@@ -1698,11 +1745,24 @@ impl<'a> Tier2DfaMatcher<'a> {
         let class = self.regex.byte_classes[byte as usize] as usize;
         let slot = self.current.idx() * self.cache.stride + class;
         if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
-            let trans =
-                self.cache
-                    .populate(self.memory, self.current, byte, self.regex, self.analysis);
-            self.cache.transitions[slot] = trans;
+            return self.populate_transition(byte, class);
         }
+        slot
+    }
+
+    /// Cache miss: compute the transition out of the current state on
+    /// `byte` (whose column in the table is `class`), store it and return
+    /// its slot.  Kept out of line so the lookups stay small.
+    #[cold]
+    #[inline(never)]
+    fn populate_transition(&mut self, byte: u8, class: usize) -> usize {
+        // The current state gets a new id if the cache has to be emptied.
+        self.current = self.cache.make_room(self.current);
+        let slot = self.current.idx() * self.cache.stride + class;
+        let trans = self
+            .cache
+            .populate(self.memory, self.current, byte, self.regex, self.analysis);
+        self.cache.transitions[slot] = trans;
         slot
     }
 
@@ -1711,10 +1771,7 @@ impl<'a> Tier2DfaMatcher<'a> {
     fn ensure_transition_direct(&mut self, byte: u8) -> usize {
         let slot = self.current.idx() * 256 + byte as usize;
         if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
-            let trans =
-                self.cache
-                    .populate(self.memory, self.current, byte, self.regex, self.analysis);
-            self.cache.transitions[slot] = trans;
+            return self.populate_transition(byte, byte as usize);
         }
         slot
     }
@@ -1861,6 +1918,7 @@ impl<'a> Tier2DfaMatcher<'a> {
             self.regex.byte_classes[byte as usize] as usize
         };
         if self.cache.dead_transitions[class].no_break == DfaStateId::UNPOPULATED {
+            self.cache.make_room(DfaStateId::DEAD);
             let trans = self.cache.populate(
                 self.memory,
                 DfaStateId::DEAD,
@@ -2139,6 +2197,60 @@ mod tests {
         let mut m = mem.matcher_for_tier(re, 2).unwrap();
         m.chunk(input);
         m.finish()
+    }
+
+    // ── Cache eviction (Bug 64) ──
+
+    /// Emptying a full cache drops every table indexed by state id,
+    /// keeps the state the matcher stands on, and leaves the stream's
+    /// counters alone.
+    #[test]
+    fn test_evict_clears_state_tables_and_keeps_counters() {
+        let re = build("x.{2,4}y");
+        assert!(re.tier2_eligible);
+        let analysis = re.tier2_analysis.as_ref().unwrap();
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier2DfaCache::new();
+        cache.prepare(&mut memory, &re, analysis);
+        let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+        m.chunk(b"zzxab");
+        assert!(m.has_live_counters);
+        let current = m.current;
+        let state = m.cache.inner.states[current.idx()].clone();
+        let live = m.cache.counters.live_count;
+        let stride = m.cache.stride;
+
+        // Put ids into the two side tables, as matching would.
+        let n = m.cache.inner.states.len();
+        m.cache.settled.resize(n, DfaStateId::UNPOPULATED);
+        m.cache.settled[0] = current;
+        m.cache.dead_transitions[0].no_break = current;
+        m.cache.dead_transitions[0].with_break = current;
+
+        m.current = m.cache.evict(current);
+        assert_eq!(m.cache.inner.states[m.current.idx()], state);
+        assert_eq!(m.cache.inner.states.len(), 2);
+        assert!(m.cache.settled.is_empty());
+        assert_eq!(m.cache.dead_transitions.len(), stride);
+        assert!(
+            m.cache
+                .dead_transitions
+                .iter()
+                .all(|t| t.no_break == DfaStateId::UNPOPULATED)
+        );
+        assert_eq!(m.cache.transitions.len(), 2 * stride);
+        assert!(
+            m.cache
+                .transitions
+                .iter()
+                .all(|t| t.no_break == DfaStateId::UNPOPULATED)
+        );
+        assert_eq!(m.cache.counters.live_count, live);
+        assert_eq!(m.cache.evictions(), 1);
+
+        // The stream goes on as if nothing had happened.
+        m.chunk(b"y");
+        assert!(m.finish());
     }
 
     // ── Dropping dead counter-body states ──
