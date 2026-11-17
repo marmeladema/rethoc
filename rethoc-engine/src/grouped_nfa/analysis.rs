@@ -10,7 +10,7 @@
 use std::fmt;
 
 use super::{Consumer, ConsumerKind, GroupedNfaPlan, Increment, Row, ZeroOp};
-use crate::{ByteMap, CounterIdx, CounterInfo, State, StateIdx};
+use crate::{AssertKind, ByteMap, CounterIdx, CounterInfo, State, StateIdx};
 
 // ---------------------------------------------------------------------------
 // Limits and rejections
@@ -72,8 +72,9 @@ pub enum Rejection {
     /// The zero-width graph has a cycle through this state (for example a
     /// nullable counted body).
     ZeroWidthCycle { state: u32 },
-    /// Milestone exclusion: assertions arrive with milestone P3.
-    Assertion { state: u32 },
+    /// An assertion of a kind not reviewed for raw replay (see
+    /// [`reviewed`]).
+    UnreviewedAssertion { state: u32 },
     /// The frontier would need more words than the budget.
     TooManyRowWords { words: usize, limit: usize },
     /// The retained plan arrays would exceed their budget.
@@ -120,11 +121,8 @@ impl fmt::Display for Rejection {
             Self::ZeroWidthCycle { state } => {
                 write!(f, "zero-width cycle through state {state}")
             }
-            Self::Assertion { state } => {
-                write!(
-                    f,
-                    "assertion at state {state} (not admitted before milestone P3)"
-                )
+            Self::UnreviewedAssertion { state } => {
+                write!(f, "assertion at state {state} is of an unreviewed kind")
             }
             Self::TooManyRowWords { words, limit } => {
                 write!(f, "frontier needs {words} words, limit {limit}")
@@ -402,6 +400,31 @@ fn row_words(scope: Scope, bounds: &[Option<(usize, usize)>]) -> usize {
     }
 }
 
+/// Whether raw replay (plan §5) has been reviewed for this assertion kind:
+/// it reads only the shared boundary context (stream start, previous byte,
+/// next byte or end of input); with a known next byte or at end of input
+/// it never defers; and a pass before the next byte is known stays a pass
+/// for every next byte and at end of input.  The tests check the last two
+/// properties on `AssertKind::eval` for every kind.
+///
+/// The match is exhaustive on purpose: a new kind does not compile until
+/// it is listed here, and it should be listed as `false` until it has been
+/// reviewed.
+pub(crate) const fn reviewed(kind: AssertKind) -> bool {
+    match kind {
+        AssertKind::Start
+        | AssertKind::End
+        | AssertKind::StartLF
+        | AssertKind::EndLF
+        | AssertKind::StartCRLF
+        | AssertKind::EndCRLF
+        | AssertKind::WordAscii
+        | AssertKind::WordAsciiNegate
+        | AssertKind::WordStartAscii
+        | AssertKind::WordEndAscii => true,
+    }
+}
+
 /// Upper bound of the transient analysis arrays for `states` states:
 /// labels and indegrees indexed by state, the reachable list, the work
 /// stacks and the order (each at most one entry per state), and the bounds
@@ -436,13 +459,11 @@ pub(crate) fn analyze(
 
     let (label, reachable) = prove_scopes(states, byte_tables, start, limits)?;
     let order = zero_width_order(states, &reachable)?;
-    // Milestone exclusions come after the structural checks, so that a
-    // graph outside the class for good is reported as such.
     if let Some(&idx) = order
         .iter()
-        .find(|&&s| matches!(states[s], State::Assert { .. }))
+        .find(|&&s| matches!(states[s], State::Assert { kind, .. } if !reviewed(kind)))
     {
-        return Err(Rejection::Assertion { state: idx.0 });
+        return Err(Rejection::UnreviewedAssertion { state: idx.0 });
     }
     let bounds = counter_bounds(states, &reachable, counter_info, num_counters)?;
 

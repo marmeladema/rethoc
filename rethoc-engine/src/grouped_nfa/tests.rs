@@ -8,8 +8,8 @@ use super::analysis::{self, Limits, Rejection, Scope};
 use super::exact::{self, Boundary, BoundaryCtx};
 use super::{GroupedNfaError, GroupedNfaPlan, GroupedScratch, GroupedStream, Increment, Row};
 use crate::{
-    ByteMap, CounterIdx, MatcherMemory, Regex, RegexConfig, State, StateIdx, byte_match_ci,
-    counter_step,
+    AssertEval, ByteMap, CounterIdx, MatcherMemory, Regex, RegexConfig, State, StateIdx,
+    byte_match_ci, counter_step,
 };
 
 // ---------------------------------------------------------------------------
@@ -18,13 +18,13 @@ use crate::{
 
 /// The three compile configurations of the test suite: default unrolling,
 /// unrolling off (counters forced), unrolling and merging off.
-const CONFIGS: [(usize, bool); 3] = [
+pub(crate) const CONFIGS: [(usize, bool); 3] = [
     (crate::DEFAULT_MAX_UNROLL_STATES, true),
     (0, true),
     (0, false),
 ];
 
-fn compile(pattern: &str, unroll: usize, merge: bool) -> Regex {
+pub(crate) fn compile(pattern: &str, unroll: usize, merge: bool) -> Regex {
     Regex::with_config(
         pattern,
         RegexConfig {
@@ -38,16 +38,16 @@ fn compile(pattern: &str, unroll: usize, merge: bool) -> Regex {
 }
 
 /// Counters forced: no unrolling, no merging.
-fn forced(pattern: &str) -> Regex {
+pub(crate) fn forced(pattern: &str) -> Regex {
     compile(pattern, 0, false)
 }
 
-fn plan(re: &Regex) -> &GroupedNfaPlan {
+pub(crate) fn plan(re: &Regex) -> &GroupedNfaPlan {
     re.grouped_plan()
         .unwrap_or_else(|e| panic!("expected admission: {e}"))
 }
 
-fn rejection(re: &Regex) -> Rejection {
+pub(crate) fn rejection(re: &Regex) -> Rejection {
     match re.grouped_plan() {
         Err(GroupedNfaError::Rejected(r)) => r,
         other => panic!("expected a rejection, got {other:?}"),
@@ -90,17 +90,17 @@ fn cinc(counter: u8, out: u32, out1: u32, min: usize, max: usize) -> State {
 }
 
 /// A small deterministic PRNG (xorshift64*).
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
-    fn below(&mut self, n: usize) -> usize {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
 }
@@ -184,11 +184,11 @@ fn rejects_outside_the_admitted_class() {
 }
 
 #[test]
-fn milestone_exclusions() {
-    assert!(matches!(
-        rejection(&forced(r"\Ax(a|aa){2}z")),
-        Rejection::Assertion { .. }
-    ));
+fn every_assertion_kind_is_reviewed() {
+    for &kind in crate::AssertKind::ALL {
+        assert!(analysis::reviewed(kind), "{kind:?}");
+    }
+    plan(&forced(r"\Ax(a|aa){2}z\z"));
 }
 
 /// The row of a counted scope: `0..=max` (finite) or `0..=min`
@@ -708,10 +708,20 @@ fn increment_of_the_maximum_is_impossible() {
 /// A configuration: a state and its count (`None` outside any counter).
 type Config = (StateIdx, Option<usize>);
 
-/// Scalar zero-width closure of `roots` plus the start state, by a plain
-/// visited-set search.  Returns every visited configuration and whether
-/// `Match` was reached.
-fn scalar_close(re: &Regex, roots: &BTreeSet<Config>) -> (BTreeSet<Config>, bool) {
+/// Scalar zero-width closure of `roots` plus the start state at boundary
+/// `ctx`, by a plain visited-set search; an assertion is followed on
+/// `Pass` of the shared evaluator.  Returns every visited configuration and
+/// whether `Match` was reached.
+fn scalar_close(
+    re: &Regex,
+    roots: &BTreeSet<Config>,
+    ctx: BoundaryCtx,
+) -> (BTreeSet<Config>, bool) {
+    let (at_end, next) = match ctx.boundary {
+        Boundary::UnknownNext => (false, None),
+        Boundary::BeforeByte(b) => (false, Some(b)),
+        Boundary::EndOfInput => (true, None),
+    };
     let mut seen = BTreeSet::new();
     let mut matched = false;
     let mut stack: Vec<Config> = roots.iter().copied().collect();
@@ -746,7 +756,11 @@ fn scalar_close(re: &Regex, roots: &BTreeSet<Config>) -> (BTreeSet<Config>, bool
                     stack.push((out1, None));
                 }
             }
-            State::Assert { .. } => panic!("assertions are not admitted"),
+            State::Assert { kind, out } => {
+                if kind.eval(ctx.at_start, at_end, ctx.prev, next) == AssertEval::Pass {
+                    stack.push((out, count));
+                }
+            }
             State::Match => matched = true,
             _ => {}
         }
@@ -816,56 +830,60 @@ fn expand(plan: &GroupedNfaPlan, rows: &[u64]) -> BTreeSet<Config> {
 }
 
 /// Run `input` byte by byte on the grouped stream and the scalar
-/// interpreter; compare raw roots, closures and match flags at every
-/// boundary.
-fn check_against_scalar(re: &Regex, input: &[u8], label: &str) {
+/// interpreter; compare raw roots, closures before each byte, and the
+/// match flag after construction, after each byte and at the end.
+pub(crate) fn check_against_scalar(re: &Regex, input: &[u8], label: &str) {
     let plan = plan(re);
     let mut scratch = GroupedScratch::new();
     let mut stream = GroupedStream::new(re, &mut scratch).unwrap();
     let mut raw: BTreeSet<Config> = BTreeSet::new();
     let mut closure_rows = vec![0u64; plan.words()];
-    let mut scalar_matched = false;
+    let ctx = |i: usize, boundary| BoundaryCtx {
+        at_start: i == 0,
+        prev: i.checked_sub(1).map(|j| input[j]),
+        boundary,
+    };
+    let (_, mut matched) = scalar_close(re, &raw, ctx(0, Boundary::UnknownNext));
+    assert_eq!(stream.ismatch(), matched, "{label}: ismatch at start");
     for (i, &b) in input.iter().enumerate() {
         assert_eq!(expand(plan, stream.raw()), raw, "{label}: raw roots at {i}");
-        let (closure, m) = scalar_close(re, &raw);
-        scalar_matched |= m;
-        let ctx = BoundaryCtx {
-            at_start: i == 0,
-            prev: i.checked_sub(1).map(|j| input[j]),
-            boundary: Boundary::BeforeByte(b),
-        };
-        let gm = exact::close(plan, stream.raw(), &mut closure_rows, ctx);
+        let (closure, m) = scalar_close(re, &raw, ctx(i, Boundary::BeforeByte(b)));
+        let gm = exact::close(
+            plan,
+            stream.raw(),
+            &mut closure_rows,
+            ctx(i, Boundary::BeforeByte(b)),
+        );
         assert_eq!(
             expand(plan, &closure_rows),
             closure,
             "{label}: closure at {i}"
         );
         assert_eq!(gm, m, "{label}: match at {i}");
-        assert_eq!(
-            stream.ismatch(),
-            scalar_matched,
-            "{label}: ismatch before {i}"
-        );
-        if scalar_matched {
+        stream.chunk(re, &mut scratch, &[b]);
+        if matched || m {
+            assert!(stream.ismatch(), "{label}: ismatch at {i}");
+            assert!(stream.finish(re, &mut scratch), "{label}: finish");
             return;
         }
         raw = scalar_consume(re, &closure, b);
-        stream.chunk(re, &mut scratch, &[b]);
+        let (_, m) = scalar_close(re, &raw, ctx(i + 1, Boundary::UnknownNext));
+        matched |= m;
+        assert_eq!(stream.ismatch(), matched, "{label}: ismatch after {i}");
     }
-    let (_, m) = scalar_close(re, &raw);
-    scalar_matched |= m;
-    if !stream.ismatch() {
+    if !matched {
         assert_eq!(expand(plan, stream.raw()), raw, "{label}: final raw roots");
     }
+    let (_, m) = scalar_close(re, &raw, ctx(input.len(), Boundary::EndOfInput));
     assert_eq!(
         stream.finish(re, &mut scratch),
-        scalar_matched,
+        matched || m,
         "{label}: finish"
     );
 }
 
 /// Every string over `alphabet` up to `max_len`.
-fn all_strings(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
+pub(crate) fn all_strings(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
     let mut out = vec![Vec::new()];
     let mut layer = vec![Vec::new()];
     for _ in 0..max_len {
@@ -908,6 +926,14 @@ const PATTERNS: &[(&str, &[u8])] = &[
     ("(ab){3,}c", b"abc"),
     ("a{3,}|b{2,}", b"ab"),
     ("abc|abd", b"abcd"),
+    (r"\Ax(a|aaa){3}z\z", b"xaz"),
+    (r"\A(a|aa){2}b(a|aa){2}\z", b"ab"),
+    (r"\Ax(a|aa){2}\z", b"xa"),
+    (r"\b(a|aa){2,5}\b", b"a -"),
+    (r"(?mR:^)(a|aa){2,5}(?mR:$)", b"a\r\n"),
+    (r"(?m:^)a{2,3}(?m:$)", b"a\n"),
+    (r"x(a\B|b){1,3}y", b"xaby"),
+    (r"\b{start}(ab){1,3}\b{end}", b"ab "),
     ("", b"a"),
 ];
 
@@ -962,14 +988,14 @@ fn configurations_match_scalar_interpreter_on_long_inputs() {
 // Match results against Tier 0 and the regex crate
 // ---------------------------------------------------------------------------
 
-fn oracle(pattern: &str) -> regex::bytes::Regex {
+pub(crate) fn oracle(pattern: &str) -> regex::bytes::Regex {
     regex::bytes::Regex::new(&format!("(?s-u){pattern}")).unwrap()
 }
 
 /// Feed `chunks` to the grouped stream and to Tier 0 side by side;
 /// `ismatch` must agree after construction and every call, `finish` must
 /// agree with both.
-fn run_chunks(re: &Regex, chunks: &[&[u8]], expected: bool, label: &str) {
+pub(crate) fn run_chunks(re: &Regex, chunks: &[&[u8]], expected: bool, label: &str) {
     let mut scratch = GroupedScratch::new();
     let mut stream = GroupedStream::new(re, &mut scratch).unwrap();
     let mut mem = MatcherMemory::default();

@@ -1,9 +1,9 @@
 # Exact grouped NFA implementation plan
 
-Status: P0–P2 implemented in `rethoc-engine/src/grouped_nfa/` (opt-in
-`RegexConfig::grouped_nfa`, assertion-free runtime, multiword and saturating
-count domains within the 8,192-word frontier budget); P3–P5 open; not
-benchmarked. Designed against main `b0bb981e8c6cba7b23df176d79f741c3b61089a7`;
+Status: P0–P3 implemented in `rethoc-engine/src/grouped_nfa/` (opt-in
+`RegexConfig::grouped_nfa`; multiword and saturating count domains within the
+8,192-word frontier budget; all assertion kinds by raw replay); P4–P5 open;
+not benchmarked. Designed against main `b0bb981e8c6cba7b23df176d79f741c3b61089a7`;
 source references below re-checked at `d82066d`. This work does not
 investigate existing tier correctness bugs.
 
@@ -421,14 +421,31 @@ experimental backend name, not Tier 5. Each milestone is independently reviewabl
 - `run_match_test` also compiles each build with the option and, when
   admitted, runs the grouped stream on the listed inputs (against Tier 0
   prefix `ismatch` and the oracle, whole/bytewise/chunked with empty calls)
-  and on the generated inputs. At P1 about 210 of ~1,480 builds are
-  admitted; about 1,140 of the rejections are assertions (P3).
+  and on the generated inputs. At P1 about 210 of 1,485 builds were
+  admitted, about 1,140 rejections being assertions; at P3, 1,372 are
+  admitted, and the 113 rejections are nesting (83) and zero-width cycles
+  (30).
 - `(?:\b){2,3}` compiles to a lone `\b` without a counter; the
   zero-width-cycle test uses `(?:\b|a){2,3}` instead.
 - P2 drops the per-counter limit: a counter is admitted when the frontier
   fits `max_row_words` (8,192 words: `a{N}` has two counted rows, so N up
   to about 260,000; the default `max_repetition` of 1,000 is far below).
   The increment computes word masks on the fly rather than storing them.
+- P3: admission accepts an assertion kind only if `analysis::reviewed`
+  lists it; that match is exhaustive, so a new kind does not compile until
+  someone decides. All ten current kinds are listed, and
+  `evaluator_contract_for_every_kind` checks the §5 table, no Defer with a
+  known next byte or at EOI, and Pass stability, over every boundary.
+- P3 tests (`grouped_nfa/assertion_tests.rs`): every release-gate row under
+  all three compile configurations, with empty calls after every data call
+  and `ismatch` checked against the hand-written expectation and Tier 0;
+  every partition and every prefix `finish` of each gate input; all 100
+  ordered kind pairs at five positions (head, entry, body, exit, tail) under
+  two configurations, against Tier 0, the oracle and the scalar interpreter
+  (none rejected); every cut of short inputs for a subset. Mutations
+  detected by these tests: old roots kept after consumption, prev updated
+  before lookahead evaluation, no EOI replay, EOI as a consumed sentinel
+  byte, Defer treated as Pass.
 - P4 must fit the checker selector into `TierChoice` and add grouped runs
   to the `assert-in-body` sweep family.
 

@@ -19,16 +19,16 @@
 //!
 //! # Status
 //!
-//! Milestones P0 (analysis, opt-in plan), P1 (assertion-free runtime) and
-//! P2 (multiword and saturating count domains).  The backend is selected
+//! Milestones P0 (analysis, opt-in plan), P1 (runtime), P2 (multiword and
+//! saturating count domains) and P3 (assertions by raw replay).  The backend is selected
 //! only explicitly: compile with
 //! [`RegexConfig::grouped_nfa`](crate::RegexConfig::grouped_nfa) and run a
 //! [`GroupedStream`].  Default dispatch and the tiers are unchanged.
 //!
 //! Admitted graphs ([`analysis`]): every reachable state has one incoming
 //! scope (outside, or inside exactly one counter), the zero-width graph is
-//! acyclic, the frontier fits the word budget, and, until milestone P3,
-//! there is no assertion.  A finite counter's rows hold `0..=max`; an
+//! acyclic, the frontier fits the word budget, and every assertion is of a
+//! kind reviewed for raw replay (all current kinds).  A finite counter's rows hold `0..=max`; an
 //! unbounded one saturates at `min` (`counter_step`), so its rows hold
 //! `0..=min`.
 //!
@@ -37,9 +37,20 @@
 //! A stream persists the *raw* rows: the configurations right after a byte
 //! was consumed, before any zero-width step.  Every call closes a copy of
 //! them in worker scratch, so the stream itself never holds a partly closed
-//! frontier (plan §5).  Without assertions the closure does not depend on
-//! the boundary, but the boundary is passed through already so that
-//! milestone P3 changes no call sequence.
+//! frontier (plan §5):
+//!
+//! - before consuming byte `b`, the closure sees `b` as the next byte;
+//! - at the end of a chunk it sees an unknown next byte, which can only
+//!   discover definite matches (a `Pass` with the next byte unknown stays
+//!   a `Pass` whatever comes);
+//! - at `finish` it sees end of input.
+//!
+//! Every assertion of one closure sees the same boundary.  An assertion
+//! that fails or defers simply blocks its path in that closure; the raw
+//! rows are untouched, so the next closure (with the next byte, or at end
+//! of input) evaluates it afresh.  Consuming a byte replaces the raw rows
+//! by the consuming successors, so a blocked path never reaches a later
+//! boundary.
 
 mod analysis;
 mod exact;
@@ -137,7 +148,8 @@ pub(crate) enum ZeroOp {
         out1: Row,
         inc: Increment,
     },
-    /// Union into `out` on `Pass` (not admitted before milestone P3).
+    /// Union into `out` iff the shared evaluator says `Pass` at the
+    /// current boundary.
     Assert {
         kind: AssertKind,
         src: Row,
@@ -340,5 +352,7 @@ impl Regex {
     }
 }
 
+#[cfg(test)]
+mod assertion_tests;
 #[cfg(test)]
 pub(crate) mod tests;
