@@ -10,7 +10,7 @@ use std::process;
 use std::str::FromStr;
 
 use bpaf::{Args, Bpaf};
-use rethoc_engine::{MatcherMemory, Regex, RegexConfig};
+use rethoc_engine::{Regex, RegexConfig};
 
 mod check;
 
@@ -292,7 +292,7 @@ fn run_match(
     debug: bool,
 ) {
     let regex = parse_pattern(pattern, config);
-    let mut memory = MatcherMemory::default();
+    let mut memory = check::new_memory();
 
     eprintln!("pattern: {pattern}");
     eprintln!("memory_size: {} bytes", regex.memory_size());
@@ -364,7 +364,7 @@ fn run_match(
 
 fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig, quiet: bool) {
     let regex = parse_pattern(pattern, config);
-    let mut memory = MatcherMemory::default();
+    let mut memory = check::new_memory();
 
     let reader: Box<dyn BufRead> = match file {
         Some(path) => {
@@ -405,6 +405,11 @@ fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig, quiet: bool)
 }
 
 fn main() {
+    // Before any work, and before any child process is started.
+    if let Err(message) = check::init_dfa_states() {
+        eprintln!("error: {message}");
+        process::exit(check::EXIT_USAGE);
+    }
     match parse_args() {
         Opts::Info {
             format,

@@ -117,6 +117,10 @@ rethoc sweep --list tier3-assert      # print the runs instead
 
 - `fuzz` seed numbers are stable: a seed is a pattern plus inputs anyone
   can re-run. `--trace` prints every step.
+- `RETHOC_DFA_STATES=N` sets the DFA state cap of every matcher the CLI
+  creates, child processes included (`RETHOC_DFA_STATES=8 rethoc sweep
+  nullable-counter`). At 8, the minimum, the caches are emptied every
+  few bytes. Summary and `repro:` lines carry the setting.
 - Seeds that are correct but slower than the watchdog go in
   `ci/known-slow-seeds.txt` with their pattern. `fuzz --batch` reports
   them as `KNOWN-SLOW`, and says when one no longer is.
@@ -131,9 +135,9 @@ GitHub Actions, in `.github/workflows/`:
   clippy (both workspaces), `cargo test` in release and debug,
   `bless_memory.py --check`.
 - `differential.yml` (same triggers): `rethoc fuzz --batch` over a fixed
-  seed range with `ci/known-slow-seeds.txt`, both `rethoc sweep`
-  families, and on PRs the `reengage_profile` Callgrind gate against the
-  base branch.
+  seed range with `ci/known-slow-seeds.txt` and both `rethoc sweep`
+  families, each at the default and at the minimum DFA state cap; on PRs
+  the `reengage_profile` Callgrind gate against the base branch.
 - `fuzz-nightly.yml` (daily, or on demand): cargo-fuzz targets.
 
 Third-party actions are pinned by commit SHA with the version in a

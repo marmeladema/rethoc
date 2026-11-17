@@ -35,6 +35,18 @@ jobs:
           scripts/capped --time 1800
           target/release/rethoc fuzz --batch 250
           --allow-slow ci/known-slow-seeds.txt 0 9000
+      # The same seeds with the DFA caches at their minimum size, so that
+      # they are emptied every few bytes.  Results must not change.  Runs
+      # even when the step above failed: a failure there must not hide a
+      # regression that only shows when the cache is emptied.
+      - name: Fuzz seeds 0..9000, minimum DFA cache
+        if: ${{ !cancelled() }}
+        env:
+          RETHOC_DFA_STATES: 8
+        run: >-
+          scripts/capped --time 1800
+          target/release/rethoc fuzz --batch 250
+          --allow-slow ci/known-slow-seeds.txt 0 9000
       # Disabled until #5 is fixed: one MatcherMemory reused across regexes
       # panics (from seed 6).  Enable it in the PR that fixes #5.
       # - name: Fuzz seeds 0..9000, one MatcherMemory per run
@@ -47,8 +59,8 @@ jobs:
     name: sweep (${{ matrix.family }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    # tier3-assert finds 108 known false positives on Tier 3 and Tier 2:
-    # its result is reported but does not block until they are fixed.
+    # tier3-assert finds 100 known false positives on Tier 3: its result
+    # is reported but does not block until they are fixed.
     continue-on-error: ${{ matrix.allow-failure }}
     strategy:
       fail-fast: false
@@ -66,6 +78,13 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --release -p rethoc-cli
       - run: scripts/capped --time 1800 target/release/rethoc sweep ${{ matrix.family }}
+      # Again with the DFA caches at their minimum size; runs even when
+      # the step above reported mismatches.
+      - name: Minimum DFA cache
+        if: ${{ !cancelled() }}
+        env:
+          RETHOC_DFA_STATES: 8
+        run: scripts/capped --time 1800 target/release/rethoc sweep ${{ matrix.family }}
 
   callgrind:
     # Compares instruction and branch-miss counts of this PR against its

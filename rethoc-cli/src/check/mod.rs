@@ -16,6 +16,7 @@ pub(crate) mod shrink;
 pub(crate) mod sweep;
 
 use std::fmt;
+use std::sync::OnceLock;
 
 use rethoc_engine::{MatcherMemory, Regex, RegexConfig};
 
@@ -204,7 +205,68 @@ pub(crate) fn describe(config: &RegexConfig) -> String {
     if config.max_estimated_states != RegexConfig::default().max_estimated_states {
         s.push_str(&format!(" max-states={}", config.max_estimated_states));
     }
+    s.push_str(&cap_note());
     s
+}
+
+/// Environment variable that sets the DFA state cap of every matcher the
+/// CLI creates.  An environment variable and not a flag so that the child
+/// processes of `fuzz --batch` and `sweep` inherit it.
+pub(crate) const DFA_STATES_ENV: &str = "RETHOC_DFA_STATES";
+
+/// The value of [`DFA_STATES_ENV`], read once per process.
+static DFA_STATES: OnceLock<Option<usize>> = OnceLock::new();
+
+/// Read [`DFA_STATES_ENV`]: `None` when unset, an error message when it
+/// is not a number.
+fn read_dfa_states_env() -> Result<Option<usize>, String> {
+    match std::env::var(DFA_STATES_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(value)) => {
+            Err(format!("{DFA_STATES_ENV}={value:?} is not a number"))
+        }
+        Ok(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("{DFA_STATES_ENV}={value:?} is not a number")),
+    }
+}
+
+/// Read and check [`DFA_STATES_ENV`] before anything else runs.  A bad
+/// value is one usage error in the process the user started, not one
+/// failure per child process.
+pub(crate) fn init_dfa_states() -> Result<(), String> {
+    let states = read_dfa_states_env()?;
+    // Already set only if something asked for the value first.
+    let _ = DFA_STATES.set(states);
+    Ok(())
+}
+
+/// The DFA state cap requested through [`DFA_STATES_ENV`], if any.
+pub(crate) fn dfa_states() -> Option<usize> {
+    *DFA_STATES.get_or_init(|| read_dfa_states_env().unwrap_or(None))
+}
+
+/// A fresh [`MatcherMemory`], with the DFA state cap of
+/// [`DFA_STATES_ENV`] applied.  A small cap makes the engine empty its
+/// DFA caches every few bytes; results must not change.
+pub(crate) fn new_memory() -> MatcherMemory {
+    let mut memory = MatcherMemory::default();
+    memory.set_dfa_state_cap(dfa_states());
+    memory
+}
+
+/// ` dfa-states=N` when a DFA state cap is set, empty otherwise.  Goes
+/// into every summary and result line, so that a run at a small cap
+/// cannot be mistaken for one at the default.
+pub(crate) fn cap_note() -> String {
+    dfa_states().map_or_else(String::new, |n| format!(" dfa-states={n}"))
+}
+
+/// What to put in front of a reproduction command so that it runs with
+/// the same DFA state cap (empty when none is set).
+pub(crate) fn repro_env() -> String {
+    dfa_states().map_or_else(String::new, |n| format!("{DFA_STATES_ENV}={n} "))
 }
 
 /// Command-line flags that select exactly `config`.
@@ -222,7 +284,7 @@ pub(crate) fn shrink_command(pattern: &str, config: &RegexConfig, input: &[u8]) 
     }
     args.push(pattern.into());
     args.push(escaped);
-    shell_join(&args)
+    format!("{}{}", repro_env(), shell_join(&args))
 }
 
 // ---------------------------------------------------------------------------
