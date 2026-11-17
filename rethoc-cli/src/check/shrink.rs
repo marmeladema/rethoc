@@ -5,11 +5,10 @@
 //! on at least one of the tier and feed combinations it failed at first.
 
 use bpaf::Bpaf;
-use rethoc_engine::MatcherMemory;
 
 use super::{
     EXIT_MISMATCH, EXIT_OK, EXIT_REJECTED, EXIT_USAGE, Failure, Feed, Reference, Subject,
-    config_args, describe, escape, shell_join, unescape,
+    config_args, describe, escape, new_memory, shell_join, unescape,
 };
 use crate::{CompileArgs, compile_args};
 
@@ -50,7 +49,7 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
             return EXIT_REJECTED;
         }
     };
-    let mut memory = MatcherMemory::default();
+    let mut memory = new_memory();
     let mut failures: Vec<Failure> = Vec::new();
 
     // The first configuration where the input mismatches.

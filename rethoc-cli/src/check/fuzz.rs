@@ -15,13 +15,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bpaf::Bpaf;
-use rethoc_engine::MatcherMemory;
 use rethoc_engine::fuzz_gen::{FuzzRng, generate_inputs, generate_pattern};
 
 use super::cap::{CapArgs, Run, Verdict, cap_args, parallel, run_capped};
 use super::{
-    EXIT_ABORT, EXIT_MISMATCH, EXIT_OK, EXIT_USAGE, Failure, Reference, Subject, describe, escape,
-    shrink_command,
+    EXIT_ABORT, EXIT_MISMATCH, EXIT_OK, EXIT_USAGE, Failure, Reference, Subject, cap_note,
+    describe, escape, new_memory, shrink_command,
 };
 use crate::{CompileArgs, compile_args};
 
@@ -163,7 +162,7 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
     let skip: BTreeSet<u64> = args.skip.iter().copied().collect();
     let end = args.first.saturating_add(args.count);
 
-    let mut shared = MatcherMemory::default();
+    let mut shared = new_memory();
     let mut failures: Vec<Failure> = Vec::new();
     let (mut cases, mut skipped, mut compiled, mut checks, mut mismatches) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
@@ -196,7 +195,7 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
         // regex has a memory of its own.
         let mut subjects = Vec::new();
         for config in &configs {
-            let mut own = MatcherMemory::default();
+            let mut own = new_memory();
             let memory = if args.shared_memory {
                 &mut shared
             } else {
@@ -248,8 +247,9 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
         }
     }
     println!(
-        "seeds {}..{end} cases={cases} reference-rejected={skipped} compiled={compiled} checks={checks} per-tier={per_tier:?} mismatches={mismatches}",
-        args.first
+        "seeds {}..{end}{} cases={cases} reference-rejected={skipped} compiled={compiled} checks={checks} per-tier={per_tier:?} mismatches={mismatches}",
+        args.first,
+        cap_note()
     );
     if mismatches > 0 {
         EXIT_MISMATCH
@@ -471,8 +471,9 @@ fn supervise(args: &FuzzArgs) -> i32 {
         .map(|(s, v)| format!("{s}:{}", v.label()))
         .collect();
     println!(
-        "fuzz seeds {}..{end}: failed=[{}] known-slow={:?} no-longer-slow={:?} in {:.0}s",
+        "fuzz seeds {}..{end}{}: failed=[{}] known-slow={:?} no-longer-slow={:?} in {:.0}s",
         args.first,
+        cap_note(),
         failed.join(", "),
         total.known_slow,
         total.no_longer_slow,

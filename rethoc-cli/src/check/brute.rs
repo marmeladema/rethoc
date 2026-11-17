@@ -4,11 +4,10 @@
 //! printed for a configuration is a shortest one.
 
 use bpaf::Bpaf;
-use rethoc_engine::MatcherMemory;
 
 use super::{
     EXIT_MISMATCH, EXIT_OK, EXIT_REJECTED, EXIT_USAGE, Failure, Reference, Subject, describe,
-    escape, shrink_command, unescape,
+    escape, new_memory, shrink_command, unescape,
 };
 use crate::{CompileArgs, compile_args};
 
@@ -59,7 +58,7 @@ pub(crate) fn run(args: &BruteArgs) -> i32 {
         }
     };
 
-    let mut memory = MatcherMemory::default();
+    let mut memory = new_memory();
     let mut failures: Vec<Failure> = Vec::new();
     let (mut checked, mut mismatched) = (0usize, 0usize);
     for config in args.compile.check_configs() {

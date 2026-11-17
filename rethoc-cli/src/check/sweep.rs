@@ -10,7 +10,7 @@ use std::time::Instant;
 use bpaf::Bpaf;
 
 use super::cap::{CapArgs, Verdict, cap_args, parallel, run_capped};
-use super::{EXIT_ABORT, EXIT_MISMATCH, EXIT_OK, shell_join};
+use super::{EXIT_ABORT, EXIT_MISMATCH, EXIT_OK, cap_note, repro_env, shell_join};
 
 /// A generated family of patterns.
 #[derive(Clone, Copy, Debug)]
@@ -190,7 +190,7 @@ pub(crate) fn run(args: &SweepArgs) -> i32 {
             let mut cmd = vec!["rethoc".to_string()];
             cmd.extend(r.args.iter().cloned());
             // Stop quietly when the reader goes away (`| head`).
-            if writeln!(out, "{}", shell_join(&cmd)).is_err() {
+            if writeln!(out, "{}{}", repro_env(), shell_join(&cmd)).is_err() {
                 break;
             }
         }
@@ -209,9 +209,10 @@ pub(crate) fn run(args: &SweepArgs) -> i32 {
             counts[index(result.verdict)] += 1;
             if !matches!(result.verdict, Verdict::Ok | Verdict::Rejected) {
                 println!(
-                    "{} unroll={} `{}`: {}",
+                    "{} unroll={}{} `{}`: {}",
                     result.verdict.label(),
                     r.unroll,
+                    cap_note(),
                     r.pattern,
                     result.detail()
                 );
@@ -230,8 +231,9 @@ pub(crate) fn run(args: &SweepArgs) -> i32 {
     .map(count)
     .sum();
     println!(
-        "sweep {}: runs={} ok={} mismatch={} rejected={} aborted={aborted} (timeout={} oom={} panic={} crash={}) in {:.0}s",
+        "sweep {}{}: runs={} ok={} mismatch={} rejected={} aborted={aborted} (timeout={} oom={} panic={} crash={}) in {:.0}s",
         args.family.name(),
+        cap_note(),
         runs.len(),
         count(Verdict::Ok),
         count(Verdict::Mismatch),
