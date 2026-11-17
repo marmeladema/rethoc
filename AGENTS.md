@@ -35,8 +35,15 @@ Eligibility is decided per tier at compile time from pattern analysis.
 
 - **0** — NFA simulation. Always available; the reference.
 - **1** — lazy DFA, counter-free patterns.
-- **2** — differential counters, non-nested fixed-length bodies.
-- **3** — conditional transitions, non-nested variable-length bodies.
+- **2** — differential counters, non-nested fixed-length bodies whose
+  count directly follows a consumed byte: no assertion that looks ahead
+  (`\b`, `$`, ...) in between.  `^` / `(?m:^)` may sit there.
+- **3** — conditional transitions, non-nested variable-length bodies
+  with no assertion that looks ahead inside. **Known to be unsound**, to
+  be redesigned rather than patched: `^` / `(?m:^)` inside a body
+  (Bug 69, "What is left"), seeds when another counter breaks (the
+  `tier3-assert` sweep). Do not add eligibility rules to hide a Tier 3
+  defect; record it (see below).
 - **4** — counter programs, nested repetitions.
 
 Repetitions are unrolled up to `max_unroll_states` and same-body
@@ -117,6 +124,8 @@ rethoc fuzz --batch 250 --allow-slow ci/known-slow-seeds.txt 0 9000   # capped c
 rethoc fuzz --shared-memory 0 500     # one MatcherMemory for every regex of the run
 rethoc sweep nullable-counter         # brute over a pattern family, each run capped
 rethoc sweep assert-edges             # every assertion kind around a repetition
+rethoc sweep --skip-tier 3 assert-in-body   # assertions inside a counted body; Tier 3 has known failures there
+rethoc sweep --max-len 4 assert-edges # shorter inputs, e.g. for a debug build
 rethoc sweep tier3-assert
 rethoc sweep --tier 3 tier3-assert    # only the NFA and Tier 3
 rethoc sweep --list tier3-assert      # print the runs instead
@@ -152,7 +161,10 @@ GitHub Actions, in `.github/workflows/`:
 - `differential.yml` (same triggers): `rethoc fuzz --batch` over a fixed
   seed range with `ci/known-slow-seeds.txt` and every `rethoc sweep`
   family, each in the default and in the extreme regime (minimum DFA
-  state cap, byte classes for every pattern); on PRs the
+  state cap, byte classes for every pattern), and each sweep once more
+  on short inputs with a debug build. Sweeps that reach known Tier 3
+  defects run twice: without Tier 3 (blocking) and on Tier 3 alone
+  (reported, not blocking). On PRs the
   `reengage_profile` Callgrind gate against the base branch.
 - `fuzz-nightly.yml` (daily, or on demand): cargo-fuzz targets.
 
@@ -168,6 +180,10 @@ and name the issue that will re-enable them.
 1. One bug at a time.
 2. Reproduce with the CLI, minimise the pattern and input.
 3. Add a regression entry to `match_tests!` (not a handwritten test).
+   A wrong answer that is a known Tier 3 design defect and is not being
+   fixed gets an entry with `tier3_broken: true`: every other engine is
+   checked on it, and Tier 3 must still be wrong on one of its inputs,
+   so the marker has to go when the defect does.
 4. Fix, then run the full test suite and clippy.
 5. Write `docs/bugs/NNN-short-name.md`: summary (pattern, input,
    expected vs actual, tiers), root cause, how it was found, what made it

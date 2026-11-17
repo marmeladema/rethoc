@@ -241,6 +241,20 @@ fn validate_tier(tier: Option<u8>) {
     }
 }
 
+/// Exit with a usage error unless `--skip-tier` names a DFA tier and is
+/// not combined with `--tier`.
+fn validate_skip_tier(tier: Option<u8>, skip_tier: Option<u8>) {
+    let Some(skip) = skip_tier else { return };
+    if tier.is_some() {
+        eprintln!("error: --tier and --skip-tier cannot be combined");
+        process::exit(check::EXIT_USAGE);
+    }
+    if !(1..=4).contains(&skip) {
+        eprintln!("error: --skip-tier must be 1, 2, 3, or 4");
+        process::exit(check::EXIT_USAGE);
+    }
+}
+
 fn run_info(pattern: &str, config: RegexConfig, format: Format) {
     let regex = parse_pattern(pattern, config);
     let info = regex.info();
@@ -449,6 +463,7 @@ fn main() {
         } => run_dump(&pattern, compile.config(), format, dfa),
         Opts::Brute(args) => {
             validate_tier(args.tier);
+            validate_skip_tier(args.tier, args.skip_tier);
             process::exit(check::brute::run(&args))
         }
         Opts::Fuzz(args) => {
@@ -461,6 +476,7 @@ fn main() {
         }
         Opts::Sweep(args) => {
             validate_tier(args.tier);
+            validate_skip_tier(args.tier, args.skip_tier);
             process::exit(check::sweep::run(&args))
         }
     }

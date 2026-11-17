@@ -58,11 +58,14 @@ jobs:
       #     --allow-slow ci/known-slow-seeds.txt 0 9000
 
   sweep:
-    name: sweep (${{ matrix.family }})
+    name: sweep (${{ matrix.family }}${{ matrix.tiers && format(', {0}', matrix.tiers) || '' }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    # tier3-assert finds 100 known false positives on Tier 3: its result
-    # is reported but does not block until they are fixed.
+    # Tier 3 is known to be unsound and is to be redesigned, not patched
+    # (docs/bugs/069, "What is left").  Where a family reaches its known
+    # defects, the other tiers are checked in a blocking job and Tier 3
+    # in one whose result is reported but does not block: 480 runs of
+    # assert-in-body, 100 of tier3-assert.
     continue-on-error: ${{ matrix.allow-failure }}
     strategy:
       fail-fast: false
@@ -72,6 +75,12 @@ jobs:
             allow-failure: false
           - family: assert-edges
             allow-failure: false
+          - family: assert-in-body
+            tiers: --skip-tier 3
+            allow-failure: false
+          - family: assert-in-body
+            tiers: --tier 3
+            allow-failure: true
           - family: tier3-assert
             allow-failure: true
     steps:
@@ -81,7 +90,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --release -p rethoc-cli
-      - run: scripts/capped --time 1800 target/release/rethoc sweep ${{ matrix.family }}
+      - run: scripts/capped --time 1800 target/release/rethoc sweep ${{ matrix.tiers }} ${{ matrix.family }}
       # Again on the other side of the engine's thresholds (minimum DFA
       # cache, byte classes for every pattern); runs even when the step
       # above reported mismatches.
@@ -90,7 +99,16 @@ jobs:
         env:
           RETHOC_DFA_STATES: 8
           RETHOC_BYTE_CLASS_MIN_STATES: 0
-        run: scripts/capped --time 1800 target/release/rethoc sweep ${{ matrix.family }}
+        run: scripts/capped --time 1800 target/release/rethoc sweep ${{ matrix.tiers }} ${{ matrix.family }}
+      # And once with a debug build, on shorter inputs, so that the
+      # engine's own debug assertions take part.  Bug 69 was a debug
+      # assertion that fired at compile time for patterns no test
+      # compiled.
+      - name: Debug build
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build -p rethoc-cli
+          scripts/capped --time 1800 target/debug/rethoc sweep --max-len 4 ${{ matrix.tiers }} ${{ matrix.family }}
 
   callgrind:
     # Compares instruction and branch-miss counts of this PR against its
