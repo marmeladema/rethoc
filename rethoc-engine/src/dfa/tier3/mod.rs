@@ -514,17 +514,14 @@ pub(crate) fn compute_tier3_analysis(
                 }
                 State::Assert { kind, out } => {
                     let mut d = deferred;
-                    // Non-End asserts are deferred — they need the next
-                    // byte to evaluate.  End asserts are handled separately
-                    // by the break closure (break_is_match_at_end).
+                    // Non-End asserts become guards, evaluated at the next
+                    // byte: by then both sides of the position are known.
+                    // That is one byte later than `^` and `(?m:^)` need,
+                    // which changes nothing: the pending effect remembers
+                    // what they read of the byte behind them.  End asserts
+                    // are handled separately by the break closure
+                    // (break_is_match_at_end).
                     if kind != AssertKind::End {
-                        debug_assert!(
-                            kind.is_dfa_deferrable(),
-                            "unexpected deferred assert kind {:?} in break-seed closure; \
-                             PendingEffect.prev_was_word only supports word-boundary \
-                             family and EndLF",
-                            kind
-                        );
                         d.push(idx);
                     }
                     ci_stack.push((out, d));
@@ -834,13 +831,6 @@ pub(crate) fn compute_tier3_analysis(
                         // at runtime (they walk from the assert's `out`).
                         // End asserts are handled by target_is_match_at_end.
                         if kind != AssertKind::End {
-                            debug_assert!(
-                                kind.is_dfa_deferrable(),
-                                "unexpected deferred assert kind {:?} in target deferred; \
-                                 PendingEffect.prev_was_word only supports word-boundary \
-                                 family and EndLF",
-                                kind
-                            );
                             asserts.push(eidx);
                         }
                         // Do NOT push `out` — stop the walk here for this
@@ -2702,19 +2692,9 @@ fn break_consuming_tails(
 )> {
     let reached = tier3_effects::consuming_by_assertion_set(break_seeds, states, |kind| {
         // End assertions are NOT deferred — they're handled statically
-        // by break_is_match_at_end.  Non-End asserts (\b, \B, etc.) are
-        // deferred.
-        if kind == AssertKind::End {
-            return false;
-        }
-        debug_assert!(
-            kind.is_dfa_deferrable(),
-            "unexpected deferred assert kind {:?} in break-tail closure; \
-             PendingEffect.prev_was_word only supports word-boundary \
-             family and EndLF",
-            kind
-        );
-        true
+        // by break_is_match_at_end.  Every other kind becomes a guard,
+        // evaluated at the next byte.
+        kind != AssertKind::End
     })?;
 
     let mut all_result = Vec::new();
@@ -2996,7 +2976,6 @@ macro_rules! step_slow_impl {
             // deposits from this step are appended to pending_effects_current.
             self.$next.clear();
             self.match_at_end = false;
-            let byte_is_word = crate::is_word_byte(byte);
 
             // Advance existing post-break tails through this transition.
             // Each tail is a consuming NFA state from a previous counter
@@ -3042,14 +3021,14 @@ macro_rules! step_slow_impl {
                                     tier3_effects::enqueue_guarded_effects(
                                         &mut self.pending_effects_current,
                                         &self.analysis.origin_effects[pbo.idx()].guarded,
-                                        byte_is_word,
+                                        byte,
                                     );
                                     // Bug 57: origins behind a deferrable
                                     // assertion are reached only if it holds.
                                     tier3_effects::enqueue_guarded_effects(
                                         &mut self.pending_effects_current,
                                         &effects.guarded,
-                                        byte_is_word,
+                                        byte,
                                     );
                                     // Bug 37 + Bug 47: apply byte-specific
                                     // immediate effects from the compiled Advance.
@@ -3118,7 +3097,7 @@ macro_rules! step_slow_impl {
                                         tier3_effects::enqueue_guarded_effects(
                                             &mut self.pending_effects_current,
                                             &effects.guarded,
-                                            byte_is_word,
+                                            byte,
                                         );
                                     }
                                 }
@@ -3135,7 +3114,7 @@ macro_rules! step_slow_impl {
                             tier3_effects::enqueue_guarded_effects(
                                 &mut self.pending_effects_current,
                                 &oe.guarded,
-                                byte_is_word,
+                                byte,
                             );
                         }
                     }
@@ -3264,7 +3243,7 @@ macro_rules! step_slow_impl {
                                         tier3_effects::enqueue_guarded_effects(
                                             &mut self.pending_effects_current,
                                             &effects.guarded,
-                                            byte_is_word,
+                                            byte,
                                         );
                                     }
                                 }
@@ -3860,7 +3839,6 @@ impl<'a> Tier3DfaMatcher<'a> {
             }
             let b = input[i];
             i += 1;
-            let b_is_word = crate::is_word_byte(b);
 
             // Resolve pending effects from the PREVIOUS step (Bug 26,
             // Bug 28, Bug 42, Bug 44, Bug 46).
@@ -3881,7 +3859,7 @@ impl<'a> Tier3DfaMatcher<'a> {
             self.resolved_tails.clear();
             self.tail_epoch = self.tail_epoch.wrapping_add(1);
             let resolved_mae = if !self.pending_effects_current.is_empty() {
-                self.resolve_pending_effects(b, b_is_word)
+                self.resolve_pending_effects(b)
             } else {
                 false
             };
@@ -4111,7 +4089,7 @@ impl<'a> Tier3DfaMatcher<'a> {
     ///
     /// Returns `true` if any resolved effect set `match_at_end`.
     #[cold]
-    fn resolve_pending_effects(&mut self, b: u8, b_is_word: bool) -> bool {
+    fn resolve_pending_effects(&mut self, b: u8) -> bool {
         let mut resolved_mae = false;
         tier3_effects::resolve_pending(
             &self.pending_effects_current,
@@ -4169,14 +4147,14 @@ impl<'a> Tier3DfaMatcher<'a> {
                                 tier3_effects::enqueue_guarded_effects(
                                     &mut self.pending_effects_next,
                                     &self.analysis.origin_effects[tail.idx()].guarded,
-                                    b_is_word,
+                                    b,
                                 );
                                 // Bug 57: so do the origins behind a
                                 // deferrable assertion.
                                 tier3_effects::enqueue_guarded_effects(
                                     &mut self.pending_effects_next,
                                     &effects.guarded,
-                                    b_is_word,
+                                    b,
                                 );
                             }
                             tier3_effects::TargetStep::Increment {
@@ -4248,7 +4226,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                                     tier3_effects::enqueue_guarded_effects(
                                         &mut self.pending_effects_next,
                                         &effects.guarded,
-                                        b_is_word,
+                                        b,
                                     );
                                 }
                             }
@@ -4265,7 +4243,7 @@ impl<'a> Tier3DfaMatcher<'a> {
                             tier3_effects::enqueue_guarded_effects(
                                 &mut self.pending_effects_next,
                                 &oe.guarded,
-                                b_is_word,
+                                b,
                             );
                         }
                     }
@@ -5010,7 +4988,7 @@ mod tests {
             timing: tier3_effects::EffectTiming::NextByte,
             guard: tier3_effects::EffectGuard::ALWAYS,
             atom: tier3_effects::EffectAtom::Match,
-            prev_was_word: false,
+            prev: crate::ByteProps::NONE,
         };
         with_matcher(TWO_GAPS, &[b"fooxxxxxx"], |m| {
             // Idle DFA state, nothing live: `settle()` marked it fresh.
@@ -5081,7 +5059,7 @@ mod tests {
                     timing: tier3_effects::EffectTiming::NextByte,
                     guard: tier3_effects::EffectGuard::ALWAYS,
                     atom: tier3_effects::EffectAtom::AddTail { origin: tail },
-                    prev_was_word: false,
+                    prev: crate::ByteProps::NONE,
                 });
             m.chunk(b"b");
             assert_eq!(m.current, start_id);
@@ -5109,7 +5087,7 @@ mod tests {
                     timing: tier3_effects::EffectTiming::NextByte,
                     guard: tier3_effects::EffectGuard::ALWAYS,
                     atom: tier3_effects::EffectAtom::AddTail { origin: tail },
-                    prev_was_word: false,
+                    prev: crate::ByteProps::NONE,
                 });
             m.chunk(b"x");
             assert!(m.post_break_tails.is_empty());

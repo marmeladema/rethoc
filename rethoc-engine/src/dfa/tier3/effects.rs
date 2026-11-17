@@ -71,7 +71,7 @@
 
 use std::fmt;
 
-use crate::{AssertEval, CounterIdx, Regex, State, StateIdx};
+use crate::{AssertEval, ByteProps, CounterIdx, Regex, State, StateIdx};
 
 // ---------------------------------------------------------------------------
 // Break mask (reserved for future provenance tracking)
@@ -656,9 +656,11 @@ impl fmt::Display for CompiledOriginEffects {
 /// A deferred effect waiting to be evaluated at the next byte boundary
 /// or at end-of-input.
 ///
-/// `prev_was_word` captures the word-boundary context at the time the
-/// effect was scheduled, because deferred assertion evaluation needs the
-/// boundary context from the *scheduling* byte, not the *evaluation* byte.
+/// `prev` captures what assertions can read of the byte consumed when the
+/// effect was scheduled ([`ByteProps`]): evaluating the guard needs the
+/// byte *before* the position, not the one the effect is evaluated on.
+/// Every assertion kind can be evaluated from it, including `(?m:^)`,
+/// which reads nothing but that byte (Bug 69).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PendingEffect {
     /// When this effect should be evaluated.
@@ -671,16 +673,16 @@ pub(crate) struct PendingEffect {
     /// helpers create one `PendingEffect` per atom, so multi-atom
     /// effects are represented as multiple entries in the queue.
     pub(crate) atom: EffectAtom,
-    /// Word-boundary context at the time the effect was scheduled.
-    pub(crate) prev_was_word: bool,
+    /// Properties of the byte consumed when the effect was scheduled.
+    pub(crate) prev: ByteProps,
 }
 
 impl fmt::Display for PendingEffect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "[{}|{}|pw={}] {}",
-            self.timing, self.guard, self.prev_was_word, self.atom
+            "[{}|{}|prev={}] {}",
+            self.timing, self.guard, self.prev, self.atom
         )
     }
 }
@@ -704,21 +706,26 @@ impl fmt::Display for PendingEffect {
 /// [`CompiledOriginEffects`] entry as
 /// [`PendingEffect`] entries in the given queue.
 ///
-/// Each [`GuardedEffect`] becomes a separate `PendingEffect` with the
-/// captured `prev_was_word` boundary context.  The caller decides which
-/// queue (`pending_effects_current` or `pending_effects_next`) to target.
+/// Each [`GuardedEffect`] becomes a separate `PendingEffect` that
+/// remembers the properties of `prev_byte`, the byte just consumed.  The
+/// caller decides which queue (`pending_effects_current` or
+/// `pending_effects_next`) to target.
 #[inline]
 pub(crate) fn enqueue_guarded_effects(
     queue: &mut Vec<PendingEffect>,
     guarded: &[GuardedEffect],
-    prev_was_word: bool,
+    prev_byte: u8,
 ) {
+    if guarded.is_empty() {
+        return;
+    }
+    let prev = ByteProps::of(prev_byte);
     for ge in guarded.iter() {
         queue.push(PendingEffect {
             timing: ge.timing,
             guard: ge.guard,
             atom: ge.atom,
-            prev_was_word,
+            prev,
         });
     }
 }
@@ -902,15 +909,9 @@ pub(crate) fn resolve_pending(
             continue;
         }
 
-        // Evaluate the assertion chain with the captured boundary context.
-        // `prev` is reconstructed from `prev_was_word`:
-        // - `Some(b'a')` if prev_was_word (word character representative)
-        // - `Some(b' ')` if not (non-word character representative)
-        let prev = if pe.prev_was_word {
-            Some(b'a')
-        } else {
-            Some(b' ')
-        };
+        // Evaluate the assertion chain with the captured context: a byte
+        // with the same properties as the one consumed back then.
+        let prev = Some(pe.prev.stand_in());
 
         // Check downstream reachability only when the effect carries a
         // Match or MatchAtEnd atom — for AddSeed/AddTail the assertion
@@ -1795,12 +1796,12 @@ mod tests {
             atom: EffectAtom::AddTail {
                 origin: StateIdx(3),
             },
-            prev_was_word: true,
+            prev: ByteProps::WORD,
         };
         let s = format!("{pe}");
         assert!(s.contains("next_byte"));
         assert!(s.contains("always"));
-        assert!(s.contains("pw=true"));
+        assert!(s.contains("prev=word"));
         assert!(s.contains("AddTail(origin:3)"));
     }
 
@@ -1866,7 +1867,7 @@ mod tests {
             timing: EffectTiming::NextByte,
             guard: EffectGuard::ALWAYS,
             atom: EffectAtom::Match,
-            prev_was_word: false,
+            prev: ByteProps::NONE,
         }];
         // Should resolve regardless of boundary context.
         let mut actions = ResolvedActions::default();
@@ -1905,7 +1906,7 @@ mod tests {
                 origin: StateIdx(0),
             },
             // prev byte is word
-            prev_was_word: true,
+            prev: ByteProps::WORD,
         }];
         // next byte is non-word → boundary exists → \b passes
         let mut actions = ResolvedActions::default();
@@ -1941,7 +1942,7 @@ mod tests {
                 origin: StateIdx(0),
             },
             // prev byte is word
-            prev_was_word: true,
+            prev: ByteProps::WORD,
         }];
         // next byte is also word → no boundary → \b fails
         let mut actions = ResolvedActions::default();
@@ -1985,7 +1986,7 @@ mod tests {
                     atom: EffectAtom::AddTail {
                         origin: StateIdx(0),
                     },
-                    prev_was_word: true,
+                    prev: ByteProps::WORD,
                 },
                 PendingEffect {
                     timing: EffectTiming::NextByte,
@@ -1995,7 +1996,7 @@ mod tests {
                     atom: EffectAtom::AddTail {
                         origin: StateIdx(1),
                     },
-                    prev_was_word: true,
+                    prev: ByteProps::WORD,
                 },
             ]
         };
@@ -2066,7 +2067,7 @@ mod tests {
             atom: EffectAtom::AddTail {
                 origin: StateIdx(0),
             },
-            prev_was_word: true,
+            prev: ByteProps::WORD,
         }];
 
         // Word → non-word: \b passes but \B fails → AND fails.
@@ -2114,7 +2115,7 @@ mod tests {
             atom: EffectAtom::AddTail {
                 origin: StateIdx(5),
             },
-            prev_was_word: false,
+            prev: ByteProps::NONE,
         }];
         let mut actions = ResolvedActions::default();
         resolve_pending(
@@ -2143,7 +2144,7 @@ mod tests {
                 origin: StateIdx(3),
                 value: 1,
             },
-            prev_was_word: false,
+            prev: ByteProps::NONE,
         }];
         let mut actions = ResolvedActions::default();
         resolve_pending(
@@ -2170,7 +2171,7 @@ mod tests {
             timing: EffectTiming::NextByte,
             guard: EffectGuard::ALWAYS,
             atom: EffectAtom::MatchAtEnd,
-            prev_was_word: false,
+            prev: ByteProps::NONE,
         }];
         let mut actions = ResolvedActions::default();
         resolve_pending(
@@ -2223,7 +2224,7 @@ mod tests {
                 assert_chain: chain_id,
             },
             atom: EffectAtom::Match,
-            prev_was_word: true,
+            prev: ByteProps::WORD,
         }];
         // At EOI: EndLF passes (at_end=true).
         let mut actions = ResolvedActions::default();
@@ -2266,7 +2267,7 @@ mod tests {
                 assert_chain: chain_id,
             },
             atom: EffectAtom::Match,
-            prev_was_word: true,
+            prev: ByteProps::WORD,
         }];
         // Mid-input with next='\n': EndLF should pass.
         let mut actions = ResolvedActions::default();
@@ -2309,7 +2310,7 @@ mod tests {
                 assert_chain: chain_id,
             },
             atom: EffectAtom::Match,
-            prev_was_word: false,
+            prev: ByteProps::NONE,
         }];
         // Mid-input with next='x': EndLF should fail.
         let mut actions = ResolvedActions::default();
@@ -2349,7 +2350,7 @@ mod tests {
                     origin: crate::StateIdx(1),
                     value: 0,
                 },
-                prev_was_word: false,
+                prev: ByteProps::NONE,
             },
             PendingEffect {
                 timing: EffectTiming::NextByte,
@@ -2357,13 +2358,13 @@ mod tests {
                 atom: EffectAtom::AddTail {
                     origin: crate::StateIdx(2),
                 },
-                prev_was_word: false,
+                prev: ByteProps::NONE,
             },
             PendingEffect {
                 timing: EffectTiming::NextByte,
                 guard: EffectGuard::ALWAYS,
                 atom: EffectAtom::Match,
-                prev_was_word: false,
+                prev: ByteProps::NONE,
             },
         ];
         let mut actions = ResolvedActions::default();
@@ -2420,7 +2421,7 @@ mod tests {
                     value: 0,
                 },
                 // \b at word→word boundary: fails
-                prev_was_word: true,
+                prev: ByteProps::WORD,
             },
             PendingEffect {
                 timing: EffectTiming::NextByte,
@@ -2430,7 +2431,7 @@ mod tests {
                 atom: EffectAtom::AddTail {
                     origin: crate::StateIdx(2),
                 },
-                prev_was_word: true,
+                prev: ByteProps::WORD,
             },
         ];
         let mut actions = ResolvedActions::default();

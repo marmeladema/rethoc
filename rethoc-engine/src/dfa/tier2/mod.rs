@@ -18,10 +18,7 @@ pub(crate) mod overlap;
 
 use std::fmt;
 
-use crate::{
-    AssertEval, AssertKind, CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci,
-    is_word_byte,
-};
+use crate::{CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci, is_word_byte};
 
 use super::{DfaCache, DfaMemory, DfaStateId};
 
@@ -283,23 +280,9 @@ pub(crate) struct Tier2Analysis {
     body_interior: Box<[u32]>,
     /// Per-counter `(start, end)` range into [`body_interior`](Self::body_interior).
     body_ranges: Box<[(usize, usize)]>,
-    /// Flat array of NFA consuming-state indices reachable from each
-    /// counter's break target (`CInc.out1`) via epsilon transitions.
-    /// These are the states that need to consume the current byte when
-    /// a deferred-assertion-gated counter breaks (Bug 18).
-    ///
-    /// Precomputed at build time — depends only on the NFA structure.
-    break_consuming: Box<[StateIdx]>,
-    /// Per-counter `(start, end)` range into [`break_consuming`](Self::break_consuming).
-    break_consuming_ranges: Box<[(usize, usize)]>,
-    /// Per-counter flag: `true` if `Match` is directly reachable (without
-    /// passing through an end-of-input assertion) from the counter's break
-    /// path (`CInc.out1`).  Precomputed at build time.
-    break_direct_match: Box<[bool]>,
     /// Per-NFA-state bitmask of counter indices whose `CounterIncrement`
     /// is reachable via epsilon transitions.  Indexed by `StateIdx`.
-    /// Replaces the runtime `find_cinc_counters` and `deferred_cinc_mask`
-    /// graph walks.
+    /// Replaces the runtime `find_cinc_counters` graph walk.
     cinc_reachable: Box<[u64]>,
     /// Flat array of consuming NFA states reachable from each counter's
     /// `CounterInstance.out` via epsilon transitions.  Used to build
@@ -317,12 +300,6 @@ impl Tier2Analysis {
         &self.body_interior[start..end]
     }
 
-    /// Returns `true` if `Match` is directly reachable (without an
-    /// end-of-input assertion) from counter `ci`'s break path.
-    pub(crate) fn break_has_direct_match(&self, ci: usize) -> bool {
-        self.break_direct_match[ci]
-    }
-
     /// Returns the bitmask of counter indices whose `CounterIncrement`
     /// is reachable via epsilon transitions from NFA state `idx`.
     pub(crate) fn cinc_reachable_from(&self, idx: StateIdx) -> u64 {
@@ -335,33 +312,31 @@ impl Tier2Analysis {
         let (start, end) = self.ci_seed_consuming_ranges[ci];
         &self.ci_seed_consuming[start..end]
     }
-
-    /// Returns the slice of consuming NFA states reachable from counter
-    /// `ci`'s break target (`CInc.out1`) via epsilon transitions.
-    pub(crate) fn break_consuming(&self, ci: usize) -> &[StateIdx] {
-        let (start, end) = self.break_consuming_ranges[ci];
-        &self.break_consuming[start..end]
-    }
 }
 
-/// Precompute body interior data and break-path consuming states for all
-/// counters in a Tier 2 pattern.
+/// Precompute the per-counter and per-state tables of a Tier 2 pattern:
 ///
-/// For each counter, identifies:
 /// 1. **Interior states** — NFA consuming states in the "interior" of the
 ///    counter body (body positions 1..L-1 for a body of length L).  Used to
 ///    detect when a DFA successor has in-progress body instances.
-/// 2. **Break consuming states** — NFA consuming states reachable from
-///    `CInc.out1` (the break target) via epsilon transitions.  Used when
-///    a deferred-assertion-gated counter breaks (Bug 18).
+/// 2. **Increment reachability** — per NFA state, the counters whose
+///    `CInc` is reachable through epsilon transitions.
+/// 3. **Seed states** — per counter, the consuming states its
+///    `CounterInstance` leads to.
+///
+/// # Panics
+///
+/// If an increment is reachable, without consuming a byte, from an
+/// assertion that looks ahead.  Eligibility excludes such patterns
+/// (requirement 6 in [`eligibility`]) and the matcher has no code for
+/// them: it only increments on the transition that consumes the last
+/// byte of a body.
 pub(crate) fn compute_tier2_analysis(
     states: &[State],
     byte_tables: &[crate::ByteMap],
     num_counters: usize,
 ) -> Tier2Analysis {
     let mut per_counter: Vec<Vec<u32>> = vec![Vec::new(); num_counters];
-    let mut break_per_counter: Vec<Vec<StateIdx>> = vec![Vec::new(); num_counters];
-    let mut break_direct: Vec<bool> = vec![false; num_counters];
 
     for s in states.iter() {
         if let State::CounterInstance { counter, out } = s {
@@ -391,19 +366,6 @@ pub(crate) fn compute_tier2_analysis(
             interior.dedup();
             per_counter[ci] = interior;
         }
-
-        // Collect break-path consuming states and match reachability
-        // for each CInc.
-        if let State::CounterIncrement { counter, out1, .. } = *s {
-            let ci = counter.idx();
-            if ci < num_counters {
-                break_per_counter[ci] = collect_break_consuming(out1, states);
-                let (direct, _at_end) = break_path_match_kind(out1, states);
-                if direct {
-                    break_direct[ci] = true;
-                }
-            }
-        }
     }
 
     // Flatten body interior into a single Vec with (start, end) ranges.
@@ -413,15 +375,6 @@ pub(crate) fn compute_tier2_analysis(
         let start = flat.len();
         flat.extend(v);
         ranges.push((start, flat.len()));
-    }
-
-    // Flatten break consuming into a single Vec with (start, end) ranges.
-    let mut break_flat: Vec<StateIdx> = Vec::new();
-    let mut break_ranges: Vec<(usize, usize)> = Vec::with_capacity(num_counters);
-    for v in break_per_counter {
-        let start = break_flat.len();
-        break_flat.extend(v);
-        break_ranges.push((start, break_flat.len()));
     }
 
     // Precompute per-NFA-state CInc reachability bitmask.
@@ -455,6 +408,23 @@ pub(crate) fn compute_tier2_analysis(
         cinc_reachable[si] = mask;
     }
 
+    // The matcher's central assumption (eligibility requirement 6): an
+    // increment directly follows a consumed byte, never an assertion a
+    // thread can wait on.  The eligibility rule and this table are
+    // computed by different walks; a pattern on which they disagree must
+    // not reach the matcher.
+    for state in states {
+        if let State::Assert { kind, out } = *state
+            && kind.looks_ahead()
+        {
+            assert_eq!(
+                cinc_reachable[out.idx()],
+                0,
+                "tier 2 pattern with an increment behind `{kind:?}`"
+            );
+        }
+    }
+
     // Precompute per-counter seed consuming states: consuming NFA states
     // reachable from each CounterInstance.out via epsilon transitions.
     let mut seed_per_counter: Vec<Vec<StateIdx>> = vec![Vec::new(); num_counters];
@@ -477,47 +447,10 @@ pub(crate) fn compute_tier2_analysis(
     Tier2Analysis {
         body_interior: flat.into_boxed_slice(),
         body_ranges: ranges.into_boxed_slice(),
-        break_consuming: break_flat.into_boxed_slice(),
-        break_consuming_ranges: break_ranges.into_boxed_slice(),
-        break_direct_match: break_direct.into_boxed_slice(),
         cinc_reachable: cinc_reachable.into_boxed_slice(),
         ci_seed_consuming: seed_flat.into_boxed_slice(),
         ci_seed_consuming_ranges: seed_ranges.into_boxed_slice(),
     }
-}
-
-/// Collect consuming NFA states reachable from `start` via epsilon
-/// transitions (Split, Assert, CounterInstance).  Stops at consuming
-/// states and CInc — does not recurse into nested counters.
-fn collect_break_consuming(start: StateIdx, states: &[State]) -> Vec<StateIdx> {
-    let mut result = Vec::new();
-    let mut stack = vec![start];
-    let mut visited = vec![false; states.len()];
-    while let Some(idx) = stack.pop() {
-        let i = idx.idx();
-        if visited[i] {
-            continue;
-        }
-        visited[i] = true;
-        match states[idx] {
-            State::Split { out, out1 } => {
-                stack.push(out);
-                stack.push(out1);
-            }
-            State::Assert { out, .. } => stack.push(out),
-            State::CounterInstance { out, .. } => stack.push(out),
-            State::Byte { .. }
-            | State::ByteCI { .. }
-            | State::Wildcard { .. }
-            | State::ByteClassStatic { .. }
-            | State::ByteClassCustom { .. }
-            | State::ByteTable { .. } => {
-                result.push(idx);
-            }
-            _ => {}
-        }
-    }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -836,7 +769,6 @@ impl Tier2DfaCache {
         follow_break: bool,
     ) -> ClosureResult {
         let mut encountered_cinc = false;
-        let mut cinc_mask: u64 = 0;
 
         let (is_match, is_match_at_end) = memory.epsilon_closure(
             seeds,
@@ -849,9 +781,8 @@ impl Tier2DfaCache {
                 mem.closure_stack.push(out);
                 mem.closure_seeds.push((counter, out));
             },
-            |mem, counter, out, out1, _, _| {
+            |mem, _, out, out1, _, _| {
                 encountered_cinc = true;
-                cinc_mask |= 1u64 << counter.idx();
                 mem.closure_stack.push(out);
                 if follow_break {
                     mem.closure_stack.push(out1);
@@ -874,7 +805,6 @@ impl Tier2DfaCache {
             is_match,
             is_match_at_end,
             encountered_cinc,
-            cinc_mask,
             seed_instances: seed_instances.into_boxed_slice(),
         }
     }
@@ -893,18 +823,13 @@ impl Tier2DfaCache {
     ) -> Transition {
         let mut targets: Vec<StateIdx> = Vec::new();
 
-        let mut resolved_cinc = false;
-        let mut resolved_cinc_mask: u64 = 0;
         let mut resolved_is_match = false;
         // Note: we do NOT track resolved_is_match_at_end here.  That flag
         // means "the deferred assertion passed mid-stream (with next=byte) and
         // $ → Match was reachable."  But the assertion was evaluated with
         // next=Some(byte) — at actual end-of-input, next is None and word-
         // boundary conditions may flip.  finish() correctly re-evaluates via
-        // resolve_deferred_at_end() and resolve_deferred_cinc_at_end().
-        // Match reachable through CInc break path in Phase 1 resolution.
-        // Only valid when any_can_break is true (counter >= min).
-        let mut resolved_break_match = false;
+        // resolve_deferred_at_end().
         // Counters entered through Phase 1 resolution whose first body
         // byte was consumed on this transition (bit `i` = counter `i`).
         // Only these get a pre-seed and are spared by `counter_reset`.
@@ -913,11 +838,6 @@ impl Tier2DfaCache {
         // resolved thread taking the byte — a state after the counter's
         // break, say — says nothing about the body (Bug 62).
         let mut resolved_body_mask: u64 = 0;
-        // Targets from consuming states on CInc break paths, consumed on
-        // this transition.  These states are only reachable when the
-        // deferred assertion passes AND the counter breaks, so they are
-        // added exclusively to the `with_break` DFA successor (Bug 18).
-        let mut resolved_break_targets: Vec<StateIdx> = Vec::new();
 
         if from != DfaStateId::DEAD {
             let from_state = &self.inner.states[from.idx()];
@@ -946,46 +866,18 @@ impl Tier2DfaCache {
                     }
                 }
 
-                resolved_cinc = cr.encountered_cinc;
-                resolved_cinc_mask = cr.cinc_mask;
+                // A resolved assertion never leads to an increment without
+                // consuming a byte: eligibility requirement 6, checked
+                // for every pattern in `compute_tier2_analysis()`.  So
+                // increments are only ever seen by the probe below, on
+                // the transition that consumes the last byte of a body.
+                debug_assert!(
+                    !cr.encountered_cinc,
+                    "tier 2 pattern with an increment behind an assertion"
+                );
                 resolved_is_match = cr.is_match;
                 // Discard cr.is_match_at_end — see comment above.
 
-                // If CInc was reached via Phase 1 resolution, check if
-                // the break path (CInc.out1) can reach Match directly
-                // (without going through $ or end-line assertions).
-                //
-                // Phase 1 fires mid-stream (we have a next byte), so $
-                // cannot pass at the break position.  Paths through $
-                // are handled at actual end-of-input by
-                // resolve_deferred_cinc_at_end() in finish().
-                if cr.encountered_cinc {
-                    let mut mask = cr.cinc_mask;
-                    while mask != 0 {
-                        let ci = mask.trailing_zeros() as usize;
-                        mask &= mask - 1;
-
-                        // Check direct (epsilon-only) match from break
-                        // target — precomputed at analysis time.
-                        if regex.counter_break_can_match[ci] && analysis.break_has_direct_match(ci)
-                        {
-                            resolved_break_match = true;
-                        }
-
-                        // Consume the current byte at precomputed
-                        // break-path consuming states (Bug 18).
-                        // These are only reachable when the counter
-                        // breaks AND the deferred assertion passed.
-                        for &bc in analysis.break_consuming(ci) {
-                            if let Some((t, te)) = consume_byte(bc, byte, regex) {
-                                resolved_break_targets.push(t);
-                                if te != StateIdx::NONE {
-                                    resolved_break_targets.push(te);
-                                }
-                            }
-                        }
-                    }
-                }
                 for &idx in cr.nfa_states.iter() {
                     if let Some((t, te)) = consume_byte(idx, byte, regex) {
                         targets.push(t);
@@ -1019,18 +911,15 @@ impl Tier2DfaCache {
             true,
         );
 
-        let is_counting = probe.encountered_cinc || resolved_cinc;
+        let is_counting = probe.encountered_cinc;
 
         // Find ALL counters that fire CInc at this transition.
-        // Include counters reached via resolved deferred assertions
-        // (Phase 1) which are not reachable from targets alone.
         // Guarded by is_counting because the precomputed cinc_reachable
         // is a static over-approximation that ignores assertion gating.
         let counting_mask = if is_counting {
             targets
                 .iter()
                 .fold(0u64, |acc, &t| acc | analysis.cinc_reachable_from(t))
-                | resolved_cinc_mask
         } else {
             0
         };
@@ -1074,30 +963,7 @@ impl Tier2DfaCache {
                 false,
             );
             let nb_id = self.intern_closure_result(&cr_nb, byte);
-            // When Phase 1 resolved a deferred assertion and reached
-            // CInc, the break path's consuming states may have consumed
-            // `byte`.  Those targets are only reachable when the counter
-            // actually breaks, so they go into the with_break closure
-            // exclusively (Bug 18).
-            let wb_id = if resolved_break_targets.is_empty() {
-                self.intern_closure_result(&probe, byte)
-            } else {
-                let wb_closure = self.epsilon_closure(
-                    memory,
-                    targets
-                        .iter()
-                        .copied()
-                        .chain(resolved_break_targets.iter().copied())
-                        .chain(std::iter::once(regex.start)),
-                    regex,
-                    analysis,
-                    false,
-                    Some(byte),
-                    None,
-                    true,
-                );
-                self.intern_closure_result(&wb_closure, byte)
-            };
+            let wb_id = self.intern_closure_result(&probe, byte);
             let (nb_m, nb_mae) = self.match_flags(nb_id);
             let (wb_m, wb_mae) = self.match_flags(wb_id);
 
@@ -1138,7 +1004,7 @@ impl Tier2DfaCache {
                 no_break_is_match: nb_m || resolved_is_match,
                 no_break_is_match_at_end: nb_mae,
                 with_break: wb_id,
-                with_break_is_match: wb_m || resolved_is_match || resolved_break_match,
+                with_break_is_match: wb_m || resolved_is_match,
                 with_break_is_match_at_end: wb_mae,
                 counting_mask,
                 pre_seeds: pre_seed_list.into_boxed_slice(),
@@ -1160,39 +1026,6 @@ impl Tier2DfaCache {
             let pre_seed_list = Self::pre_seeds_for(resolved_body_mask);
             let counter_reset = counter_reset & !resolved_body_mask;
 
-            // Counters reachable from deferred assertions (for pre-reset
-            // snapshot in step_inner).
-            let dcm = probe
-                .deferred_asserts
-                .iter()
-                .fold(0u64, |acc, &assert_idx| {
-                    if let State::Assert { out, .. } = regex.states[assert_idx] {
-                        acc | analysis.cinc_reachable_from(out)
-                    } else {
-                        acc
-                    }
-                });
-
-            // For L=1 counter bodies with deferred assertions gating
-            // CInc, the probe can't see through the deferred assertion
-            // to find CI → body seeds.  If counter_reset will clear
-            // the counter AND dcm shows CInc is behind a deferred
-            // assertion, inject a seed so the counter is re-populated
-            // after clearing.  This allows the counter to accumulate
-            // across transitions where the assertion always defers.
-            let needs_deferred_seed = dcm & counter_reset;
-            if needs_deferred_seed != 0 {
-                let mut mask = needs_deferred_seed;
-                while mask != 0 {
-                    let ci = mask.trailing_zeros() as usize;
-                    mask &= mask - 1;
-                    let counter = CounterIdx(ci as u8);
-                    if !seed_list.iter().any(|s| s.0 == counter) {
-                        seed_list.push((counter, 0));
-                    }
-                }
-                seed_list.sort_by_key(|&(c, _)| c);
-            }
             let phase_reset = Self::compute_phase_reset(analysis, 0, counter_reset);
 
             Transition {
@@ -1461,8 +1294,6 @@ struct ClosureResult {
     is_match: bool,
     is_match_at_end: bool,
     encountered_cinc: bool,
-    /// Bitmask of counters that reached CInc during this closure.
-    cinc_mask: u64,
     seed_instances: Box<[(CounterIdx, StateIdx)]>,
 }
 
@@ -1556,63 +1387,6 @@ fn consuming_states_walk(
     }
 }
 
-/// Walk from `start` through epsilon states on the CInc break path
-/// (CInc.out1) and determine how `Match` is reachable:
-///
-/// Returns `(direct, at_end)`:
-/// - `direct`: `Match` is reachable without going through `$` / end-line
-///   assertions — this fires mid-stream.
-/// - `at_end`: `Match` is reachable only through `$` / `(?m:$)` /
-///   `(?Rm:$)` — this fires only at end-of-input.
-///
-/// Both can be true if there are multiple paths.
-/// Walk from `start` through epsilon states on the CInc break path
-/// (CInc.out1) and determine how `Match` is reachable:
-///
-/// Returns `(direct, at_end)`:
-/// - `direct`: Match is reachable without passing through an end-like
-///   assertion (`$`, `\Z`, `\z`).
-/// - `at_end`: Match is reachable through an end-like assertion.
-fn break_path_match_kind(start: StateIdx, states: &[State]) -> (bool, bool) {
-    let mut direct = false;
-    let mut at_end = false;
-    let mut stack: Vec<(StateIdx, bool)> = vec![(start, false)];
-    let mut visited = vec![[false; 2]; states.len()];
-    while let Some((idx, through_end)) = stack.pop() {
-        let i = idx.idx();
-        let te = through_end as usize;
-        if visited[i][te] {
-            continue;
-        }
-        visited[i][te] = true;
-        match states[idx] {
-            State::Match => {
-                if through_end {
-                    at_end = true;
-                } else {
-                    direct = true;
-                }
-            }
-            State::Split { out, out1 } => {
-                stack.push((out, through_end));
-                stack.push((out1, through_end));
-            }
-            State::Assert { kind, out } => {
-                let is_end_like = matches!(
-                    kind,
-                    AssertKind::End | AssertKind::EndLF | AssertKind::EndCRLF
-                );
-                stack.push((out, through_end || is_end_like));
-            }
-            State::CounterInstance { out, .. } => {
-                stack.push((out, through_end));
-            }
-            _ => {}
-        }
-    }
-    (direct, at_end)
-}
-
 // ---------------------------------------------------------------------------
 // Tier 2 Matcher
 // ---------------------------------------------------------------------------
@@ -1632,72 +1406,6 @@ pub struct Tier2DfaMatcher<'a> {
     /// instance is live.
     settle: bool,
     prefilter: Prefilter,
-}
-
-/// Check if resolving deferred assertions at end-of-input reaches a
-/// CInc whose counter, after one more increment, allows a break to
-/// Match.  Free function to avoid borrow conflicts between the DFA
-/// state (`cache.inner`) and the counter/memory state.
-fn resolve_deferred_cinc_at_end(
-    deferred: &[StateIdx],
-    prev: Option<u8>,
-    regex: &crate::Regex,
-    counters: &CounterState,
-    memory: &mut DfaMemory,
-) -> bool {
-    if deferred.is_empty() {
-        return false;
-    }
-    let states = &regex.states;
-
-    for v in memory.closure_visited.iter_mut() {
-        *v = false;
-    }
-    memory.closure_stack.clear();
-    for &assert_idx in deferred {
-        if let State::Assert { kind, out } = states[assert_idx]
-            && kind.eval(false, true, prev, None) == AssertEval::Pass
-        {
-            memory.closure_stack.push(out);
-        }
-    }
-
-    while let Some(idx) = memory.closure_stack.pop() {
-        let i = idx.idx();
-        if memory.closure_visited[i] {
-            continue;
-        }
-        memory.closure_visited[i] = true;
-        match states[idx] {
-            State::CounterIncrement { counter, min, .. } => {
-                let ci = counter.idx();
-                if !regex.counter_break_can_match[ci] {
-                    continue;
-                }
-                if ci < counters.meta.len() {
-                    let m = &counters.meta[ci];
-                    for ph in 0..m.num_phases {
-                        let phase = &counters.phases[m.phase_start + ph];
-                        if !phase.is_empty() && phase.oldest + 1 >= min as u32 {
-                            return true;
-                        }
-                    }
-                }
-            }
-            State::Split { out, out1 } => {
-                memory.closure_stack.push(out1);
-                memory.closure_stack.push(out);
-            }
-            State::Assert { kind, out } => {
-                if kind.eval(false, true, prev, None) == AssertEval::Pass {
-                    memory.closure_stack.push(out);
-                }
-            }
-            State::CounterInstance { out, .. } => memory.closure_stack.push(out),
-            _ => {}
-        }
-    }
-    false
 }
 
 impl<'a> Tier2DfaMatcher<'a> {
@@ -2070,19 +1778,6 @@ impl<'a> Tier2DfaMatcher<'a> {
             // counter bodies (deferred assert -> Match path).
             let mut scratch = super::ReachScratch::new();
             if state.resolve_deferred_at_end(self.regex, &mut scratch) {
-                return true;
-            }
-            // Tier 2 specific: handle deferred assertions inside counter
-            // bodies.  When a deferred assertion resolves at end-of-input
-            // and reaches CInc, we need to check whether incrementing the
-            // counter allows a break to Match.
-            if resolve_deferred_cinc_at_end(
-                &state.deferred_asserts,
-                state.prev_byte_representative(),
-                self.regex,
-                &self.cache.counters,
-                self.memory,
-            ) {
                 return true;
             }
         }
@@ -2516,8 +2211,8 @@ mod tests {
     fn test_settle_disabled_for_assertions_inside_bodies() {
         // Instance liveness is not exact while a thread is parked on a
         // deferred assertion inside the body.
-        let pattern = "x(a\\b){2,6}y";
-        with_matcher(pattern, b"xa a a a a a a a a", |m| {
+        let pattern = "x(\\Ba){2,6}y";
+        with_matcher(pattern, b"xa xaaaaaaaaa xa a", |m| {
             assert!(!m.settle);
             assert!(m.cache.settled.is_empty());
         });
