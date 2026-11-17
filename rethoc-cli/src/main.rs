@@ -85,6 +85,9 @@ impl CompileArgs {
             config.max_estimated_states = m;
         }
         config.merge_repetitions = !self.no_merge;
+        if let Some(n) = check::regime().byte_class_min_states {
+            config.byte_class_min_states = n;
+        }
         config
     }
 
@@ -406,7 +409,7 @@ fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig, quiet: bool)
 
 fn main() {
     // Before any work, and before any child process is started.
-    if let Err(message) = check::init_dfa_states() {
+    if let Err(message) = check::init_regime() {
         eprintln!("error: {message}");
         process::exit(check::EXIT_USAGE);
     }

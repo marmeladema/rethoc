@@ -118,7 +118,21 @@ pub(crate) fn run(args: &BruteArgs) -> i32 {
         );
         if let Some(input) = first_bad {
             mismatched += 1;
-            println!("  repro: {}", shrink_command(pattern, &config, &input));
+            // The inputs above share one `MatcherMemory`, like the
+            // streams of a real user.  A mismatch can therefore depend on
+            // what earlier inputs left in the DFA caches; such an input
+            // passes when run alone, and `shrink` would find nothing.
+            let expected = reference.is_match(&input);
+            subject.check(&mut new_memory(), &input, expected, &mut failures);
+            if failures.is_empty() {
+                println!(
+                    "  note: input=\"{}\" passes on a fresh MatcherMemory; the mismatch depends on \
+                     the DFA caches left by earlier inputs.  Rerun this command to reproduce it.",
+                    escape(&input)
+                );
+            } else {
+                println!("  repro: {}", shrink_command(pattern, &config, &input));
+            }
         }
     }
 

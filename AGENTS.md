@@ -103,6 +103,12 @@ read and printed with byte escapes (`\n`, `\xNN`), and every mismatch
 comes with a `repro:` command. Exit codes: 0 clean, 1 mismatch, 2 usage,
 3 aborted (watchdog, timeout, OOM, crash), 4 pattern rejected.
 
+`brute` and `fuzz` reuse one `MatcherMemory` across inputs, as a user
+does across streams, so they also find bugs that need the DFA caches left
+by earlier inputs. Such an input passes when run alone: the tools check
+that and print a `note:` instead of a `repro:` line. `shrink` runs every
+candidate on fresh memory, so what it prints fails on its own.
+
 ```bash
 rethoc brute --alphabet 'ab ' --max-len 6 '<pattern>'  # every input up to length 6
 rethoc shrink --unroll-limit 0 '<pattern>' '<input>'    # minimise a mismatching input
@@ -110,6 +116,7 @@ rethoc fuzz 0 500                                       # seeds 0..500, in proce
 rethoc fuzz --batch 250 --allow-slow ci/known-slow-seeds.txt 0 9000   # capped children
 rethoc fuzz --shared-memory 0 500     # one MatcherMemory for every regex of the run
 rethoc sweep nullable-counter         # brute over a pattern family, each run capped
+rethoc sweep assert-edges             # every assertion kind around a repetition
 rethoc sweep tier3-assert
 rethoc sweep --tier 3 tier3-assert    # only the NFA and Tier 3
 rethoc sweep --list tier3-assert      # print the runs instead
@@ -117,10 +124,18 @@ rethoc sweep --list tier3-assert      # print the runs instead
 
 - `fuzz` seed numbers are stable: a seed is a pattern plus inputs anyone
   can re-run. `--trace` prints every step.
-- `RETHOC_DFA_STATES=N` sets the DFA state cap of every matcher the CLI
-  creates, child processes included (`RETHOC_DFA_STATES=8 rethoc sweep
-  nullable-counter`). At 8, the minimum, the caches are emptied every
-  few bytes. Summary and `repro:` lines carry the setting.
+- Two environment variables move engine thresholds for every command,
+  child processes included, so that small patterns and short inputs reach
+  the code behind them. Summary, result and `repro:` lines carry the
+  settings.
+  - `RETHOC_DFA_STATES=N`: the DFA state cap. At 8, the minimum, the
+    caches are emptied every few bytes.
+  - `RETHOC_BYTE_CLASS_MIN_STATES=N`: the NFA size from which the DFA
+    tiers use byte equivalence classes (default 128). At 0, every
+    pattern gets them.
+
+  `RETHOC_DFA_STATES=8 RETHOC_BYTE_CLASS_MIN_STATES=0 rethoc sweep
+  assert-edges` is the "extreme regime" CI runs next to the default.
 - Seeds that are correct but slower than the watchdog go in
   `ci/known-slow-seeds.txt` with their pattern. `fuzz --batch` reports
   them as `KNOWN-SLOW`, and says when one no longer is.
@@ -135,9 +150,10 @@ GitHub Actions, in `.github/workflows/`:
   clippy (both workspaces), `cargo test` in release and debug,
   `bless_memory.py --check`.
 - `differential.yml` (same triggers): `rethoc fuzz --batch` over a fixed
-  seed range with `ci/known-slow-seeds.txt` and both `rethoc sweep`
-  families, each at the default and at the minimum DFA state cap; on PRs
-  the `reengage_profile` Callgrind gate against the base branch.
+  seed range with `ci/known-slow-seeds.txt` and every `rethoc sweep`
+  family, each in the default and in the extreme regime (minimum DFA
+  state cap, byte classes for every pattern); on PRs the
+  `reengage_profile` Callgrind gate against the base branch.
 - `fuzz-nightly.yml` (daily, or on demand): cargo-fuzz targets.
 
 Third-party actions are pinned by commit SHA with the version in a
