@@ -1,8 +1,10 @@
 # Exact grouped NFA implementation plan
 
-Status: implementation-ready experimental design; no new matcher implemented or
-benchmarked. Checked against main `b0bb981e8c6cba7b23df176d79f741c3b61089a7`.
-This work does not investigate existing tier correctness bugs.
+Status: P0 and P1 implemented in `rethoc-engine/src/grouped_nfa/` (opt-in
+`RegexConfig::grouped_nfa`, one-word assertion-free runtime); P2–P5 open; not
+benchmarked. Designed against main `b0bb981e8c6cba7b23df176d79f741c3b61089a7`;
+source references below re-checked at `d82066d`. This work does not
+investigate existing tier correctness bugs.
 
 ## Decision: sparse sets are not required
 
@@ -29,22 +31,23 @@ Context: [directions](../docs/research/counting-engine-directions.md),
 
 ## 1. Evidence and verification status
 
-Source locations are relative to `rethoc-engine/src/lib.rs` unless specified.
+Source locations are symbols in `rethoc-engine/src/lib.rs` unless specified
+(line numbers drifted by up to 450 lines in two commits, so none are given).
 
 | Verified behavior | Location | Design implication |
 |---|---|---|
-| NFA stores `(StateIdx, CounterCtx)` | 3866 | Multiple valuations repeat work at one state |
-| Closure hashes/copies nonempty contexts | 4010 | Replace with grouped unions for the admitted subset |
-| Predicate dispatch occurs per thread | 4217 | Group before consumption |
-| CI initializes count zero | 4078 | Zero is an active count, not an inactive sentinel |
-| CInc increments before testing continue/break | 4093 | Increment at iteration completion, not per byte |
-| Continue is `< max`; break is `>= min` | 4101 | Separate continuation and exit transfers |
-| Unbounded counts saturate at `min` | `counter_step`, 3285 | Unbounded repetition can have a finite exact domain |
-| `{0,max}` lowers to optional `{1,max}` | 2338 | Preserve the existing Outside bypass |
-| ByteTable consumes; atoms can have `out_exit` | `State`, 597 | Cover all consuming edges in analysis/runtime |
-| Byte-table optimization precedes analysis | 2647 | Analyze the final graph |
-| `End` returns Fail before EOI | `AssertKind::eval`, 411 | Saving only Defer assertions loses candidates |
-| CLI checker enumerates tiers 0–4 | `rethoc-cli/src/check/mod.rs:129` | Explicitly integrate the experimental backend |
+| NFA stores `(StateIdx, CounterCtx)` | `MatcherMemory::clist`/`nlist` | Multiple valuations repeat work at one state |
+| Closure hashes/copies nonempty contexts | `NfaMatcher::drain_addstack` (dedup) | Replace with grouped unions for the admitted subset |
+| Predicate dispatch occurs per thread | `NfaMatcher::step` (consumption loop) | Group before consumption |
+| CI initializes count zero | `drain_addstack`, `State::CounterInstance` arm | Zero is an active count, not an inactive sentinel |
+| CInc increments before testing continue/break | `drain_addstack`, `State::CounterIncrement` arm | Increment at iteration completion, not per byte |
+| Continue is `< max`; break is `>= min` | same arm | Separate continuation and exit transfers |
+| Unbounded counts saturate at `min` | `counter_step` | Unbounded repetition can have a finite exact domain |
+| `{0,max}` lowers to optional `{1,max}` | `RegexBuilder::emit_bounded_repetition` | Preserve the existing Outside bypass |
+| ByteTable consumes; atoms can have `out_exit` | `State` | Cover all consuming edges in analysis/runtime |
+| Byte-table optimization precedes analysis | `RegexBuilder::build` → `optimize_byte_tables` | Analyze the final graph |
+| `End` returns Fail before EOI | `AssertKind::eval` | Saving only Defer assertions loses candidates |
+| CLI checker enumerates tiers 0–4 | `rethoc-cli/src/check/mod.rs`, `TierChoice { All, Only, Except }` | Explicitly integrate the experimental backend |
 
 `CounterInfo.body_byte_length == 0` is not a nullability test: it also denotes
 variable length. Do not reuse Tier 2/3 eligibility or body-length metadata as a
@@ -405,6 +408,24 @@ experimental backend name, not Tier 5. Each milestone is independently reviewabl
   eligibility/rejection, persistent bytes, and scratch bytes separately.
 - Gate: structural checks and forced-counter examples pass; a plan-budget
   rejection leaves existing compilation/dispatch usable.
+
+### Implementation notes (P0/P1)
+
+- `grouped_nfa/analysis.rs` checks the structural conditions (scope proof,
+  zero-width cycles) before the milestone exclusions, so a graph that is
+  outside the class for good is reported as such. `Limits` makes every
+  budget a parameter; the tests cover each below/at/above.
+- The `Regex` field is `Option<Box<GroupedNfa>>`: 8 bytes on every regex
+  (all `memory:` values re-blessed), plan bytes only when requested.
+- `run_match_test` also compiles each build with the option and, when
+  admitted, runs the grouped stream on the listed inputs (against Tier 0
+  prefix `ismatch` and the oracle, whole/bytewise/chunked with empty calls)
+  and on the generated inputs. At P1 about 210 of ~1,480 builds are
+  admitted; about 1,140 of the rejections are assertions (P3).
+- `(?:\b){2,3}` compiles to a lone `\b` without a counter; the
+  zero-width-cycle test uses `(?:\b|a){2,3}` instead.
+- P4 must fit the checker selector into `TierChoice` and add grouped runs
+  to the `assert-in-body` sweep family.
 
 ### P1: one-word exact, assertion-free runtime
 

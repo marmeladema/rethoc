@@ -436,6 +436,20 @@ impl fmt::Display for DumpRegex<'_> {
         writeln!(f, "  tier4 (counter programs):       {}", r.tier4_eligible)?;
         writeln!(f)?;
 
+        // -- Grouped NFA (experimental, only when requested) -----------------
+        match r.grouped_nfa.as_deref() {
+            None => {}
+            Some(crate::grouped_nfa::GroupedNfa::Rejected(reason)) => {
+                writeln!(f, "Grouped NFA: rejected: {reason}")?;
+                writeln!(f)?;
+            }
+            Some(crate::grouped_nfa::GroupedNfa::Admitted(plan)) => {
+                writeln!(f, "Grouped NFA: admitted")?;
+                write!(f, "{plan}")?;
+                writeln!(f)?;
+            }
+        }
+
         // -- Auxiliary Arrays --------------------------------------------------
         writeln!(f, "Auxiliary Arrays:")?;
         write!(f, "  state_can_reach_match: [")?;

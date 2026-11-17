@@ -58,6 +58,9 @@ pub struct MemoryInfo {
     pub num_byte_tables: usize,
     /// Size of one byte-map table in bytes.
     pub byte_table_size: usize,
+    /// Bytes of the experimental grouped NFA plan or rejection; 0 unless
+    /// it was requested.
+    pub grouped_nfa: usize,
 }
 
 /// Breakdown of NFA states by kind.
@@ -97,6 +100,29 @@ pub struct ExecutionInfo {
     pub tier: u8,
     /// Human-readable description of the selected tier.
     pub tier_name: String,
+}
+
+/// Experimental grouped NFA diagnostics, present when the regex was
+/// compiled with `RegexConfig::grouped_nfa`.
+///
+/// Persistent bytes (the plan, on the regex), per-stream bytes and
+/// per-worker scratch bytes are reported separately.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupedNfaInfo {
+    /// Whether the analysis admitted the graph.
+    pub admitted: bool,
+    /// Why it was rejected, if it was.
+    pub rejection: Option<String>,
+    /// Heap bytes of the plan arrays (0 when rejected).
+    pub plan_bytes: usize,
+    /// Rows: reachable NFA states.
+    pub rows: usize,
+    /// Words of one frontier (`W`).
+    pub row_words: usize,
+    /// Frontier payload of one stream: `8 W` bytes.
+    pub stream_bytes: usize,
+    /// Frontier payload of one worker's scratch: `16 W` bytes.
+    pub scratch_bytes: usize,
 }
 
 /// Start-closure diagnostics.
@@ -156,6 +182,9 @@ pub struct RegexInfo {
     pub start_closure: StartClosureInfo,
     /// Prefilter description (e.g. `"memchr1('a')"` or `"none"`).
     pub prefilter: String,
+    /// Experimental grouped NFA analysis, when requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grouped_nfa: Option<GroupedNfaInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +309,20 @@ impl fmt::Display for RegexInfo {
             self.start_closure.matches_empty
         )?;
         write!(f, "Prefilter: {}", self.prefilter)?;
+
+        if let Some(g) = &self.grouped_nfa {
+            writeln!(f)?;
+            writeln!(f)?;
+            write!(f, "Grouped NFA (experimental): ")?;
+            match &g.rejection {
+                None => write!(
+                    f,
+                    "admitted, {} rows, {} words; plan {} bytes, stream {} bytes, scratch {} bytes",
+                    g.rows, g.row_words, g.plan_bytes, g.stream_bytes, g.scratch_bytes
+                )?,
+                Some(reason) => write!(f, "rejected: {reason}")?,
+            }
+        }
         Ok(())
     }
 }
