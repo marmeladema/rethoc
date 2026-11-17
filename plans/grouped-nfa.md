@@ -1,0 +1,612 @@
+# Exact grouped NFA implementation plan
+
+Status: implementation-ready experimental design; no new matcher implemented or
+benchmarked. Checked against main `b0bb981e8c6cba7b23df176d79f741c3b61089a7`.
+This work does not investigate existing tier correctness bugs.
+
+## Decision: sparse sets are not required
+
+Build an **exact grouped NFA as an independently useful backend**. Sparse sets
+are an optional later optimization, with a different invariant and proof.
+
+| Technique | Preserves | Benefit | Remaining cost |
+|---|---|---|---|
+| Exact grouping | Every reachable count at each control position | Eliminates per-value predicates, context copies, and hashing | Bitset work grows with the count domain |
+| Sparse compression | Required acceptance observations, not every count | Fewer representatives for suitable ranges | Restricted operations and a separate abstraction proof |
+
+Grouping changes the layout to `state -> set of valuations`. Sparsification
+discards some valuations. For the flat subset below, a valuation is empty or
+one scalar count. Nested scopes need joint tuples and are excluded.
+
+Target consuming-prefix variable-body workloads, for example
+`a(a|aa){1,256}b`, where the current per-instance representation warrants a
+comparison. Measure the exact backend before pursuing further techniques.
+Keep default unrolling, Tier 2, and all other eligible paths as competitors.
+
+Context: [directions](../docs/research/counting-engine-directions.md),
+[benchmark method](../docs/research/counting-benchmark-method.md),
+[deployment requirements](../research_notes/engine-goal.md).
+
+## 1. Evidence and verification status
+
+Source locations are relative to `rethoc-engine/src/lib.rs` unless specified.
+
+| Verified behavior | Location | Design implication |
+|---|---|---|
+| NFA stores `(StateIdx, CounterCtx)` | 3866 | Multiple valuations repeat work at one state |
+| Closure hashes/copies nonempty contexts | 4010 | Replace with grouped unions for the admitted subset |
+| Predicate dispatch occurs per thread | 4217 | Group before consumption |
+| CI initializes count zero | 4078 | Zero is an active count, not an inactive sentinel |
+| CInc increments before testing continue/break | 4093 | Increment at iteration completion, not per byte |
+| Continue is `< max`; break is `>= min` | 4101 | Separate continuation and exit transfers |
+| Unbounded counts saturate at `min` | `counter_step`, 3285 | Unbounded repetition can have a finite exact domain |
+| `{0,max}` lowers to optional `{1,max}` | 2338 | Preserve the existing Outside bypass |
+| ByteTable consumes; atoms can have `out_exit` | `State`, 597 | Cover all consuming edges in analysis/runtime |
+| Byte-table optimization precedes analysis | 2647 | Analyze the final graph |
+| `End` returns Fail before EOI | `AssertKind::eval`, 411 | Saving only Defer assertions loses candidates |
+| CLI checker enumerates tiers 0–4 | `rethoc-cli/src/check/mod.rs:129` | Explicitly integrate the experimental backend |
+
+`CounterInfo.body_byte_length == 0` is not a nullability test: it also denotes
+variable length. Do not reuse Tier 2/3 eligibility or body-length metadata as a
+substitute for the scope and zero-width proofs below.
+
+Verification performed for this plan:
+
+- Read scalar transfers, assertion evaluation, compilation, memory ownership,
+  test helpers, and CLI selection code.
+- Inspected forced-counter dumps of `x(a|aaa){2,5}z`, `(a{2,3}b)*c`, and
+  `a{0,2}b`: confirmed variable body, completed-scope reentry, and optional bypass.
+- Exhaustively checked bitset increment/exit formulas against scalar semantics:
+  finite maxima 1–8, every lower bound and legal incoming subset, plus saturated
+  domains with minima 0–8. All 5,118 cases passed. This does not verify Rust
+  cross-word carries, complete matching, or performance.
+- Independent reviews checked scope propagation, topological closure, assertion
+  replay, and the separation from the sparse paper's guarantees.
+
+The implementation must discharge the remaining obligations below. This is
+not a formal proof or evidence of speedup.
+
+### Dedicated assertion re-audit
+
+Three independent reviews checked evaluator semantics, graph/guard provenance,
+and an executable scalar-versus-grouped scheduling model. The reproducible
+[assertion audit](verification/README.md) records:
+
+- 660,490 complete-boundary checks against the actual Rust evaluator, plus
+  provisional-pass stability under next-byte revelation **and EOI**.
+- 500,160 abstract-model executions and 3,417,480 prefix comparisons across
+  all assertion kinds, chunk partitions, and inserted empty chunks, with no
+  discrepancy. These are overlapping suites, not distinct-case counts.
+- Detection of five deliberately unsafe scheduling/storage mutations.
+
+The audit strengthened Section 5 and P3 below. It does not validate a Rust
+grouped matcher, production admission, or general count-domain machinery.
+
+## 2. Admitted class
+
+Use the existing optimized Thompson NFA, with no second regex compiler, position
+automaton conversion, DFA cache, or new numeric tier.
+
+Require all of:
+
+1. Each reachable state has one proven incoming scope: Outside or Counter(c).
+2. The reachable zero-width graph is acyclic, conservatively including every
+   assertion edge and both counter branches.
+3. Exact domains and metadata fit checked compile-time limits.
+4. The first runnable milestone excludes assertions and unbounded repetitions,
+   and requires one-word finite domains. Later milestones lift these restrictions
+   explicitly, even when an unbounded counter's saturated domain would fit.
+
+Allow consuming prefixes, multiple sequential/alternative counters, fixed and
+variable nonnullable bodies, and ordinary repetition around a completed counter
+when these checks pass. `(a{2,3}b)*c` remains flat: it exits the counted scope
+before the ordinary star reenters it.
+
+Reject grouped eligibility for nesting, conflicting scope labels, zero-width
+cycles, milestone exclusions, or budget exhaustion. Normal regex compilation
+and existing dispatch remain available. Forced grouped selection reports the
+reason; it must not silently run a different backend or return false.
+
+Non-goals: sparse sets, interval approximation, runtime truncation, prefilter
+skipping, SIMD, context DAGs, cyclic closure, or changing automatic dispatch.
+Counter-free graphs are useful test controls, not the initial promotion target.
+
+## 3. Compile an immutable plan
+
+Add `rethoc-engine/src/grouped_nfa/{mod,analysis,exact}.rs`. Names and APIs in
+this plan are proposed additions, not existing interfaces.
+
+### Scope proof
+
+Seed `Regex.start` with Outside and propagate labels over **all** edges,
+including consuming edges. Each state can acquire one label. Reject a different
+second label or an operation incompatible with its incoming scope.
+
+| State | Required incoming scope | Outgoing scope |
+|---|---|---|
+| Split, Assert | Either | Preserve on every edge |
+| Byte/ByteCI/Wildcard/classes | Either | Preserve on `out` and non-NONE `out_exit` |
+| ByteTable | Either | Preserve on every non-NONE table target |
+| CI(c) | Outside | Counter(c) |
+| CInc(c) | Counter(c) | Continue: Counter(c); break: Outside |
+| Match | Outside | Terminal |
+
+Reject CI inside any active scope, mismatched CInc, and Match with active scope.
+Ignore byte/guard feasibility conservatively. Validate identities and bounds
+against actual CI/CInc nodes; cross-check counter metadata. Ignore unreachable
+graph remnants. Test conflicting labels with explicit graph fixtures even if
+the current compiler does not produce them.
+
+### Topological closure schedule
+
+Construct a second graph containing outgoing edges only from Split, Assert,
+CI, and CInc. All consuming states, including ByteTable, are terminal in this
+graph. Topologically sort reachable states iteratively; reject remaining cycles.
+Handle duplicate edges consistently in indegrees and traversal.
+
+A nullable counted body creates a zero-width path to CInc and a continue cycle.
+Other zero-width cycles are excluded too, even if harmless. An ordinary `b*`
+inside `ab*` need not create a zero-width cycle: its return path consumes `b`.
+
+Seed all input rows before traversing the stored order. Every state's incoming
+zero-width contributions are complete when processed, so closure visits it once.
+No per-count visited hash or fixed-point queue is needed. A future cyclic
+worklist would require a different work bound.
+
+### Exact row layout
+
+Use a flat u64 arena with precomputed per-state spans:
+
+- Outside: one word; bit zero denotes a reachable empty valuation.
+- Finite counter maximum h: values `0..=h`, requiring `ceil((h+1)/64)` words.
+- Unbounded maximum: values `0..=min`, with existing saturation semantics.
+
+Scope labels distinguish Outside from active count zero. Finite bit h is useful
+in transfer calculations; incoming CInc values are below h because continuation
+excludes h. Never derive allocation size from the unbounded `usize::MAX` sentinel.
+
+Precompute final-word masks, guard boundaries/masks, and successor descriptors.
+Use flat slices and index newtypes. Reuse existing byte tables; do not allocate
+another 256-entry table per ByteTable state. No per-byte temporary allocation.
+
+### Experimental admission limits
+
+Initial values to make the prototype bounded, not production memory targets:
+
+- 4,096 states in the entire optimized state array, checked before allocating
+  StateIdx-indexed analysis arrays. Only reachable states receive runtime rows.
+- 1,048,576 examined edge entries, including ByteTable entries.
+- 8,192 total row words W: at most 64 KiB raw frontier payload per stream.
+- 1 MiB of new compiled-plan arrays, accounted from the actual layout.
+- 2 MiB of transient analysis arrays in addition to the retained-plan budget.
+
+Check arithmetic and limits before allocating. The first milestone additionally
+requires each counted domain endpoint <=63: `0..=64` already needs two words.
+Report actual bytes, coverage, and rejection reasons. Production selection must
+account for hundreds of patterns per stream; 64 KiB per pattern is not a goal.
+
+## 4. Exact transfers
+
+Process only nonempty rows. Transfers are unions of scalar pointwise transfers.
+Do not replace sets by intervals, extrema, or sparse representatives.
+
+| Operation | Grouped action |
+|---|---|
+| Union | OR rows with identical scope/domain |
+| Split | Union into both successors |
+| CI(c) | If Outside is present, insert count zero at its successor |
+| Finite CInc | T = `{v+1 : v in S}`; continue with T intersect `[0,h-1]`; set Outside at break target iff T intersects `[min,h]` |
+| Unbounded CInc | T = `{min(v+1,min) : v in S}`; continue with T; set Outside at break target iff T contains min |
+| Assert | Preserve row only on existing evaluator's Pass |
+| Consuming predicate | Test once per active state; on success transfer row to next-boundary successor(s) |
+| ByteTable | Consume one byte and transfer to its selected non-NONE target |
+| Match | If Outside is present, set sticky boolean match result |
+
+Exit forgets the completed count because the proven scalar scope ends there.
+Do not combine incompatible exit/continue payloads. For finite increments use
+shift-with-carry and masks; test cross-word carries and high padding. For
+saturation, retain an existing min bit as well as shifting smaller values;
+min=0 must work. Use `counter_step` as a unit-test oracle.
+
+## 5. Streaming and assertion replay
+
+### Ownership
+
+Persist **raw post-consumption roots**, not partially closed state. A stream
+owns one fixed-size W-word frontier, previous byte, at-start flag, sticky match flag, and
+lifecycle/plan identity metadata. Worker scratch owns closure and next-root
+arenas of W words each and is borrowed only during a call.
+
+After consumption copy scratch.next's W-word logical region into raw, then clear
+scratch before reuse. Do not swap worker Vec allocations into streams: after a
+large plan, that would spread the worker's high-water capacity into many small
+streams. Use fixed-size stream storage, such as `Box<[u64]>`; count the O(W)
+copy in the baseline.
+
+Different streams can share scratch sequentially; simultaneous calls need
+separate scratch. Reserve capacity before entering scanning. Frontier payload
+is `8W` bytes per stream and `16W` per worker for this plan, plus metadata and
+allocator overhead. Worker scratch may retain larger capacity from previous
+plans; report that high-water memory separately. Test large-plan then small-plan
+interleaving to ensure small stream allocations remain fixed-size.
+
+### Closure
+
+`close(raw, boundary)` clears closure scratch, copies all raw rows, and inserts
+Outside at the pattern start for search. Seed **all rows before** the topological
+pass. Apply zero-width transfers in order; consuming rows remain for consumption.
+
+Pass boundary flags and neighboring bytes to `AssertKind::eval`. Only Pass
+traverses the assertion. Fail and Defer stop this evaluation, but immutable raw
+roots remain available for reevaluation. In particular, End fails before EOI
+and must still become eligible at finish. Keep the raw frontier immutable under
+this plan's invariant. In particular, writing incremented values back into their
+original pre-increment CInc row would apply the increment again on replay.
+
+This does not mean every closed-frontier design is incorrect: a full exact
+closure retaining original roots, blocked assertions, and state identities can
+have an idempotent-closure argument. That is a different representation and proof.
+This plan deliberately keeps raw roots; retaining only consuming leaves or only
+Defer assertions would lose candidates such as End, which currently returns Fail.
+
+### Assertion contract: one immutable byte boundary
+
+Every raw row belongs to the **same current byte boundary**, even when its
+paths began at different positions. Every assertion in one closure, including
+chains separated by counter operations, sees the identical boundary context.
+Zero-width traversal never advances the position, updates prev/at_start, or
+consumes the lookahead byte.
+
+Use an explicit boundary-mode type rather than unrelated optional flags:
+
+| Mode | Next byte | EOI | Meaning |
+|---|---|---|---|
+| UnknownNext | None | false | Current chunk has ended; future input is unknown |
+| BeforeByte(b) | Some(b) | false | b is the next byte and is still unconsumed |
+| EndOfInput | None | true | Caller has finished this stream |
+
+Reject inconsistent internal contexts such as a known next byte together with
+EOI. On unmatched streams, `at_start` remains true until the first consumed byte
+and prev is None exactly at stream start. Chunk boundaries are not input starts
+or ends. Empty chunks do not resolve assertions.
+
+The current evaluator reads only this global boundary context. Thus the same
+assertion at the same state has one result for all grouped counts and origins.
+This is why exact grouping requires no per-origin assertion history here.
+Revisit the argument before adding any assertion that reads other context.
+`\B` is a boundary predicate, not a complement of the reachable-count set;
+its transfer still distributes over union.
+
+Raw roots persist only while resolving their current boundary. On consumption,
+replace raw **entirely** by the consuming successors. Never append old failed
+or deferred roots to the next boundary: they would be able to revive later.
+Likewise, a failed body assertion gates only its own path; an unasserted bypass
+must remain independent. Convergence permits union only at the same state and
+scope, after the predecessor's guard has passed.
+
+### All current assertion kinds
+
+In this table `s` is stream-start, `w` is whether prev is an ASCII word byte,
+and P/F/D mean Pass/Fail/Defer. A missing prev is neither a word byte nor CR/LF.
+These are required tests against the shared evaluator, not a second production
+implementation of assertion logic.
+
+| Kind | UnknownNext | EndOfInput |
+|---|---|---|
+| Start (`\A`, non-multiline `^`) | P iff s, otherwise F | Same |
+| End (`\z`, non-multiline `$`) | F | P |
+| StartLF | P iff s or prev=LF, otherwise F | Same |
+| EndLF | D | P |
+| StartCRLF | P if s or prev=LF; D if prev=CR; otherwise F | P iff s or prev=LF/CR |
+| EndCRLF | D | P |
+| WordAscii (`\b`) | D | P iff w |
+| WordAsciiNegate (`\B`) | D | P iff not w |
+| WordStartAscii | F if w, otherwise D | F |
+| WordEndAscii | D if w, otherwise F | P iff w |
+
+Known-byte evaluation must have no Defer. EOI evaluation must have no Defer.
+UnknownNext Pass must remain Pass for **every** next byte and for EOI. This
+last condition justifies sticky matches found during provisional closure. Fail
+has no such general stability guarantee: End is deliberately F before EOI.
+
+### Call sequence
+
+```
+start/reset:
+    raw = empty; at_start = true; prev = None; matched = false
+    close(raw, next=None, at_end=false)
+
+chunk(nonempty bytes):
+    for b in bytes:
+        close(raw, next=Some(b), at_end=false)
+        if matched: return
+        clear scratch.next
+        consume matching closure rows into scratch.next
+        copy scratch.next's logical region into fixed-size raw
+        prev = Some(b); at_start = false
+    close(raw, next=None, at_end=false)
+
+chunk(empty): no semantic change
+
+finish:
+    if matched: return true
+    close(raw, next=None, at_end=true)
+    return matched
+```
+
+Once matched, subsequent work can short-circuit under the boolean API. Enforce
+finish/reset lifecycle in the wrapper. Constructor closure makes `ismatch()`
+correct before the first chunk. End-of-chunk closure discovers definite matches
+without assuming EOI. Empty chunks remain O(1).
+
+A matched stream is an absorbing result: it may stop consuming the supplied
+slice and need not maintain a frontier for its unused suffix. Reset must restore
+all boundary flags and rows. Every unmatched stream must obey the full frontier
+invariant. At EOI perform closure only: never invent a sentinel byte or consume
+a tail reached through an end assertion. In BeforeByte mode, an assertion can
+open a consuming tail that uses b in that same iteration, exactly once.
+
+For `\Ax(a|aa){2}\z`, feeding `xaa` must not yet match; finish must match;
+feeding another `b` before finish must fail. Word assertions resolve when the
+next byte arrives; CR/LF split across calls remains visible through prev/next.
+
+This deliberately trades closure recomputation for a simple invariant. The first
+runtime excludes assertions; enable them only after the full schedule is tested.
+
+### Proof obligations
+
+1. Expanding raw grouped rows gives exactly the scalar configurations immediately
+   after consumption and before further zero-width traversal.
+2. For fixed boundary context, topological closure equals scalar zero-width
+   reachability, by induction over the order.
+3. Transfers distribute over union; consumption and search reseeding preserve
+   the invariant.
+4. Unknown-next Pass before EOI is stable under every later byte revelation
+   **and EOI** in the current evaluator. Test this property; reassess it for
+   future assertion kinds. All assertions in a pass share one immutable context.
+5. Next-byte/EOI reevaluation starts from original roots, not incremented closure.
+6. Consuming a byte replaces the old frontier; unresolved assertions cannot
+   migrate to a later boundary. Search reseeding also occurs at EOI, without
+   resetting existing counts or the global at_start flag.
+
+## 6. Cost model
+
+Let R be reachable states, W total row words, and B the sum of row-word work
+across transfers in one closure/consume phase. Count both successors, empty-row
+checks, and guard reductions; multiword nonempty checks are not O(1).
+
+- Analysis is linear in examined graph size plus descriptors, within budgets.
+- A closure/consume phase costs `O(R + W + B)` with a full sweep.
+- L bytes and J chunk calls cost `O((L+1)*(R+W+B) + J)`. Each nonempty chunk
+  adds one provisional closure; there are at most L such chunks.
+- Frontier storage is O(W) per stream and per worker, plus the shared plan.
+
+This is input-linear and allocation-free within scanning after preparation,
+**not independent of count bounds**. Full sweeps can lose on sparse frontiers.
+Active-row scheduling is a later measured optimization with its own ordering
+invariant, not part of the initial implementation.
+
+## 7. Milestones
+
+Keep tiers 0–4, their oracle, and `Regex::min_tier()` unchanged. Use an explicit
+experimental backend name, not Tier 5. Each milestone is independently reviewable.
+
+### P0: analysis and opt-in plan
+
+- Add `GroupedNfaPlan`, scope/row descriptors, order, masks, eligibility reasons,
+  checked sizes, and structural fixtures in the new module.
+- Add a default-off experimental compile option. Analyze in `RegexBuilder::build`
+  after graph optimization; store the plan/result on Regex. Never analyze during
+  matcher construction or scanning.
+- Keep Regex layout consistent between test and non-test builds; a `cfg(test)`
+  field would invalidate memory-footprint comparisons.
+- Update info/dump/debug and memory accounting for all new plan allocations.
+  Do not claim unrelated accounting gaps are fixed. Report requested mode,
+  eligibility/rejection, persistent bytes, and scratch bytes separately.
+- Gate: structural checks and forced-counter examples pass; a plan-budget
+  rejection leaves existing compilation/dispatch usable.
+
+### P1: one-word exact, assertion-free runtime
+
+- Implement finite domains <=63 and the topological runtime.
+- Add experimental stream-state and worker-scratch types with explicit
+  start/reset, chunk, finish, and ismatch operations. Scratch is passed per call;
+  do not retain its borrow across a suspended stream. Keep this runner separate
+  from AnyMatcher's current lifetime-long memory borrow initially.
+- Reserve once and reuse capacity. Implement Display/Debug for raw state, scopes,
+  exact counts, boundary flags, and chosen row widths.
+- Cover sequential scopes, reentry, ByteTable, out_exit, empty input/chunks,
+  early success, and reset. Use raw byte predicates; no prefilter or byte-class
+  compression in this version.
+- Gate: grouped expansion agrees with an independent scalar fixture interpreter;
+  pattern results agree with unchanged Tier 0 and regex. Instrumentation confirms
+  one predicate test per active state per consuming pass, not per count.
+
+### P2: multiword and unbounded domains
+
+- Add carry propagation, padding masks, and saturation; lift the one-word limit
+  only within total-word admission.
+- Test endpoints 63/64/65 and 127/128/129, and long saturated streams.
+- Gate: scalar transfer/property tests and boundary patterns pass; no capacity
+  growth after preparation. Raised limits in experiments are explicitly recorded.
+
+### P3: assertions using raw replay
+
+- Implement Section 5 in full, using the existing assertion evaluator.
+- Enable all existing assertion kinds only after differential coverage, including
+  body assertions, chains, and split CRLF. Keep the zero-width-cycle rejection.
+- This is a mandatory milestone before production selection, not an optional
+  assertion wrapper around a finished consuming engine.
+- Test the full evaluator truth/stability contract using `AssertKind::ALL`.
+  New kinds must fail the reviewed coverage gate until their boundary requirements
+  and provisional-pass behavior have been checked.
+- Gate: prefix ismatch and finish agree across all cuts of small inputs and
+  randomized larger chunks. Use the unchanged NFA's unfinished-stream ismatch
+  as the prefix oracle: `regex.is_match(prefix)` treats the prefix as complete
+  input and is not equivalent. Test Fail-before-EOI as well as Defer cases.
+- Also compare to an independent scalar parked-assertion model; do not give both
+  models the same scheduler. Use the regex crate for final whole-input results.
+  Resolve oracle disagreements before enabling a class rather than copying a
+  suspected oracle error into the design.
+- Run the assertion-specific gate below with forced counters and default
+  compilation. Report graphs executed separately from graphs rejected by admission.
+
+### P4: tools, differential coverage, and deployment evaluation
+
+- Add explicit `--grouped-nfa` selection to match/dump/info and checking commands;
+  reject simultaneous `--tier`. Existing default dispatch remains unchanged.
+- Introduce a checker backend selector (`Tier(u8)` / `Grouped`) and update
+  execution, failures, shrink/reproduction, and coverage counts together.
+- Extend `test_all_tiers`, `test_generated`, proptests, and cargo-fuzz targets to
+  run grouped when admitted. Enumerating 0..=4 alone does not test this backend.
+- Preserve default memory assertions. Compile an additional opt-in Regex for
+  grouped checks under each existing unroll/merge regime; confirm that its NFA
+  is otherwise identical. Test plan accounting explicitly.
+- Extend the probe with grouped execution, true cold setup, allocation counts,
+  operation counters, and interleaved streams with shared worker scratch.
+- Gate: reproducible results for the matrix below, including rejections and
+  scratch reuse across plans. No silent backend omission in test summaries.
+
+### P5: production selection decision
+
+Require a meaningful workload win against the fastest relevant existing path
+without unacceptable memory, latency, compilation, or coverage regressions.
+Compare external engines on matched semantics. Correctness alone does not justify
+changing default dispatch or replacing the independent reference.
+
+Sparse compression, prefilters, bit-parallel control, and cyclic closure are
+follow-up decisions. They are not prerequisites for completing P0–P4.
+
+## 8. Test and measurement matrix
+
+Pattern regressions belong in `match_tests!`; never set `unroll_limit: 0` in
+entries. Existing reruns force counters. Structural and bitset mechanism tests
+belong in the new module.
+
+| Pattern / family | Required observation |
+|---|---|
+| `x(a\|aa){2,5}z` | Multiple counts at one state; consuming prefix |
+| `\Ax(a\|aaa){3}z\z` | `xaaaz` matches, `xaaaaz` does not; preserve holes |
+| `\A(a\|aa){2}b(a\|aa){2}\z` | Sequential scopes remain distinct |
+| `(a{2,3}b)*c` | Exit before ordinary-star reentry |
+| `a{0,2}b` | Outside bypass and active loop |
+| `x(ab*){2,5}z` | Variable/nonnullable body despite zero length metadata |
+| `x(ab\|cd\|ef){2,5}z` | ByteTable and all destinations |
+| `a{2,5}b` with default unrolling | Consuming out_exit edges |
+| `a{63}b`, `a{64}b`, `a{65}b` | Staged eligibility and word boundaries |
+| `a{2,}b` | Finite saturated domain on long streams |
+| `\Ax(a\|aa){2}\z` | EOI replay without duplicate increments |
+| `\b(a\|aa){2,5}\b` | Next-byte resolution across chunks |
+| `(?mR:^)(a\|aa){2,5}(?mR:$)` | CRLF behavior after assertion milestone |
+| `x(a?){2,5}z` with counters forced | Nullable-body/cycle rejection |
+| `x((a\|aa){2,3}){2,3}z` with counters forced | Nested rejection |
+
+Exercise every assertion kind, bytes 0x00/0xff/CR/LF and word transitions,
+positive/negative and early/late outcomes, every cut on short inputs, empty
+chunks, random large chunks, fresh/reused state, and interleaved streams.
+Admission tests cover below/at/above each limit. Direct transfer unit tests
+compare all small subsets to scalar counter_step and randomized multiword sets.
+
+### Assertion-specific release gate
+
+These are required behaviors, not results from an implemented grouped backend.
+`/` separates chunk calls in the input column. Check ismatch after construction
+and every call, including inserted empty calls; check finish separately.
+
+| Hazard | Pattern and input | Required behavior |
+|---|---|---|
+| Absolute EOI | `\Aa{2}\z`, `aa` | false until finish, then true |
+| Failed EOI must not migrate | Same, `aa` / `b` | finish false |
+| Resolving byte feeds tail | `\Aa{2}\b!`, `aa` / `!` | false after aa; true after ! |
+| Negative word assertion | `\Aa{2}\Bz`, `aa` / `z` | true after z |
+| Failed boundary cannot revive | `\Aa{2}\b`, `aa` / `b` / `!` | remains false, including finish |
+| Assertion before CInc | `\Ax(a\B){2}z\z` | xaaz true at finish; xaz false |
+| Optional bypass independent | `\Ax(a\b){0,2}z\z` | xz true; xaz false |
+| Exit gates downstream CI | `\Ax(a\|aa){2}\Bz{2}\z` | xaazz true; xaaz false |
+| EOI opens a chain | `a{2}\z\b` | aa true only at finish; aab false |
+| Contradictory chain | `a{2}\b\B` | aa and aa! both false |
+| Empty EOI chain | `\z\B` versus `\z\b`, empty stream | first true only at finish; second false |
+| CR start needs lookahead | `\A\r(?mR:^)a` | CR / a true; CR / LF / a false |
+| No interior CRLF end | `\A\r(?mR:$)\n` | CR / LF false; LF-only variant `(?m:$)` true |
+| EOI resolves CR start | `\A\r(?mR:^)`, CR | false provisionally, true at finish; adding LF instead fails |
+| EOI cannot consume | `\Aa{2}\z\x00` | aa and aa-NUL false; `\Aa{2}\x00\z` matches aa-NUL |
+| Guarded/unconditional convergence | `\A(?:a{2}\b\|a{2})!\z` | aa! true; a failed alternative must not poison a valid one |
+| Assertion-only counted body | `(?:\b){2,3}` with counters forced | reject zero-width cycle rather than deferring indefinitely |
+
+Generate all ordered assertion-kind pairs at body, entry, exit, and tail
+positions, including contradictions. Exercise all ten kinds with word/nonword,
+NUL, 0xff, CR, LF, and finite/saturated count domains. Add graph fixtures for
+shared tails and guarded bypasses that HIR normalization might erase.
+
+Run whole, bytewise, every partition of short inputs, and empty calls around
+all data calls. Separately finish at every prefix on a fresh stream. Interleave
+streams with different prev-byte categories through one scratch. Assert that
+provisional closure leaves raw rows and boundary metadata unchanged and that
+only consumption replaces raw with successors.
+
+Mutation checks on the independent model must detect old raw roots carried
+forward after consumption, incremented values written back to pre-increment
+roots, blocked roots discarded, prev changed before lookahead evaluation,
+omitted EOI replay, and EOI treated as a consuming sentinel. Do not require a
+test to reject a semantically valid alternative representation merely because
+it differs from this plan's storage invariant.
+
+Performance families: `a(a|aa){1,N}b`, `a.{N}b`, `(ab){1,N}c`,
+`x(a|aa|b){N/2,N}z`, and exact-count variants. Generate concrete bounds
+8/64/256/1000 with recorded compiler limits. Include sparse-start and counter-free
+controls to expose full-sweep overhead. Nested inputs measure rejection coverage
+and existing baselines, not grouped throughput.
+
+Report compile time/bytes, stream bytes, scratch high-water bytes, cold setup,
+reset, ns/byte, chunk-latency distributions, copy/hash work avoided, and set
+operation work. Include hundreds of rules and thousands of interleaved active
+and idle streams. Disable instrumentation for final throughput runs.
+
+Required implementation checks, not claimed executed for this document:
+
+```
+cargo fmt --check
+cargo clippy --all-targets -- -D clippy::all
+cargo test
+cargo test --release
+cargo build --release
+python3 scripts/bless_memory.py --check
+cargo test test_fuzz -- --ignored
+```
+
+Refresh memory assertions using a newly built release binary after adding Regex
+fields. Run differential sweeps and a recorded `fuzz --batch` range with explicit
+grouped coverage, plus matching/compile cargo-fuzz targets under repository
+resource controls. Run the hot-path performance gate against the unchanged base
+using isolated build directories, without switching another worktree's branch.
+Existing commands without grouped coverage cannot certify grouped execution.
+
+## 9. Optional sparse extension
+
+The [sparse paper](../research_notes/regex-matching-research-2020-2026/text/2026-ncma-berglund-sparse-counting-sets.md)
+separates exact grouping (Definition 12, Section 2.5) from sparse operations
+(Definition 16, Lemma 20, Corollary 21). Its active counted positions store positive
+counts; outside positions and the initial configuration use zero. Thompson CI
+seeds zero and CInc follows body completion. Its guarantee
+is for prescribed operations, not arbitrary integer-set manipulation.
+
+For bounds `[5,10]`, its example represents `{4,5,6,7,8,9,10}` by `{4,10}`.
+An unrelated `<=7` mask followed by a `[5,10]` check distinguishes those sets.
+Sparse sets therefore cannot implement the exact bitset interface by silently
+deleting values. Representatives can also disappear on sparse merge, invalidating
+a naive monotone `new minus seen` worklist. Our topological schedule avoids that
+worklist issue but does not establish transfer compatibility by itself.
+
+Start a sparse extension when measurements identify domain width or merging as
+a remaining bottleneck, or admission results show important patterns excluded
+by exact stream-state costs. The latter cannot be timed on the rejected exact
+backend; compare its estimated costs and existing admitted backends. Require:
+
+1. A mapping from the admitted Thompson operations/zero-based convention to
+   the paper's model, or a verified position-CA intermediate form.
+2. An observation-preserving invariant distinct from exact reachability.
+3. Proofs for reset, increment, exit, merge, assertion replay, and saturation.
+4. Compile-time representative/storage bounds and fresh end-to-end measurements.
+
+Keep exact grouped execution as an oracle and competitor. **The exact grouped
+NFA is complete without this extension.**
