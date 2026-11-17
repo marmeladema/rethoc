@@ -81,8 +81,8 @@ use super::{DfaCache, DfaMemory, DfaStateId};
 /// `state.0 * stride + byte_class`, where `stride` is the number
 /// of byte equivalence classes ([`Regex::num_byte_classes`]).
 /// Unpopulated slots contain `DfaStateId::UNPOPULATED`.  When the
-/// state count reaches [`DFA_MAX_STATES`], new states are no longer
-/// interned — the transition falls back to recomputing without caching.
+/// state count reaches the cap, the cache is emptied and refilled on
+/// demand (see [`DfaCache`]); answers do not depend on what is cached.
 ///
 /// The cache is **persisted across `matcher()` calls** for the same
 /// `Regex`.  A unique regex ID detects when a different regex is used
@@ -99,6 +99,8 @@ impl fmt::Debug for Tier1DfaCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Tier1DfaCache")
             .field("num_states", &self.inner.states.len())
+            .field("max_states", &self.inner.max_states)
+            .field("evictions", &self.inner.evictions)
             .finish()
     }
 }
@@ -112,9 +114,50 @@ impl Tier1DfaCache {
         }
     }
 
+    /// Set the state cap (see [`DfaCache::set_max_states`]).
+    pub(crate) fn set_max_states(&mut self, max_states: usize) {
+        self.inner.set_max_states(max_states);
+    }
+
+    /// Number of times the cache was emptied because it was full.
+    #[cfg(test)]
+    pub(crate) fn evictions(&self) -> u64 {
+        self.inner.evictions
+    }
+
+    /// The state cap in effect.
+    #[cfg(test)]
+    pub(crate) fn max_states(&self) -> usize {
+        self.inner.max_states
+    }
+
+    /// Make room for the state a missing transition out of `from` can
+    /// add: when the cache is full, empty it and put `from` back.
+    /// Returns the id `from` has afterwards.
+    #[inline]
+    fn make_room(&mut self, from: DfaStateId) -> DfaStateId {
+        if self.inner.has_room(1) {
+            from
+        } else {
+            self.evict(from)
+        }
+    }
+
+    #[cold]
+    fn evict(&mut self, from: DfaStateId) -> DfaStateId {
+        let stride = self.stride;
+        let mut keep = [from];
+        self.transitions.clear();
+        self.inner.evict(&mut keep, || {
+            self.transitions
+                .extend(std::iter::repeat_n(DfaStateId::UNPOPULATED, stride));
+        });
+        keep[0]
+    }
+
     /// Look up or insert a DFA state for the given sorted NFA state set.
-    /// Returns `None` if the state cap ([`DFA_MAX_STATES`]) has been reached
-    /// and the state is not already interned.
+    /// Callers make room first ([`make_room`](Self::make_room)), so the
+    /// state always fits.
     fn intern_state(
         &mut self,
         nfa_states: &[StateIdx],
@@ -122,19 +165,21 @@ impl Tier1DfaCache {
         is_match: bool,
         is_match_at_end: bool,
         prev_was_word: bool,
-    ) -> Option<DfaStateId> {
+    ) -> DfaStateId {
         let stride = self.stride;
-        self.inner.intern_state(
-            nfa_states,
-            deferred_asserts,
-            is_match,
-            is_match_at_end,
-            prev_was_word,
-            || {
-                self.transitions
-                    .extend(std::iter::repeat_n(DfaStateId::UNPOPULATED, stride));
-            },
-        )
+        self.inner
+            .intern_state(
+                nfa_states,
+                deferred_asserts,
+                is_match,
+                is_match_at_end,
+                prev_was_word,
+                || {
+                    self.transitions
+                        .extend(std::iter::repeat_n(DfaStateId::UNPOPULATED, stride));
+                },
+            )
+            .expect("DFA state cap reached although room was made")
     }
 
     /// Compute the epsilon closure from a set of NFA seed states.
@@ -189,9 +234,7 @@ impl Tier1DfaCache {
         if cached != DfaStateId::UNPOPULATED {
             return cached;
         }
-        let to = self.populate(memory, from, byte, regex);
-        self.transitions[slot] = to;
-        to
+        self.transition_miss(memory, from, byte, class, regex)
     }
 
     /// Compute the DFA transition for `(from_state, byte)`, using the
@@ -212,8 +255,26 @@ impl Tier1DfaCache {
         if cached != DfaStateId::UNPOPULATED {
             return cached;
         }
+        self.transition_miss(memory, from, byte, byte as usize, regex)
+    }
+
+    /// Cache miss: compute the transition out of `from` on `byte` (whose
+    /// column in the table is `class`) and store it.  Kept out of line so
+    /// the lookup above stays small.
+    #[cold]
+    #[inline(never)]
+    fn transition_miss(
+        &mut self,
+        memory: &mut DfaMemory,
+        from: DfaStateId,
+        byte: u8,
+        class: usize,
+        regex: &Regex,
+    ) -> DfaStateId {
+        // `from` gets a new id if the cache has to be emptied.
+        let from = self.make_room(from);
         let to = self.populate(memory, from, byte, regex);
-        self.transitions[slot] = to;
+        self.transitions[from.idx() * self.stride + class] = to;
         to
     }
 
@@ -226,6 +287,7 @@ impl Tier1DfaCache {
         byte: u8,
         regex: &Regex,
     ) -> DfaStateId {
+        self.make_room(DfaStateId::DEAD);
         self.populate(memory, DfaStateId::DEAD, byte, regex)
     }
 
@@ -343,9 +405,13 @@ impl Tier1DfaCache {
                     } else {
                         is_word_byte(byte)
                     };
-                    return self
-                        .intern_state(&memory.closure_result, &memory.closure_deferred, m, mae, pw)
-                        .unwrap_or(DfaStateId::DEAD);
+                    return self.intern_state(
+                        &memory.closure_result,
+                        &memory.closure_deferred,
+                        m,
+                        mae,
+                        pw,
+                    );
                 }
 
                 let seeds = targets.into_iter().chain(std::iter::once(regex.start));
@@ -364,9 +430,13 @@ impl Tier1DfaCache {
                 } else {
                     is_word_byte(byte)
                 };
-                return self
-                    .intern_state(&memory.closure_result, &memory.closure_deferred, m, mae, pw)
-                    .unwrap_or(DfaStateId::DEAD);
+                return self.intern_state(
+                    &memory.closure_result,
+                    &memory.closure_deferred,
+                    m,
+                    mae,
+                    pw,
+                );
             }
 
             // No deferred assertions to resolve — fast path (Phase 2 only).
@@ -398,15 +468,13 @@ impl Tier1DfaCache {
             } else {
                 is_word_byte(byte)
             };
-            return self
-                .intern_state(
-                    &memory.closure_result,
-                    &memory.closure_deferred,
-                    is_match,
-                    is_match_at_end,
-                    pw,
-                )
-                .unwrap_or(DfaStateId::DEAD);
+            return self.intern_state(
+                &memory.closure_result,
+                &memory.closure_deferred,
+                is_match,
+                is_match_at_end,
+                pw,
+            );
         }
 
         let seeds = targets.into_iter().chain(std::iter::once(regex.start));
@@ -433,7 +501,6 @@ impl Tier1DfaCache {
             is_match_at_end,
             pw,
         )
-        .unwrap_or(DfaStateId::DEAD)
     }
 
     /// Reset the cache for reuse with a new regex.
@@ -467,15 +534,13 @@ impl Tier1DfaCache {
             None,
         );
         let pw = false; // At start, prev is always non-word.
-        self.inner.start_id = self
-            .intern_state(
-                &memory.closure_result,
-                &memory.closure_deferred,
-                is_match,
-                is_match_at_end,
-                pw,
-            )
-            .expect("start state exceeds DFA_MAX_STATES");
+        self.inner.start_id = self.intern_state(
+            &memory.closure_result,
+            &memory.closure_deferred,
+            is_match,
+            is_match_at_end,
+            pw,
+        );
         self.inner.start_is_match = self.inner.states[self.inner.start_id.idx()].is_match;
     }
 }
@@ -722,5 +787,47 @@ impl fmt::Display for DfaMatcher<'_> {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bug 64: emptying a full cache keeps the state the matcher stands
+    /// on and drops everything else.
+    #[test]
+    fn test_evict_keeps_the_given_state_and_empties_the_table() {
+        let re = Regex::new("a[ab]{3}c").unwrap();
+        assert!(re.dfa_eligible);
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier1DfaCache::new();
+        cache.prepare(&mut memory, &re);
+        let mut m = DfaMatcher::new(&mut cache, &mut memory, &re);
+        m.chunk(b"abab");
+        let current = m.current;
+        assert_ne!(current, DfaStateId::DEAD);
+        assert_ne!(current, cache.inner.start_id);
+        let state = cache.inner.states[current.idx()].clone();
+        let start = cache.inner.states[cache.inner.start_id.idx()].clone();
+        assert!(cache.inner.states.len() > 2);
+
+        let current = cache.evict(current);
+        assert_eq!(cache.inner.states[current.idx()], state);
+        assert_eq!(cache.inner.states[cache.inner.start_id.idx()], start);
+        assert_eq!(cache.inner.states.len(), 2);
+        assert_eq!(cache.transitions.len(), 2 * cache.stride);
+        assert!(
+            cache
+                .transitions
+                .iter()
+                .all(|&t| t == DfaStateId::UNPOPULATED)
+        );
+        assert_eq!(cache.evictions(), 1);
+
+        // The dead state has no entry to keep.
+        assert_eq!(cache.evict(DfaStateId::DEAD), DfaStateId::DEAD);
+        assert_eq!(cache.inner.states.len(), 1);
+        assert_eq!(cache.transitions.len(), cache.stride);
     }
 }

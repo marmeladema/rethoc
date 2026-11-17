@@ -40,9 +40,21 @@ pub(crate) use tier4::{Tier4DfaCache, Tier4DfaMatcher};
 
 use crate::{AssertEval, AssertKind, ByteMap, CounterIdx, Regex, State, StateIdx};
 
-/// Maximum number of DFA states before the flat transition table stops
-/// growing.  2048 states × stride entries × 4 bytes.
-const DFA_MAX_STATES: usize = 2048;
+/// Default number of DFA states a cache holds before it is emptied (see
+/// [`DfaCache::evict`]).  Bounds the flat transition table at
+/// 2048 states × stride entries.
+pub(crate) const DFA_MAX_STATES: usize = 2048;
+
+/// Most states a matcher holds at once and asks an eviction to keep
+/// (Tier 3: the current state, its no-break twin and the clean chain's).
+const MAX_KEPT_STATES: usize = 3;
+
+/// Smallest state cap a cache accepts: the start state, the
+/// [`MAX_KEPT_STATES`] states a matcher can hold, and the four states one
+/// input byte can add (two transitions with a break and a no-break
+/// successor each).  Tests run at this cap, where the cache is emptied
+/// every few bytes.
+pub(crate) const DFA_MIN_STATES: usize = 1 + MAX_KEPT_STATES + 4;
 
 // ---------------------------------------------------------------------------
 // DFA state table (shared by all tiers)
@@ -617,12 +629,28 @@ impl IdleStates {
     }
 }
 
+/// The DFA state table shared by Tiers 1–3.
+///
+/// This is a **cache** of a function that can always be recomputed: which
+/// DFA state follows from a state and a byte.  Entries may be dropped at
+/// any time without changing an answer.  When the table is full it is
+/// emptied ([`evict`](Self::evict)) and refilled on demand; a matcher
+/// never trades a state it cannot store for another one.
+///
+/// The protocol, for every tier: before computing a missing transition,
+/// the matcher checks [`has_room`](Self::has_room) for the states that
+/// computation can add, and evicts if there is none.  Interning then
+/// cannot fail.
 struct DfaCache {
     states: IndexSet<DfaState, ahash::RandomState>,
     regex_id: u64,
     start_id: DfaStateId,
     start_is_match: bool,
     start_is_match_at_end: bool,
+    /// State cap; at least [`DFA_MIN_STATES`].
+    max_states: usize,
+    /// Number of times the table was emptied because it was full.
+    evictions: u64,
 }
 
 impl DfaCache {
@@ -633,12 +661,91 @@ impl DfaCache {
             start_id: DfaStateId::DEAD,
             start_is_match: false,
             start_is_match_at_end: false,
+            max_states: DFA_MAX_STATES,
+            evictions: 0,
+        }
+    }
+
+    /// Set the state cap (raised to [`DFA_MIN_STATES`] if lower).  Takes
+    /// effect at the next missing transition; never changes an answer.
+    fn set_max_states(&mut self, max_states: usize) {
+        self.max_states = max_states.max(DFA_MIN_STATES);
+    }
+
+    /// Whether `n` more states fit under the cap.
+    #[inline]
+    fn has_room(&self, n: usize) -> bool {
+        self.states.len() + n <= self.max_states
+    }
+
+    /// Empty the state table, keeping only the start state and the states
+    /// in `keep` (at most [`MAX_KEPT_STATES`]), whose ids are rewritten in
+    /// place ([`DfaStateId::DEAD`] entries are left alone).  `new_row` is
+    /// called once per state that is put back, like the callback of
+    /// [`intern_state`](Self::intern_state); the caller must have cleared
+    /// every table indexed by state id beforehand.
+    ///
+    /// **The start state keeps its id.**  It is the first state interned
+    /// into an empty table, here as in `prepare`, so it is always state 0.
+    /// Matchers rely on this: they copy `start_id` once per chunk and
+    /// compare against it while the cache may be emptied under them.
+    ///
+    /// Every other [`DfaStateId`] is invalid afterwards.
+    ///
+    /// The kept states are moved, not copied, and the table keeps its
+    /// capacity: at a small cap this runs every few bytes.
+    #[cold]
+    fn evict(&mut self, keep: &mut [DfaStateId], mut new_row: impl FnMut()) {
+        debug_assert!(self.start_id != DfaStateId::DEAD, "cache not prepared");
+        debug_assert_eq!(self.start_id, DfaStateId(0), "the start state is state 0");
+        debug_assert!(keep.len() <= MAX_KEPT_STATES);
+        let start_idx = self.start_id.idx();
+        let mut old = [DfaStateId::DEAD; MAX_KEPT_STATES];
+        old[..keep.len()].copy_from_slice(keep);
+
+        // Take the wanted states out of the table while it is drained.
+        let mut start = None;
+        let mut kept: [Option<DfaState>; MAX_KEPT_STATES] = [const { None }; MAX_KEPT_STATES];
+        for (idx, state) in self.states.drain(..).enumerate() {
+            if idx == start_idx {
+                start = Some(state);
+            } else if let Some(k) = old
+                .iter()
+                .position(|id| *id != DfaStateId::DEAD && id.idx() == idx)
+            {
+                kept[k] = Some(state);
+            }
+        }
+        self.evictions += 1;
+
+        let start = start.expect("the start state is in the table");
+        let (idx, _) = self.states.insert_full(start);
+        new_row();
+        debug_assert_eq!(idx, start_idx, "the start state keeps its id");
+        self.start_id = DfaStateId(idx as u32);
+        for k in 0..keep.len() {
+            if old[k] == DfaStateId::DEAD {
+                continue;
+            }
+            keep[k] = if old[k].idx() == start_idx {
+                self.start_id
+            } else if let Some(first) = old[..k].iter().position(|id| *id == old[k]) {
+                // The same state asked for twice.
+                keep[first]
+            } else {
+                let state = kept[k].take().expect("a kept state is in the table");
+                let (idx, _) = self.states.insert_full(state);
+                new_row();
+                DfaStateId(idx as u32)
+            };
         }
     }
 
     /// Look up or insert a DFA state for the given sorted NFA state set.
-    /// Returns `None` if the state cap ([`DFA_MAX_STATES`]) has been reached
-    /// and the state is not already interned.
+    /// Returns `None` if the state cap has been reached and the state is
+    /// not already interned.  Matchers make room before computing a
+    /// transition, so for them `None` cannot happen; it is only a normal
+    /// outcome for optional extra states (Tier 2's settled states).
     ///
     /// Takes borrowed slices so that cache-hit probes (the common case)
     /// are zero-allocation.  A heap-allocated [`DfaState`] is only created
@@ -663,7 +770,7 @@ impl DfaCache {
         if let Some(idx) = self.states.get_index_of(&probe) {
             return Some(DfaStateId(idx as u32));
         }
-        if self.states.len() >= DFA_MAX_STATES {
+        if self.states.len() >= self.max_states {
             return None;
         }
         let state = DfaState {
@@ -686,6 +793,7 @@ impl DfaCache {
         self.start_id = DfaStateId::DEAD;
         self.start_is_match = false;
         self.start_is_match_at_end = false;
+        self.evictions = 0;
     }
 }
 
@@ -1206,6 +1314,97 @@ mod tests {
         assert_eq!(
             set.get_index_of(&make_ref(&nfa2, &[], true, false, false)),
             None
+        );
+    }
+
+    // ── Cache eviction (Bug 64) ──
+
+    /// A cache holding the states `[0]` (the start state), `[1]`, … `[n-1]`.
+    fn cache_with_states(n: u32) -> DfaCache {
+        let mut cache = DfaCache::new();
+        for i in 0..n {
+            let id = cache
+                .intern_state(&[StateIdx(i)], &[], false, false, false, || {})
+                .expect("room");
+            assert_eq!(id, DfaStateId(i));
+        }
+        cache.start_id = DfaStateId(0);
+        cache
+    }
+
+    #[test]
+    fn test_state_cap_has_a_minimum() {
+        let mut cache = DfaCache::new();
+        assert_eq!(cache.max_states, DFA_MAX_STATES);
+        cache.set_max_states(0);
+        assert_eq!(cache.max_states, DFA_MIN_STATES);
+        cache.set_max_states(100);
+        assert_eq!(cache.max_states, 100);
+    }
+
+    #[test]
+    fn test_intern_refuses_new_states_at_the_cap_but_finds_old_ones() {
+        let mut cache = cache_with_states(DFA_MIN_STATES as u32);
+        cache.set_max_states(DFA_MIN_STATES);
+        assert!(cache.has_room(0));
+        assert!(!cache.has_room(1));
+        let mut rows = 0;
+        assert_eq!(
+            cache.intern_state(&[StateIdx(99)], &[], false, false, false, || rows += 1),
+            None
+        );
+        assert_eq!(
+            cache.intern_state(&[StateIdx(3)], &[], false, false, false, || rows += 1),
+            Some(DfaStateId(3))
+        );
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn test_evict_keeps_start_and_requested_states() {
+        let mut cache = cache_with_states(6);
+        let mut keep = [DfaStateId(4), DfaStateId::DEAD, DfaStateId(2)];
+        let mut rows = 0;
+        cache.evict(&mut keep, || rows += 1);
+
+        // Start state first, then the kept ones in order; DEAD is left alone.
+        assert_eq!(cache.start_id, DfaStateId(0));
+        assert_eq!(keep, [DfaStateId(1), DfaStateId::DEAD, DfaStateId(2)]);
+        assert_eq!(cache.states.len(), 3);
+        assert_eq!(rows, 3, "one transition row per state put back");
+        assert_eq!(cache.evictions, 1);
+        assert_eq!(cache.states[0], make_state(&[0], &[], false, false, false));
+        assert_eq!(cache.states[1], make_state(&[4], &[], false, false, false));
+        assert_eq!(cache.states[2], make_state(&[2], &[], false, false, false));
+        assert!(cache.has_room(DFA_MIN_STATES - 3));
+    }
+
+    #[test]
+    fn test_evict_maps_repeated_and_start_ids_to_one_state() {
+        let mut cache = cache_with_states(5);
+        // The same state twice, and the start state itself.
+        let mut keep = [DfaStateId(3), DfaStateId(0), DfaStateId(3)];
+        let mut rows = 0;
+        cache.evict(&mut keep, || rows += 1);
+        assert_eq!(keep, [DfaStateId(1), DfaStateId(0), DfaStateId(1)]);
+        assert_eq!(cache.states.len(), 2);
+        assert_eq!(rows, 2);
+    }
+
+    #[test]
+    fn test_evict_preserves_state_flags() {
+        let mut cache = DfaCache::new();
+        cache.start_id = cache
+            .intern_state(&[StateIdx(0)], &[], false, false, false, || {})
+            .unwrap();
+        let flagged = cache
+            .intern_state(&[StateIdx(1)], &[StateIdx(7)], true, true, true, || {})
+            .unwrap();
+        let mut keep = [flagged];
+        cache.evict(&mut keep, || {});
+        assert_eq!(
+            cache.states[keep[0].idx()],
+            make_state(&[1], &[7], true, true, true)
         );
     }
 }

@@ -3497,9 +3497,30 @@ pub struct MatcherMemory {
     tier4_cache: Option<Tier4DfaCache>,
     /// Counter pool for the counting DFA (separate from NFA's pool).
     counting_pool: CounterPool,
+    /// State cap for the DFA caches of tiers 1–3; `None` is the default
+    /// ([`dfa::DFA_MAX_STATES`]).  See
+    /// [`set_dfa_state_cap`](Self::set_dfa_state_cap).
+    dfa_state_cap: Option<usize>,
 }
 
 impl MatcherMemory {
+    /// Set how many DFA states the caches of tiers 1–3 hold before they
+    /// are emptied and refilled; `None` restores the default.  Values
+    /// below the engine's minimum are raised to it.  This trades speed
+    /// for memory and never changes a match result; the differential
+    /// tools and tests use a tiny cap to exercise cache eviction on every
+    /// input.
+    #[doc(hidden)]
+    pub fn set_dfa_state_cap(&mut self, states: Option<usize>) {
+        self.dfa_state_cap = states;
+    }
+
+    /// The state cap to give a DFA cache before it is used.
+    #[inline]
+    fn dfa_state_cap(&self) -> usize {
+        self.dfa_state_cap.unwrap_or(dfa::DFA_MAX_STATES)
+    }
+
     /// Create a matcher for the given regex.
     ///
     /// Returns an [`AnyMatcher`] that transparently dispatches to the
@@ -3508,7 +3529,9 @@ impl MatcherMemory {
     pub fn matcher<'a>(&'a mut self, regex: &'a Regex) -> AnyMatcher<'a> {
         if regex.dfa_eligible {
             // Tier 1: pure DFA (no counters, simple assertions).
+            let cap = self.dfa_state_cap();
             let cache = self.dfa_cache.get_or_insert_with(Tier1DfaCache::new);
+            cache.set_max_states(cap);
             cache.prepare(&mut self.dfa_memory, regex);
             let dfa = DfaMatcher::new(cache, &mut self.dfa_memory, regex);
             AnyMatcher::Dfa(dfa)
@@ -3518,7 +3541,9 @@ impl MatcherMemory {
                 .tier2_analysis
                 .as_ref()
                 .expect("tier2_analysis must be present for tier 2 patterns");
+            let cap = self.dfa_state_cap();
             let cache = self.tier2_cache.get_or_insert_with(Tier2DfaCache::new);
+            cache.set_max_states(cap);
             cache.prepare(&mut self.dfa_memory, regex, analysis);
             let dfa = Tier2DfaMatcher::new(cache, &mut self.dfa_memory, regex, analysis);
             AnyMatcher::Tier2Dfa(dfa)
@@ -3528,7 +3553,9 @@ impl MatcherMemory {
                 .tier3_analysis
                 .as_ref()
                 .expect("tier3_analysis must be present for tier 3 patterns");
+            let cap = self.dfa_state_cap();
             let cache = self.tier3_cache.get_or_insert_with(Tier3DfaCache::new);
+            cache.set_max_states(cap);
             cache.prepare(&mut self.dfa_memory, regex, analysis);
             let dfa = Tier3DfaMatcher::new(cache, &mut self.dfa_memory, regex, analysis);
             AnyMatcher::Tier3Dfa(dfa)
@@ -3565,7 +3592,9 @@ impl MatcherMemory {
                 if !regex.dfa_eligible {
                     return Err("pattern is not eligible for tier 1 (pure DFA)".into());
                 }
+                let cap = self.dfa_state_cap();
                 let cache = self.dfa_cache.get_or_insert_with(Tier1DfaCache::new);
+                cache.set_max_states(cap);
                 cache.prepare(&mut self.dfa_memory, regex);
                 let dfa = DfaMatcher::new(cache, &mut self.dfa_memory, regex);
                 Ok(AnyMatcher::Dfa(dfa))
@@ -3580,7 +3609,9 @@ impl MatcherMemory {
                     .tier2_analysis
                     .as_ref()
                     .expect("tier2_analysis must be present for tier 2 patterns");
+                let cap = self.dfa_state_cap();
                 let cache = self.tier2_cache.get_or_insert_with(Tier2DfaCache::new);
+                cache.set_max_states(cap);
                 cache.prepare(&mut self.dfa_memory, regex, analysis);
                 let dfa = Tier2DfaMatcher::new(cache, &mut self.dfa_memory, regex, analysis);
                 Ok(AnyMatcher::Tier2Dfa(dfa))
@@ -3595,7 +3626,9 @@ impl MatcherMemory {
                     .tier3_analysis
                     .as_ref()
                     .expect("tier3_analysis must be present for tier 3 patterns");
+                let cap = self.dfa_state_cap();
                 let cache = self.tier3_cache.get_or_insert_with(Tier3DfaCache::new);
+                cache.set_max_states(cap);
                 cache.prepare(&mut self.dfa_memory, regex, analysis);
                 let dfa = Tier3DfaMatcher::new(cache, &mut self.dfa_memory, regex, analysis);
                 Ok(AnyMatcher::Tier3Dfa(dfa))
@@ -5012,90 +5045,107 @@ mod tests {
         );
     }
 
-    /// Test a pattern+input via Tier 1 DFA (full-chunk + byte-at-a-time).
+    /// The DFA state caps the tier 1–3 helpers run at: the default, and
+    /// the minimum, where the cache is emptied every few bytes.  A result
+    /// must not depend on what is cached (Bug 64).
+    const TEST_STATE_CAPS: [usize; 2] = [crate::dfa::DFA_MAX_STATES, crate::dfa::DFA_MIN_STATES];
+
+    /// Test a pattern+input via Tier 1 DFA (full-chunk + byte-at-a-time),
+    /// at each of [`TEST_STATE_CAPS`].
     fn test_tier1(pattern: &str, re: &Regex, input: &str, expected: bool, config: &str) {
         use crate::dfa::{DfaMatcher, DfaMemory, Tier1DfaCache};
-        let mut memory = DfaMemory::default();
-        let mut cache = Tier1DfaCache::new();
-        cache.prepare(&mut memory, re);
-        let mut d = DfaMatcher::new(&mut cache, &mut memory, re);
-        d.chunk(input.as_bytes());
-        let actual = d.finish();
-        assert_eq!(
-            actual, expected,
-            "Tier1 chunk mismatch for `{}` on {:?} ({}): got={}, expected={}",
-            pattern, input, config, actual, expected
-        );
-        let mut d = DfaMatcher::new(&mut cache, &mut memory, re);
-        for &b in input.as_bytes() {
-            d.chunk(&[b]);
+        for cap in TEST_STATE_CAPS {
+            let mut memory = DfaMemory::default();
+            let mut cache = Tier1DfaCache::new();
+            cache.set_max_states(cap);
+            cache.prepare(&mut memory, re);
+            let mut d = DfaMatcher::new(&mut cache, &mut memory, re);
+            d.chunk(input.as_bytes());
+            let actual = d.finish();
+            assert_eq!(
+                actual, expected,
+                "Tier1 chunk mismatch for `{}` on {:?} ({}, state cap {}): got={}, expected={}",
+                pattern, input, config, cap, actual, expected
+            );
+            let mut d = DfaMatcher::new(&mut cache, &mut memory, re);
+            for &b in input.as_bytes() {
+                d.chunk(&[b]);
+            }
+            let actual = d.finish();
+            assert_eq!(
+                actual, expected,
+                "Tier1 single-byte mismatch for `{}` on {:?} ({}, state cap {}): got={}, expected={}",
+                pattern, input, config, cap, actual, expected
+            );
         }
-        let actual = d.finish();
-        assert_eq!(
-            actual, expected,
-            "Tier1 single-byte mismatch for `{}` on {:?} ({}): got={}, expected={}",
-            pattern, input, config, actual, expected
-        );
     }
 
-    /// Test a pattern+input via Tier 2 DFA (full-chunk + byte-at-a-time).
+    /// Test a pattern+input via Tier 2 DFA (full-chunk + byte-at-a-time),
+    /// at each of [`TEST_STATE_CAPS`].
     fn test_tier2(pattern: &str, re: &Regex, input: &str, expected: bool, config: &str) {
         use crate::dfa::{DfaMemory, Tier2DfaCache, Tier2DfaMatcher};
         let analysis = re
             .tier2_analysis
             .as_ref()
-            .expect("tier2_analysis must be present for tier 2 test");
-        let mut memory = DfaMemory::default();
-        let mut cache = Tier2DfaCache::new();
-        cache.prepare(&mut memory, re, analysis);
-        let mut d = Tier2DfaMatcher::new(&mut cache, &mut memory, re, analysis);
-        d.chunk(input.as_bytes());
-        let actual = d.finish();
-        assert_eq!(
-            actual, expected,
-            "Tier2 chunk mismatch for `{}` on {:?} ({}): got={}, expected={}",
-            pattern, input, config, actual, expected
-        );
-        let mut d = Tier2DfaMatcher::new(&mut cache, &mut memory, re, analysis);
-        for &b in input.as_bytes() {
-            d.chunk(&[b]);
+            .expect("tier2_analysis must be present for tier 2 patterns");
+        for cap in TEST_STATE_CAPS {
+            let mut memory = DfaMemory::default();
+            let mut cache = Tier2DfaCache::new();
+            cache.set_max_states(cap);
+            cache.prepare(&mut memory, re, analysis);
+            let mut d = Tier2DfaMatcher::new(&mut cache, &mut memory, re, analysis);
+            d.chunk(input.as_bytes());
+            let actual = d.finish();
+            assert_eq!(
+                actual, expected,
+                "Tier2 chunk mismatch for `{}` on {:?} ({}, state cap {}): got={}, expected={}",
+                pattern, input, config, cap, actual, expected
+            );
+            let mut d = Tier2DfaMatcher::new(&mut cache, &mut memory, re, analysis);
+            for &b in input.as_bytes() {
+                d.chunk(&[b]);
+            }
+            let actual = d.finish();
+            assert_eq!(
+                actual, expected,
+                "Tier2 single-byte mismatch for `{}` on {:?} ({}, state cap {}): got={}, expected={}",
+                pattern, input, config, cap, actual, expected
+            );
         }
-        let actual = d.finish();
-        assert_eq!(
-            actual, expected,
-            "Tier2 single-byte mismatch for `{}` on {:?} ({}): got={}, expected={}",
-            pattern, input, config, actual, expected
-        );
     }
 
-    /// Test a pattern+input via Tier 3 DFA (full-chunk + byte-at-a-time).
+    /// Test a pattern+input via Tier 3 DFA (full-chunk + byte-at-a-time),
+    /// at each of [`TEST_STATE_CAPS`].
     fn test_tier3(pattern: &str, re: &Regex, input: &str, expected: bool, config: &str) {
         use crate::dfa::{DfaMemory, Tier3DfaCache, Tier3DfaMatcher};
         let analysis = re
             .tier3_analysis
             .as_ref()
-            .expect("tier3_analysis must be present for tier 3 test");
-        let mut memory = DfaMemory::default();
-        let mut cache = Tier3DfaCache::new();
-        cache.prepare(&mut memory, re, analysis);
-        let mut d = Tier3DfaMatcher::new(&mut cache, &mut memory, re, analysis);
-        d.chunk(input.as_bytes());
-        let actual = d.finish();
-        assert_eq!(
-            actual, expected,
-            "Tier3 chunk mismatch for `{}` on {:?} ({}): got={}, expected={}",
-            pattern, input, config, actual, expected
-        );
-        let mut d = Tier3DfaMatcher::new(&mut cache, &mut memory, re, analysis);
-        for &b in input.as_bytes() {
-            d.chunk(&[b]);
+            .expect("tier3_analysis must be present for tier 3 patterns");
+        for cap in TEST_STATE_CAPS {
+            let mut memory = DfaMemory::default();
+            let mut cache = Tier3DfaCache::new();
+            cache.set_max_states(cap);
+            cache.prepare(&mut memory, re, analysis);
+            let mut d = Tier3DfaMatcher::new(&mut cache, &mut memory, re, analysis);
+            d.chunk(input.as_bytes());
+            let actual = d.finish();
+            assert_eq!(
+                actual, expected,
+                "Tier3 chunk mismatch for `{}` on {:?} ({}, state cap {}): got={}, expected={}",
+                pattern, input, config, cap, actual, expected
+            );
+            let mut d = Tier3DfaMatcher::new(&mut cache, &mut memory, re, analysis);
+            for &b in input.as_bytes() {
+                d.chunk(&[b]);
+            }
+            let actual = d.finish();
+            assert_eq!(
+                actual, expected,
+                "Tier3 single-byte mismatch for `{}` on {:?} ({}, state cap {}): got={}, expected={}",
+                pattern, input, config, cap, actual, expected
+            );
         }
-        let actual = d.finish();
-        assert_eq!(
-            actual, expected,
-            "Tier3 single-byte mismatch for `{}` on {:?} ({}): got={}, expected={}",
-            pattern, input, config, actual, expected
-        );
     }
 
     /// Test a pattern+input via Tier 4 DFA (full-chunk + byte-at-a-time).
@@ -13326,6 +13376,117 @@ mod tests {
                 ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabaac", true),
                 ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaababc", true),
             ],
+        }
+    }
+
+    /// Every 12-letter word over `a`/`b`, concatenated: 49 KB that take a
+    /// pattern like `a[ab]{12}c` through more DFA states than a cache
+    /// holds.
+    fn every_ab_word_of_length_12() -> Vec<u8> {
+        let mut out = Vec::with_capacity(4096 * 12);
+        for word in 0..4096u32 {
+            for bit in (0..12).rev() {
+                out.push(if (word >> bit) & 1 == 1 { b'a' } else { b'b' });
+            }
+        }
+        out
+    }
+
+    /// Bug 64: a full DFA cache must not change an answer — neither for
+    /// the stream that filled it, nor for the next stream that reuses the
+    /// same `MatcherMemory`.  Default settings, tiers 1, 2 and 3.
+    #[test]
+    fn test_full_dfa_cache_does_not_change_answers() {
+        let filler = every_ab_word_of_length_12();
+        // (pattern, tier, tail that matches)
+        let cases: [(&str, u8, &[u8]); 3] = [
+            ("a[ab]{12}c", 1, b"abbbbbbbbbbbbc"),
+            (
+                "a[ab]{10}c[0-9]{40,60}",
+                2,
+                b"abbbbbbbbbbc777777777777777777777777777777777777777777777",
+            ),
+            (
+                "a[ab]{10}c(?:xy|z){40,60}q",
+                3,
+                b"abbbbbbbbbbczzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzq",
+            ),
+        ];
+        for (pattern, tier, tail) in cases {
+            let re = Regex::new(pattern).unwrap();
+            assert_eq!(compute_min_tier(&re), tier, "{pattern}");
+            let mut long = filler.clone();
+            long.extend_from_slice(tail);
+
+            let mut memory = MatcherMemory::default();
+            let run = |memory: &mut MatcherMemory, input: &[u8], bytewise: bool| {
+                let mut m = memory.matcher(&re);
+                if bytewise {
+                    for b in input {
+                        m.chunk(std::slice::from_ref(b));
+                    }
+                } else {
+                    m.chunk(input);
+                }
+                m.finish()
+            };
+            // The filler alone does not match, and fills the cache.
+            assert!(!run(&mut memory, &filler, false), "{pattern}: filler");
+            let evictions = match tier {
+                1 => memory.dfa_cache.as_ref().unwrap().evictions(),
+                2 => memory.tier2_cache.as_ref().unwrap().evictions(),
+                _ => memory.tier3_cache.as_ref().unwrap().evictions(),
+            };
+            assert!(
+                evictions > 0,
+                "{pattern}: the filler must overflow the cache"
+            );
+            // A later stream on the same memory is not affected.
+            assert!(
+                run(&mut memory, tail, false),
+                "{pattern}: tail after filler"
+            );
+            // Nor is the match that comes after the cache filled up.
+            assert!(run(&mut memory, &long, false), "{pattern}: whole");
+            assert!(run(&mut memory, &long, true), "{pattern}: byte by byte");
+            assert!(
+                run(&mut memory, tail, true),
+                "{pattern}: tail, byte by byte"
+            );
+        }
+    }
+
+    /// The state cap can be changed on a `MatcherMemory` at any time,
+    /// including between two uses of an already filled cache.
+    #[test]
+    fn test_dfa_state_cap_setting_never_changes_answers() {
+        let filler = every_ab_word_of_length_12();
+        let re = Regex::new("a[ab]{6}c").unwrap();
+        let mut input = filler[..6000].to_vec();
+        input.extend_from_slice(b"abababac");
+        let mut memory = MatcherMemory::default();
+        let caps = [
+            Some(usize::MAX),
+            Some(0),
+            Some(1),
+            Some(8),
+            Some(9),
+            Some(50),
+            None,
+            Some(0),
+        ];
+        for cap in caps {
+            memory.set_dfa_state_cap(cap);
+            let mut m = memory.matcher(&re);
+            m.chunk(&input);
+            assert!(m.finish(), "cap {cap:?}");
+            let mut m = memory.matcher(&re);
+            m.chunk(&filler[..6000]);
+            assert!(!m.finish(), "cap {cap:?}: filler only");
+            let want = cap.map_or(crate::dfa::DFA_MAX_STATES, |c| {
+                c.max(crate::dfa::DFA_MIN_STATES)
+            });
+            assert_eq!(memory.dfa_cache.as_ref().unwrap().max_states(), want);
         }
     }
 

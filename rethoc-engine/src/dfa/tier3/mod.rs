@@ -1657,6 +1657,8 @@ impl fmt::Debug for Tier3DfaCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Tier3DfaCache")
             .field("num_states", &self.inner.states.len())
+            .field("max_states", &self.inner.max_states)
+            .field("evictions", &self.inner.evictions)
             .finish()
     }
 }
@@ -1672,6 +1674,39 @@ impl Tier3DfaCache {
         }
     }
 
+    /// Set the state cap (see [`DfaCache::set_max_states`]).
+    pub(crate) fn set_max_states(&mut self, max_states: usize) {
+        self.inner.set_max_states(max_states);
+    }
+
+    /// Number of times the cache was emptied because it was full.
+    #[cfg(test)]
+    pub(crate) fn evictions(&self) -> u64 {
+        self.inner.evictions
+    }
+
+    /// Whether the states that computing `transitions` transitions can
+    /// add still fit: a break and a no-break successor each.
+    #[inline]
+    fn has_room_for(&self, transitions: usize) -> bool {
+        self.inner.has_room(2 * transitions)
+    }
+
+    /// Empty the cache, keeping the start state and the states in `keep`,
+    /// whose ids are rewritten in place (see [`DfaCache::evict`]).
+    #[cold]
+    fn evict(&mut self, keep: &mut [DfaStateId]) {
+        let stride = self.stride;
+        self.transitions.clear();
+        self.idle.clear();
+        self.inner.evict(keep, || {
+            self.transitions
+                .extend(std::iter::repeat_with(Transition::empty).take(stride));
+        });
+    }
+
+    /// Look up or insert a DFA state.  The matcher makes room before it
+    /// computes a transition, so the state always fits.
     fn intern_state(
         &mut self,
         nfa_states: &[StateIdx],
@@ -1679,19 +1714,21 @@ impl Tier3DfaCache {
         is_match: bool,
         is_match_at_end: bool,
         prev_was_word: bool,
-    ) -> Option<DfaStateId> {
+    ) -> DfaStateId {
         let stride = self.stride;
-        self.inner.intern_state(
-            nfa_states,
-            deferred_asserts,
-            is_match,
-            is_match_at_end,
-            prev_was_word,
-            || {
-                self.transitions
-                    .extend(std::iter::repeat_with(Transition::empty).take(stride));
-            },
-        )
+        self.inner
+            .intern_state(
+                nfa_states,
+                deferred_asserts,
+                is_match,
+                is_match_at_end,
+                prev_was_word,
+                || {
+                    self.transitions
+                        .extend(std::iter::repeat_with(Transition::empty).take(stride));
+                },
+            )
+            .expect("DFA state cap reached although room was made")
     }
 
     // -----------------------------------------------------------------------
@@ -2138,7 +2175,7 @@ impl Tier3DfaCache {
     }
 
     /// Intern a closure result into the state table.  Returns DEAD if
-    /// empty or if the state cap is reached.
+    /// it is empty.
     fn intern_closure_result(&mut self, cr: &ClosureResult, byte: u8) -> DfaStateId {
         if cr.nfa_states.is_empty()
             && cr.deferred_asserts.is_empty()
@@ -2159,7 +2196,6 @@ impl Tier3DfaCache {
             cr.is_match_at_end,
             pw,
         )
-        .unwrap_or(DfaStateId::DEAD)
     }
 
     /// Get match flags for a DFA state ID.
@@ -2209,15 +2245,13 @@ impl Tier3DfaCache {
             None,
             true, // follow_break=true for start closure
         );
-        self.inner.start_id = self
-            .intern_state(
-                &cr.nfa_states,
-                &cr.deferred_asserts,
-                cr.is_match,
-                cr.is_match_at_end,
-                false,
-            )
-            .expect("start state exceeds DFA_MAX_STATES");
+        self.inner.start_id = self.intern_state(
+            &cr.nfa_states,
+            &cr.deferred_asserts,
+            cr.is_match,
+            cr.is_match_at_end,
+            false,
+        );
         self.inner.start_is_match = self.inner.states[self.inner.start_id.idx()].is_match;
         self.inner.start_is_match_at_end =
             self.inner.states[self.inner.start_id.idx()].is_match_at_end;
@@ -3530,6 +3564,62 @@ impl<'a> Tier3DfaMatcher<'a> {
     // the clean chain transition's `nb_counter_free_mae`, which is
     // computed against the *pre-transition* clean state.
 
+    /// Empty the DFA cache because it is full, keeping the states this
+    /// matcher stands on.  Every state id and transition slot the matcher
+    /// holds is refreshed or dropped here.
+    #[cold]
+    fn evict_cache(&mut self) {
+        let mut keep = [self.current, self.no_break_current, self.clean_nb];
+        self.cache.evict(&mut keep);
+        [self.current, self.no_break_current, self.clean_nb] = keep;
+        self.clean_nb_trans_slot = None;
+    }
+
+    /// Before computing a missing main transition: make room for it, and
+    /// for the clean chain's transition if this step takes one, so that
+    /// one byte empties the cache at most once.  Returns whether the
+    /// cache was emptied.  Out of line: the scanning loop is sensitive to
+    /// the code around its lookups.
+    #[cold]
+    #[inline(never)]
+    fn make_room_for_step(&mut self) -> bool {
+        let transitions = if self.clean_chain_steps() { 2 } else { 1 };
+        if self.cache.has_room_for(transitions) {
+            return false;
+        }
+        self.evict_cache();
+        true
+    }
+
+    /// Before computing a missing clean-chain transition: make room for
+    /// it.  This only finds none when the main transition of this byte
+    /// was cached (a miss there makes room for both).  Emptying the cache
+    /// drops that transition, so it is computed again here.  Returns
+    /// whether the cache was emptied.
+    #[cold]
+    #[inline(never)]
+    fn make_room_for_clean_chain(&mut self, byte: u8, class: usize) -> bool {
+        if self.cache.has_room_for(1) {
+            return false;
+        }
+        self.evict_cache();
+        let slot = self.current.idx() * self.cache.stride + class;
+        let trans = self
+            .cache
+            .populate(self.memory, self.current, byte, self.regex, self.analysis);
+        self.cache.transitions[slot] = trans;
+        true
+    }
+
+    /// Whether this step advances the clean no-break chain with a
+    /// transition of its own, next to the main one.
+    #[inline]
+    fn clean_chain_steps(&self) -> bool {
+        self.current_has_break_extras
+            && self.regex.num_counters > 1
+            && self.clean_nb != DfaStateId::DEAD
+    }
+
     fn step_from_dead(&mut self, byte: u8) {
         if self.has_live_instances {
             if self.use_ranges {
@@ -3544,6 +3634,14 @@ impl<'a> Tier3DfaMatcher<'a> {
         self.pending_effects_current.clear();
         self.pending_effects_next.clear();
 
+        if !self.cache.has_room_for(1) {
+            // The matcher stands on no state, and the other ids it holds
+            // are overwritten below: nothing to keep.
+            self.cache.evict(&mut []);
+            self.no_break_current = DfaStateId::DEAD;
+            self.clean_nb = DfaStateId::DEAD;
+            self.clean_nb_trans_slot = None;
+        }
         let trans = self.cache.populate(
             self.memory,
             DfaStateId::DEAD,
@@ -3799,8 +3897,13 @@ impl<'a> Tier3DfaMatcher<'a> {
             } else {
                 self.regex.byte_classes[b as usize] as usize
             };
-            let slot = self.current.idx() * stride + class;
+            let mut slot = self.current.idx() * stride + class;
             if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
+                // Emptying the cache changes the ids of the states the
+                // matcher holds, so the slot is looked up again.
+                if self.make_room_for_step() {
+                    slot = self.current.idx() * stride + class;
+                }
                 let trans =
                     self.cache
                         .populate(self.memory, self.current, b, self.regex, self.analysis);
@@ -3818,8 +3921,15 @@ impl<'a> Tier3DfaMatcher<'a> {
             // the clean chain's seeds.
             if self.current_has_break_extras && self.regex.num_counters > 1 {
                 if self.clean_nb != DfaStateId::DEAD {
-                    let cn_slot = self.clean_nb.idx() * stride + class;
+                    let mut cn_slot = self.clean_nb.idx() * stride + class;
                     if self.cache.transitions[cn_slot].no_break == DfaStateId::UNPOPULATED {
+                        // Emptying the cache changes the ids of the
+                        // states the matcher holds: look both slots up
+                        // again.
+                        if self.make_room_for_clean_chain(b, class) {
+                            slot = self.current.idx() * stride + class;
+                            cn_slot = self.clean_nb.idx() * stride + class;
+                        }
                         let cn_trans = self.cache.populate(
                             self.memory,
                             self.clean_nb,
@@ -4546,6 +4656,239 @@ mod tests {
             m.chunk(chunk);
         }
         f(&mut m)
+    }
+
+    /// Bug 64: emptying a full cache refreshes every state id the matcher
+    /// holds and drops every table and slot indexed by one.
+    #[test]
+    fn test_evict_cache_refreshes_every_state_id_the_matcher_holds() {
+        with_matcher(
+            "a{2,3}b(?:x|yy){2,3}c",
+            &[b"z", b"a", b"a", b"b", b"x"],
+            |m| {
+                let n = m.cache.inner.states.len();
+                assert!(n >= 4, "need four distinct states, have {n}");
+                // Three different states, none of them the start state.
+                m.current = DfaStateId(3);
+                m.no_break_current = DfaStateId(1);
+                m.clean_nb = DfaStateId(2);
+                let want = [3, 1, 2].map(|i| m.cache.inner.states[i].clone());
+                m.clean_nb_trans_slot = Some(0);
+                // Classify a state so the idle table is not empty.
+                m.cache.idle.is_idle(&m.cache.inner, DfaStateId(1), m.regex);
+                assert!(!m.cache.idle.class.is_empty());
+
+                m.evict_cache();
+
+                let ids = [m.current, m.no_break_current, m.clean_nb];
+                for (id, want) in ids.iter().zip(&want) {
+                    assert_eq!(&m.cache.inner.states[id.idx()], want);
+                }
+                assert_eq!(m.cache.inner.states.len(), 4);
+                assert_eq!(m.clean_nb_trans_slot, None);
+                assert!(m.cache.idle.class.is_empty());
+                assert_eq!(m.cache.transitions.len(), 4 * m.cache.stride);
+                assert!(
+                    m.cache
+                        .transitions
+                        .iter()
+                        .all(|t| t.no_break == DfaStateId::UNPOPULATED)
+                );
+                assert_eq!(m.cache.evictions(), 1);
+            },
+        );
+    }
+
+    /// Bug 64: one input byte empties the cache at most once, even when
+    /// both the main transition and the clean chain's are missing.  The
+    /// main lookup makes room for both.
+    #[test]
+    fn test_one_byte_evicts_at_most_once() {
+        let mut steps_with_clean_chain = 0;
+        for pattern in [
+            "a{2,3}b(?:x|yy){2,3}c",
+            "(?:a|bb){2,3}c(?:x|yy){2,3}d",
+            ".{2,4}1\\b.{2,3}z",
+        ] {
+            let re = build(pattern);
+            assert!(re.tier3_eligible, "`{pattern}` must be tier 3 eligible");
+            let analysis = re.tier3_analysis.as_ref().unwrap();
+            let mut memory = DfaMemory::default();
+            let mut cache = Tier3DfaCache::new();
+            cache.set_max_states(crate::dfa::DFA_MIN_STATES);
+            cache.prepare(&mut memory, &re, analysis);
+            let mut m = Tier3DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+            let input = b"aabxyyc aabbbcxyyd abbaaabxxyyx 111 1 11 aaabyyxxc bbabbcyyxd";
+            for _ in 0..4 {
+                for &b in input.iter() {
+                    let before = m.cache.evictions();
+                    if m.clean_chain_steps() {
+                        steps_with_clean_chain += 1;
+                    }
+                    m.chunk(&[b]);
+                    let evicted = m.cache.evictions() - before;
+                    assert!(evicted <= 1, "`{pattern}`: {evicted} evictions on one byte");
+                }
+            }
+            assert!(m.cache.evictions() > 0, "`{pattern}`: no eviction at all");
+        }
+        assert!(steps_with_clean_chain > 0, "no step used the clean chain");
+    }
+
+    /// Bug 64: the rarest eviction.  The main transition is cached, the
+    /// clean chain's is not, and there is no room for it: the cache is
+    /// emptied between the two lookups of one byte, and the main
+    /// transition has to be computed again.
+    ///
+    /// Ordinary inputs almost never get there, so the situation is set
+    /// up: whenever the clean chain is about to take a transition that is
+    /// not cached, the main one is cached by hand and the cap is lowered
+    /// to the current size.  After every byte the matcher must stand on
+    /// the same states as one that never evicts.
+    #[test]
+    fn test_eviction_between_main_and_clean_lookup() {
+        // What a matcher stands on, by content: ids differ between caches.
+        fn standing(m: &Tier3DfaMatcher) -> [Option<crate::dfa::DfaState>; 3] {
+            [m.current, m.no_break_current, m.clean_nb]
+                .map(|id| (id != DfaStateId::DEAD).then(|| m.cache.inner.states[id.idx()].clone()))
+        }
+
+        let mut forced = 0;
+        // Each alphabet leaves out the pattern's last byte: no match, so
+        // the matchers keep running.
+        for (pattern, alphabet) in [
+            ("a{2,3}b(?:x|yy){2,3}c", &b"aabbxy1 dz"[..]),
+            ("(?:a|bb){2,3}c(?:x|yy){2,3}d", &b"aabbxyc1 z"[..]),
+            (".{2,4}1\\b.{2,3}z", &b"aabbxyc1 d"[..]),
+        ] {
+            let re = build(pattern);
+            assert!(re.tier3_eligible, "`{pattern}` must be tier 3 eligible");
+            let analysis = re.tier3_analysis.as_ref().unwrap();
+            let (mut memory, mut ref_memory) = (DfaMemory::default(), DfaMemory::default());
+            let (mut cache, mut ref_cache) = (Tier3DfaCache::new(), Tier3DfaCache::new());
+            cache.prepare(&mut memory, &re, analysis);
+            ref_cache.prepare(&mut ref_memory, &re, analysis);
+            let mut m = Tier3DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+            let mut reference =
+                Tier3DfaMatcher::new(&mut ref_cache, &mut ref_memory, &re, analysis);
+
+            let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+            for i in 0..5_000 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let b = alphabet[(rng >> 33) as usize % alphabet.len()];
+
+                // Back to the default cap, and forget the cached
+                // transitions now and then so that lookups keep missing.
+                m.cache.set_max_states(crate::dfa::DFA_MAX_STATES);
+                if i % 5 == 0 {
+                    m.evict_cache();
+                }
+                // Then force the situation if this byte allows it.
+                if m.current != DfaStateId::DEAD && m.clean_chain_steps() {
+                    let stride = m.cache.stride;
+                    let class = if stride == 256 {
+                        b as usize
+                    } else {
+                        m.regex.byte_classes[b as usize] as usize
+                    };
+                    let clean_slot = m.clean_nb.idx() * stride + class;
+                    let clean_cached =
+                        m.cache.transitions[clean_slot].no_break != DfaStateId::UNPOPULATED;
+                    if !clean_cached && m.clean_nb != m.current {
+                        let slot = m.current.idx() * stride + class;
+                        if m.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
+                            let trans = m
+                                .cache
+                                .populate(m.memory, m.current, b, m.regex, m.analysis);
+                            m.cache.transitions[slot] = trans;
+                        }
+                        // Pad the table to the smallest cap with states
+                        // nothing refers to, then leave no room.
+                        let mut filler = 0;
+                        while m.cache.inner.states.len() < crate::dfa::DFA_MIN_STATES {
+                            m.cache.intern_state(
+                                &[StateIdx(0), StateIdx(0), StateIdx(filler)],
+                                &[],
+                                false,
+                                false,
+                                false,
+                            );
+                            filler += 1;
+                        }
+                        m.cache.inner.max_states = m.cache.inner.states.len();
+                        forced += 1;
+                        let before = m.cache.evictions();
+                        m.chunk(&[b]);
+                        assert_eq!(m.cache.evictions(), before + 1, "`{pattern}` byte {i}");
+                    } else {
+                        m.chunk(&[b]);
+                    }
+                } else {
+                    m.chunk(&[b]);
+                }
+                reference.chunk(&[b]);
+
+                assert!(!reference.ismatch(), "`{pattern}` must not match");
+                assert_eq!(
+                    (
+                        standing(&m),
+                        m.ismatch(),
+                        m.match_at_end,
+                        m.has_live_instances
+                    ),
+                    (
+                        standing(&reference),
+                        false,
+                        reference.match_at_end,
+                        reference.has_live_instances
+                    ),
+                    "`{pattern}` diverges at byte {i}"
+                );
+            }
+            assert_eq!(reference.cache.evictions(), 0);
+        }
+        assert!(forced > 20, "the situation came up only {forced} times");
+    }
+
+    /// Bug 64: stepping out of the dead state with a full cache empties
+    /// it and leaves no stale id or slot behind.
+    #[test]
+    fn test_eviction_from_the_dead_state() {
+        let re = build("^a{2,3}b(?:x|yy){2,3}c|q{2,3}r");
+        assert!(re.tier3_eligible);
+        let analysis = re.tier3_analysis.as_ref().unwrap();
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier3DfaCache::new();
+        cache.set_max_states(crate::dfa::DFA_MIN_STATES);
+        cache.prepare(&mut memory, &re, analysis);
+        let mut m = Tier3DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+        // Fill the table with states nothing refers to.
+        let mut filler = 0;
+        while m.cache.has_room_for(1) {
+            m.cache
+                .intern_state(&[StateIdx(0), StateIdx(filler)], &[], false, false, false);
+            filler += 1;
+        }
+        m.current = DfaStateId::DEAD;
+        m.no_break_current = DfaStateId(2);
+        m.clean_nb = DfaStateId(3);
+        m.clean_nb_trans_slot = Some(7);
+
+        m.step_from_dead(b'q');
+
+        assert_eq!(m.cache.evictions(), 1);
+        assert_eq!(m.clean_nb_trans_slot, None);
+        let n = m.cache.inner.states.len();
+        assert!(
+            n <= 3,
+            "start state plus one transition's successors, have {n}"
+        );
+        for id in [m.current, m.no_break_current, m.clean_nb] {
+            assert!(id == DfaStateId::DEAD || id.idx() < n, "stale id {id:?}");
+        }
+        assert_eq!(m.cache.transitions.len(), n * m.cache.stride);
     }
 
     /// Debug rendering of the matcher's state, with the prefilter
