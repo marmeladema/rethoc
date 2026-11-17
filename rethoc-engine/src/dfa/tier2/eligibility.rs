@@ -9,18 +9,30 @@
 //! All of the following must hold (given `non_nested_eligible == true`):
 //!
 //! 1. Every counter body has a **fixed byte length** > 0.
-//! 2. No counter with body length > 1 contains deferred assertions.
-//! 3. If any counter body contains deferred assertions, there is exactly
-//!    one counter (multi-counter + deferred is unsupported).
+//! 2. No counter with body length > 1 contains an assertion that looks
+//!    ahead ([`AssertKind::looks_ahead`](crate::AssertKind::looks_ahead)).
+//! 3. If any counter body contains such an assertion, there is exactly
+//!    one counter.
 //! 4. The number of counters is ≤ [`MAX_TIER2_COUNTERS`](super::MAX_TIER2_COUNTERS) (64).
 //! 5. Counter body byte sets are **pairwise disjoint** (so at most one
 //!    counter fires `CInc` on any DFA transition).
+//! 6. Every increment **directly follows a consumed byte**: no assertion
+//!    that looks ahead sits between the last byte of a body and its
+//!    `CInc` (see [`BodyAssertions::increment_behind_lookahead`]).
+//!
+//! Requirement 6 is the tier's central assumption: a counter is
+//! incremented on the transition that consumes the last byte of its body,
+//! once per byte, for all threads of a phase together.  `(?:a\B){2,3}`
+//! breaks it.  The increment is only decided one byte later, and that
+//! transition may consume a byte and reach the increment again.  An
+//! assertion *before* the body's byte, as in `(?:\Ba){2,3}`, is fine: a
+//! thread waiting there has not counted anything yet.
 //!
 //! Requirement 5 will be relaxed in a later patch via a reachability probe
 //! that proves `counting_mask.count_ones() <= 1` for all reachable
 //! transitions even when raw byte sets overlap.
 
-use crate::{AssertKind, ByteClassBits, ByteMap, CounterIdx, State, StateIdx};
+use crate::{ByteClassBits, ByteMap, CounterIdx, State, StateIdx};
 
 // ---------------------------------------------------------------------------
 // Eligibility result
@@ -40,16 +52,20 @@ pub(crate) struct Tier2Eligibility {
     pub(crate) disjoint_bytes: bool,
     /// True when every counter body has a fixed byte length > 0.
     pub(crate) all_fixed_length: bool,
-    /// True when a counter with body_length > 1 contains deferred
-    /// assertions in its body.
-    pub(crate) has_deferred_in_long_body: bool,
-    /// True when deferred assertions exist in any counter body AND
-    /// there is more than one counter.
-    pub(crate) has_deferred_in_multi_counter_body: bool,
+    /// True when a counter with body_length > 1 contains an assertion
+    /// that looks ahead in its body.
+    pub(crate) has_lookahead_in_long_body: bool,
+    /// True when an assertion that looks ahead exists in any counter body
+    /// AND there is more than one counter.
+    pub(crate) has_lookahead_in_multi_counter_body: bool,
     /// True when any two counters have identical body byte sets.
     /// This causes Tier 2's runtime to overcount (both counters advance
     /// simultaneously and `counter_reset` never fires).
     pub(crate) has_identical_body_bytes: bool,
+    /// What the assertions inside the counter bodies are and where they
+    /// sit.  All false when the counters are nested: no tier that reads
+    /// it takes such a pattern.
+    pub(crate) body: BodyAssertions,
 }
 
 impl Tier2Eligibility {
@@ -57,8 +73,9 @@ impl Tier2Eligibility {
     /// except the byte-overlap check.
     pub(crate) fn base_eligible(&self) -> bool {
         self.all_fixed_length
-            && !self.has_deferred_in_long_body
-            && !self.has_deferred_in_multi_counter_body
+            && !self.has_lookahead_in_long_body
+            && !self.has_lookahead_in_multi_counter_body
+            && !self.body.increment_behind_lookahead
             && !self.counter_info.is_empty()
             && self.counter_info.len() <= super::MAX_TIER2_COUNTERS
     }
@@ -85,16 +102,17 @@ impl Tier2Eligibility {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Compute Tier 2 eligibility for a pattern with non-nested counters.
+/// Compute Tier 2 eligibility.
 ///
-/// `has_deferred_in_counter_body` must be pre-computed by the caller
-/// (it is shared with other tier checks).
+/// `non_nested` is the caller's `non_nested_eligible`.  When it is false
+/// no counting DFA tier takes the pattern, and the counter bodies are not
+/// examined for assertions.
 pub(crate) fn compute_tier2_eligibility(
     states: &[State],
     classes: &indexmap::set::IndexSet<ByteClassBits>,
     byte_tables: &[ByteMap],
     counters_len: usize,
-    has_deferred_in_counter_body: bool,
+    non_nested: bool,
 ) -> Tier2Eligibility {
     let counter_info = build_counter_info(states, byte_tables, counters_len);
     let disjoint_bytes = counter_bodies_have_disjoint_bytes(states, classes, byte_tables);
@@ -102,18 +120,23 @@ pub(crate) fn compute_tier2_eligibility(
     let all_fixed_length =
         !counter_info.is_empty() && counter_info.iter().all(|c| c.body_byte_length > 0);
 
-    let has_deferred_in_long_body = has_deferred_in_counter_body
-        && states.iter().any(|s| {
-            if let State::CounterInstance { counter, out } = s {
-                let ci = counter.idx();
-                let body_len = counter_info.get(ci).map_or(0, |c| c.body_byte_length);
-                body_len > 1 && body_has_deferred(*out, *counter, states, byte_tables)
-            } else {
-                false
+    let mut body = BodyAssertions::default();
+    let mut has_lookahead_in_long_body = false;
+    if non_nested {
+        for state in states {
+            if let State::CounterInstance { counter, out } = *state {
+                let one = body_assertions(out, counter, states, byte_tables);
+                let body_len = counter_info
+                    .get(counter.idx())
+                    .map_or(0, |c| c.body_byte_length);
+                has_lookahead_in_long_body |= one.lookahead && body_len > 1;
+                body.lookahead |= one.lookahead;
+                body.increment_behind_lookahead |= one.increment_behind_lookahead;
             }
-        });
+        }
+    }
 
-    let has_deferred_in_multi_counter_body = has_deferred_in_counter_body && counter_info.len() > 1;
+    let has_lookahead_in_multi_counter_body = body.lookahead && counter_info.len() > 1;
 
     let has_identical_body_bytes =
         counter_bodies_have_identical_bytes(states, classes, byte_tables);
@@ -122,9 +145,10 @@ pub(crate) fn compute_tier2_eligibility(
         counter_info,
         disjoint_bytes,
         all_fixed_length,
-        has_deferred_in_long_body,
-        has_deferred_in_multi_counter_body,
+        has_lookahead_in_long_body,
+        has_lookahead_in_multi_counter_body,
         has_identical_body_bytes,
+        body,
     }
 }
 
@@ -456,49 +480,42 @@ pub(crate) fn counter_body_length(
 }
 
 // ---------------------------------------------------------------------------
-// Deferred-assertion-in-body check
+// Assertions inside counter bodies
 // ---------------------------------------------------------------------------
 
-/// Returns true if any deferred assertion kind is reachable within the
-/// counter body from `start` to `CInc(own_counter)`.
-pub(crate) fn body_has_deferred(
+/// Visit the states of the counter body that starts at `start` (the
+/// `out` of the counter's `CounterInstance`), each once, up to but not
+/// including the counter's own `CounterIncrement`.  Stops and returns
+/// true as soon as `visit` does.
+///
+/// Every check on what a body contains goes through this walk, so that
+/// they agree on what the body is.
+pub(crate) fn any_in_body(
     start: StateIdx,
     own_counter: CounterIdx,
     states: &[State],
     byte_tables: &[ByteMap],
+    mut visit: impl FnMut(&State) -> bool,
 ) -> bool {
     let mut stack = vec![start];
     let mut visited = vec![false; states.len()];
     while let Some(idx) = stack.pop() {
-        let i = idx.idx();
-        if visited[i] {
+        if std::mem::replace(&mut visited[idx.idx()], true) {
             continue;
         }
-        visited[i] = true;
-        match states[idx] {
-            State::CounterIncrement { counter, .. } if counter == own_counter => {
-                continue;
-            }
-            State::Assert { kind, out } => {
-                if matches!(
-                    kind,
-                    AssertKind::EndLF
-                        | AssertKind::EndCRLF
-                        | AssertKind::StartCRLF
-                        | AssertKind::WordAscii
-                        | AssertKind::WordAsciiNegate
-                        | AssertKind::WordStartAscii
-                        | AssertKind::WordEndAscii
-                ) {
-                    return true;
-                }
-                stack.push(out);
-            }
+        let state = &states[idx];
+        if matches!(state, State::CounterIncrement { counter, .. } if *counter == own_counter) {
+            continue;
+        }
+        if visit(state) {
+            return true;
+        }
+        match *state {
             State::Split { out, out1 } => {
                 stack.push(out1);
                 stack.push(out);
             }
-            State::CounterInstance { out, .. } => stack.push(out),
+            State::Assert { out, .. } | State::CounterInstance { out, .. } => stack.push(out),
             State::Byte { out, out_exit, .. }
             | State::ByteCI { out, out_exit, .. }
             | State::Wildcard { out, out_exit }
@@ -510,14 +527,271 @@ pub(crate) fn body_has_deferred(
                 }
             }
             State::ByteTable { table } => {
-                for &succ in &byte_tables[table.idx()].0 {
-                    if succ != StateIdx::NONE {
-                        stack.push(succ);
-                    }
-                }
+                stack.extend(
+                    byte_tables[table.idx()]
+                        .0
+                        .iter()
+                        .copied()
+                        .filter(|&succ| succ != StateIdx::NONE),
+                );
             }
             _ => {}
         }
     }
     false
+}
+
+/// Whether the increment of `counter` can be reached from one of `starts`
+/// through epsilon transitions only: splits, assertions and counter
+/// entries.  Consuming states, other increments and `Match` end a path.
+///
+/// One walk with one visited set, however many starts there are.
+pub(crate) fn epsilon_reaches_increment(
+    starts: impl IntoIterator<Item = StateIdx>,
+    counter: CounterIdx,
+    states: &[State],
+) -> bool {
+    let mut stack: Vec<StateIdx> = starts.into_iter().collect();
+    let mut visited = vec![false; states.len()];
+    while let Some(idx) = stack.pop() {
+        if std::mem::replace(&mut visited[idx.idx()], true) {
+            continue;
+        }
+        match states[idx] {
+            State::CounterIncrement { counter: c, .. } if c == counter => return true,
+            State::Split { out, out1 } => {
+                stack.push(out1);
+                stack.push(out);
+            }
+            State::Assert { out, .. } | State::CounterInstance { out, .. } => stack.push(out),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// What the assertions inside counter bodies are and where they sit: the
+/// input of the counting tiers' eligibility rules.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BodyAssertions {
+    /// A body contains an assertion that looks ahead
+    /// ([`AssertKind::looks_ahead`](crate::AssertKind::looks_ahead): the
+    /// word-boundary family, `(?m:$)`, `$`, the CRLF anchors).
+    ///
+    /// `^` and `(?m:^)` do not count: they are decided by what is behind
+    /// them, so a thread never waits on them.
+    pub(crate) lookahead: bool,
+    /// Inside a body, the increment can be reached without consuming a
+    /// byte from an assertion that looks ahead, as in `(?:a\B){2,3}`,
+    /// `(?:a\b|b){2,3}` or `(?:a$){1,2}`.
+    ///
+    /// Such an increment does not happen on the transition that consumes
+    /// the body's last byte: whether the iteration counts is decided one
+    /// byte later.  Tier 2 excludes it (requirement 6 in the module
+    /// docs, Bug 68).  An assertion in front of the body's byte is not
+    /// one of these: `(?:\Ba){2,3}` reaches a consuming state first.
+    ///
+    /// `^` and `(?m:^)` in that position are not reported: tier 2
+    /// settles them when it computes the transition.
+    pub(crate) increment_behind_lookahead: bool,
+}
+
+/// Examine the body of `own_counter`, which starts at `start`: one walk
+/// over the body, then one epsilon walk from its assertions.
+pub(crate) fn body_assertions(
+    start: StateIdx,
+    own_counter: CounterIdx,
+    states: &[State],
+    byte_tables: &[ByteMap],
+) -> BodyAssertions {
+    // Where the body's assertions that look ahead lead.
+    let mut behind_lookahead = Vec::new();
+    any_in_body(start, own_counter, states, byte_tables, |state| {
+        if let State::Assert { kind, out } = *state
+            && kind.looks_ahead()
+        {
+            behind_lookahead.push(out);
+        }
+        false
+    });
+
+    let lookahead = !behind_lookahead.is_empty();
+    let increment_behind_lookahead =
+        lookahead && epsilon_reaches_increment(behind_lookahead, own_counter, states);
+    BodyAssertions {
+        lookahead,
+        increment_behind_lookahead,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Regex, RegexConfig};
+
+    /// Compile without unrolling so small repetitions keep their counters.
+    fn build(pattern: &str) -> Regex {
+        Regex::with_config(
+            pattern,
+            RegexConfig {
+                max_unroll_states: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// What `body_assertions` says about the body of the pattern's first
+    /// counter.
+    fn first_body(pattern: &str) -> BodyAssertions {
+        let re = build(pattern);
+        re.states
+            .iter()
+            .find_map(|s| match s {
+                State::CounterInstance { counter, out } => {
+                    Some(body_assertions(*out, *counter, &re.states, &re.byte_tables))
+                }
+                _ => None,
+            })
+            .expect("the pattern has a counter")
+    }
+
+    /// Bug 68: an increment is "behind an assertion" when an assertion
+    /// that looks ahead sits between the last byte of the body and the
+    /// increment, on any path.
+    #[test]
+    fn test_increment_behind_assertion() {
+        for (pattern, expected) in [
+            // After the byte.
+            (r"(?:a\b){2,3}c", true),
+            (r"(?:a\B){2,3}c", true),
+            (r"(?:[ab]\b{end}){2,3}c", true),
+            (r"(?:a(?m:$)){2,3}", true),
+            (r"(?:a$){1,2}", true),
+            // On one branch only.
+            (r"(?:a\B|b){2,3}c", true),
+            (r"(?:b|a$){2,3}", true),
+            (r"(?:a(?:b|c\b)){2,3}d", true),
+            // Behind a second assertion, or an optional one.
+            (r"(?:a\b\B){2,3}c", true),
+            (r"(?:a(?m:^)\b){2,3}c", true),
+            (r"(?:a\b(?m:^)){2,3}c", true),
+            (r"(?:ab\B){2,3}c", true),
+            (r"(?:a(?:\b|b)){2,3}c", true),
+            // In front of the byte: the increment follows a consumed byte.
+            (r"(?:\ba){2,3}c", false),
+            (r"(?:\B[ab]){2,3}c", false),
+            (r"(?:\Ba|b){2,3}c", false),
+            (r"(?:$a|b){2,3}c", false),
+            (r"(?:\ba\Bb){2,3}c", false),
+            (r"(?:(?m:^)a+\n){2,3}c", false),
+            (r"(?:^a|bb){2,3}c", false),
+            // Between two bytes of the body.
+            (r"(?:\n(?m:^)a|bb){2,3}c", false),
+            (r"(?:[ab](?m:^)c){2,3}", false),
+            (r"(?:a(?:(?m:^)b|c)){2,3}d", false),
+            // Behind an assertion that is decided by what is behind it.
+            (r"(?:\n(?m:^)){2,3}c", false),
+            (r"(?:a^){2,3}c", false),
+            (r"(?:a(?m:^)|\n\n){2,3}c", false),
+            (r"(?:\n(?m:^)|aa){2,3}c", false),
+            (r"(?:\Ba(?m:^)|bb){2,3}c", false),
+            // No assertion in the body at all.
+            (r"\b(?:a|b){2,3}\bc", false),
+            (r"a{2,3}$", false),
+            (r"(?m:^)(?:a|bb){2,3}$", false),
+        ] {
+            assert_eq!(
+                first_body(pattern).increment_behind_lookahead,
+                expected,
+                "{pattern}"
+            );
+        }
+    }
+
+    /// Bug 67: `$` counts as an assertion that looks ahead inside a body,
+    /// like the word-boundary family and `(?m:$)`; `^` and `(?m:^)` do
+    /// not.
+    #[test]
+    fn test_body_has_lookahead() {
+        for (pattern, expected) in [
+            (r"(?:a$|bb){2,3}", true),
+            (r"(?:$a|b){2,3}c", true),
+            (r"(?:a\b){2,3}c", true),
+            (r"(?:\Ba){2,3}c", true),
+            (r"(?:a(?m:$)){2,3}", true),
+            (r"(?:\b{start}a.){2,3}c", true),
+            (r"(?:\n(?m:^)){2,3}c", false),
+            (r"(?:^a|b){2,3}c", false),
+            (r"\b(?:a|b){2,3}\bc$", false),
+        ] {
+            assert_eq!(first_body(pattern).lookahead, expected, "{pattern}");
+        }
+    }
+
+    /// The body flags are only computed for patterns a counting DFA tier
+    /// can take.
+    #[test]
+    fn test_body_assertions_skipped_for_nested_counters() {
+        let body_of = |pattern: &str, non_nested: bool| {
+            let re = build(pattern);
+            let classes: indexmap::IndexSet<ByteClassBits> = re.classes.iter().copied().collect();
+            compute_tier2_eligibility(
+                &re.states,
+                &classes,
+                &re.byte_tables,
+                re.num_counters,
+                non_nested,
+            )
+            .body
+        };
+        let pattern = r"(?:a\b){2,3}c";
+        assert_eq!(
+            body_of(pattern, true),
+            BodyAssertions {
+                lookahead: true,
+                increment_behind_lookahead: true,
+            }
+        );
+        assert_eq!(body_of(pattern, false), BodyAssertions::default());
+    }
+
+    /// What the checks mean for the tiers.
+    #[test]
+    fn test_lookahead_in_body_tiers() {
+        for (pattern, tier2, tier3, tier4) in [
+            // In front of a one-byte body, one counter: tier 2.
+            (r"(?:\B[ab]){2,3}c", true, false, false),
+            (r"(?:\Ba|b){2,3}c", true, false, false),
+            // Behind the byte: no counting DFA tier takes a word boundary
+            // in a body; `$` is left to tier 4.
+            (r"(?:[ab]\B){2,3}c", false, false, false),
+            (r"(?:a\B|b){2,3}c", false, false, false),
+            (r"(?:a$|b){2,3}", false, false, true),
+            (r"(?:a$|bb){2,3}", false, false, true),
+            (r"(?:ab$|ba){2,3}", false, false, true),
+            // `^` and `(?m:^)` anywhere in a body: every tier that takes
+            // the body takes them.  (Tier 3 is not always right on them:
+            // see the `tier3_broken` entries in `match_tests!`.)
+            (r"(?:(?m:^)a+\n){2,3}c", false, true, true),
+            (r"(?:^a|bb){2,3}c", false, true, true),
+            (r"(?:(?m:^)a|b){2,3}c", true, true, true),
+            (r"(?:\n(?m:^)a|bb){2,3}c", true, true, true),
+            (r"(?:[ab\n](?m:^)c){2,3}", true, true, true),
+            (r"(?:\n(?m:^)){2,3}c", true, true, true),
+            (r"(?:a(?m:^)|\n\n){2,3}c", false, true, true),
+            (r"(?:\na(?m:^)|bb){2,3}c", true, true, true),
+            // Outside the body: unaffected.
+            (r"\b[ab]{2,3}\bc", true, true, false),
+            (r"(?m:^)[ab]{2,3}$", true, true, true),
+            (r"(?:a|bb){2,3}\n(?m:^)c", false, true, true),
+        ] {
+            let re = build(pattern);
+            assert_eq!(
+                (re.tier2_eligible, re.tier3_eligible, re.tier4_eligible),
+                (tier2, tier3, tier4),
+                "{pattern}"
+            );
+        }
+    }
 }
