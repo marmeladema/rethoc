@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 use super::analysis::{self, Limits, Rejection, Scope};
 use super::exact::{self, Boundary, BoundaryCtx};
-use super::{CincMasks, GroupedNfaError, GroupedNfaPlan, GroupedScratch, GroupedStream};
+use super::{GroupedNfaError, GroupedNfaPlan, GroupedScratch, GroupedStream, Increment, Row};
 use crate::{
     ByteMap, CounterIdx, MatcherMemory, Regex, RegexConfig, State, StateIdx, byte_match_ci,
     counter_step,
@@ -189,18 +189,56 @@ fn milestone_exclusions() {
         rejection(&forced(r"\Ax(a|aa){2}z")),
         Rejection::Assertion { .. }
     ));
-    assert!(matches!(
-        rejection(&forced("a{2,}b")),
-        Rejection::UnboundedCounter { .. }
-    ));
-    // `a{63}` keeps 0..=63 in one word; `a{64}` needs a second.
-    plan(&forced("a{63}b"));
-    for pattern in ["a{64}b", "a{65}b"] {
-        assert!(matches!(
-            rejection(&forced(pattern)),
-            Rejection::CounterTooWide { limit: 63, .. }
-        ));
+}
+
+/// The row of a counted scope: `0..=max` (finite) or `0..=min`
+/// (saturating) in `top / 64 + 1` words.
+#[test]
+fn counted_rows_span_words() {
+    for (pattern, words) in [
+        ("a{63}b", 1),
+        ("a{64}b", 2),
+        ("a{65}b", 2),
+        ("a{127}b", 2),
+        ("a{128}b", 3),
+        ("a{129}b", 3),
+        ("a{2,}b", 1),
+        ("a{63,}b", 1),
+        ("a{64,}b", 2),
+        ("a{129,}b", 3),
+    ] {
+        let re = forced(pattern);
+        let plan = plan(&re);
+        let widths: BTreeSet<u32> = plan
+            .scopes
+            .iter()
+            .filter(|(_, scope)| matches!(scope, Scope::Counter(_)))
+            .map(|(s, _)| plan.row_of[s.idx()].words)
+            .collect();
+        assert_eq!(widths, BTreeSet::from([words]), "`{pattern}`");
     }
+    // A counter is admitted as long as its rows fit the frontier budget.
+    let re = forced("a{1000}b");
+    let n = plan(&re).words();
+    let narrow = Limits {
+        max_row_words: n - 1,
+        ..Limits::DEFAULT
+    };
+    assert_eq!(
+        analysis::analyze(
+            &re.states,
+            &re.byte_tables,
+            re.start,
+            1,
+            &re.counter_info,
+            &narrow
+        )
+        .err(),
+        Some(Rejection::TooManyRowWords {
+            words: n,
+            limit: n - 1
+        })
+    );
 }
 
 #[test]
@@ -216,12 +254,10 @@ fn not_requested_is_reported() {
         GroupedStream::new(&re, &mut scratch).err(),
         Some(GroupedNfaError::NotRequested)
     );
-    let rejected = forced("a{2,}b");
+    let rejected = forced("x((a|aa){2,3}){2,3}z");
     assert!(matches!(
         GroupedStream::new(&rejected, &mut scratch).err(),
-        Some(GroupedNfaError::Rejected(
-            Rejection::UnboundedCounter { .. }
-        ))
+        Some(GroupedNfaError::Rejected(Rejection::NestedCounter { .. }))
     ));
 }
 
@@ -272,11 +308,11 @@ fn info_and_dump_report_the_plan() {
     );
     assert!(re.dump(false).to_string().contains("Grouped NFA: admitted"));
 
-    let re = forced("a{2,}b");
+    let re = forced("x((a|aa){2,3}){2,3}z");
     let info = re.info();
     let g = info.grouped_nfa.as_ref().expect("requested");
     assert!(!g.admitted);
-    assert!(g.rejection.as_ref().unwrap().contains("unbounded"));
+    assert!(g.rejection.as_ref().unwrap().contains("nested"));
     assert!(re.dump(false).to_string().contains("Grouped NFA: rejected"));
 
     assert!(Regex::new("a").unwrap().info().grouped_nfa.is_none());
@@ -306,7 +342,7 @@ fn fixture_conflicting_scope() {
         State::Match,
     ];
     assert_eq!(
-        analyze_fixture(&states, 1, &Limits::P1).err(),
+        analyze_fixture(&states, 1, &Limits::DEFAULT).err(),
         Some(Rejection::ConflictingScope { state: 3 })
     );
 }
@@ -324,7 +360,7 @@ fn fixture_scope_errors() {
         State::Match,
     ];
     assert_eq!(
-        analyze_fixture(&states, 2, &Limits::P1).err(),
+        analyze_fixture(&states, 2, &Limits::DEFAULT).err(),
         Some(Rejection::IncrementScopeMismatch { state: 2 })
     );
     // Match inside a scope.
@@ -336,7 +372,7 @@ fn fixture_scope_errors() {
         State::Match,
     ];
     assert_eq!(
-        analyze_fixture(&states, 1, &Limits::P1).err(),
+        analyze_fixture(&states, 1, &Limits::DEFAULT).err(),
         Some(Rejection::MatchInScope { state: 1 })
     );
     // An instance inside a scope.
@@ -355,7 +391,7 @@ fn fixture_scope_errors() {
         State::Match,
     ];
     assert_eq!(
-        analyze_fixture(&states, 2, &Limits::P1).err(),
+        analyze_fixture(&states, 2, &Limits::DEFAULT).err(),
         Some(Rejection::NestedCounter { state: 1 })
     );
 }
@@ -383,7 +419,7 @@ fn fixture_bounds() {
         State::Match,
     ];
     assert_eq!(
-        analyze_fixture(&states, 1, &Limits::P1).err(),
+        analyze_fixture(&states, 1, &Limits::DEFAULT).err(),
         Some(Rejection::CounterBoundsMismatch { counter: 0 })
     );
     for (min, max) in [(0, 0), (3, 2)] {
@@ -397,7 +433,7 @@ fn fixture_bounds() {
             State::Match,
         ];
         assert_eq!(
-            analyze_fixture(&states, 1, &Limits::P1).err(),
+            analyze_fixture(&states, 1, &Limits::DEFAULT).err(),
             Some(Rejection::UnsupportedBounds {
                 counter: 0,
                 min,
@@ -422,7 +458,7 @@ fn fixture_zero_width_graph() {
         State::Match,
     ];
     assert_eq!(
-        analyze_fixture(&states, 0, &Limits::P1).err(),
+        analyze_fixture(&states, 0, &Limits::DEFAULT).err(),
         Some(Rejection::ZeroWidthCycle { state: 0 })
     );
     // Duplicate edges are fine, and an unreachable remnant (here one that
@@ -439,7 +475,7 @@ fn fixture_zero_width_graph() {
             out: st(2),
         },
     ];
-    let plan = analyze_fixture(&states, 1, &Limits::P1).unwrap();
+    let plan = analyze_fixture(&states, 1, &Limits::DEFAULT).unwrap();
     assert_eq!(plan.rows(), 3);
     assert_eq!(plan.row_of[3], super::Row::NONE);
 }
@@ -460,7 +496,7 @@ fn budgets_below_at_and_above() {
             &limits,
         )
     };
-    let full = run(Limits::P1).unwrap();
+    let full = run(Limits::DEFAULT).unwrap();
     let (words, bytes) = (full.words(), full.heap_bytes());
     let n = states.len();
     let analysis = analysis::analysis_bytes(n, n_counters);
@@ -486,7 +522,7 @@ fn budgets_below_at_and_above() {
     assert!(reachable_edges <= edges);
 
     let with = |f: &dyn Fn(&mut Limits)| {
-        let mut l = Limits::P1;
+        let mut l = Limits::DEFAULT;
         f(&mut l);
         run(l)
     };
@@ -529,25 +565,16 @@ fn budgets_below_at_and_above() {
             limit: analysis - 1
         })
     );
-    assert!(with(&|l| l.max_counter_max = 5).is_ok());
-    assert!(matches!(
-        with(&|l| l.max_counter_max = 4).err(),
-        Some(Rejection::CounterTooWide {
-            max: 5,
-            limit: 4,
-            ..
-        })
-    ));
 }
 
 /// A plan-budget rejection leaves normal compilation and dispatch usable.
 #[test]
 fn rejection_keeps_regex_usable() {
-    let re = forced("a{2,}b");
+    let re = forced("x((a|aa){2,3}){2,3}z");
     assert!(re.grouped_plan().is_err());
     let mut mem = MatcherMemory::default();
     let mut m = mem.matcher(&re);
-    m.chunk(b"xaaab");
+    m.chunk(b"qxaaaaaaz");
     assert!(m.finish());
 }
 
@@ -555,56 +582,115 @@ fn rejection_keeps_regex_usable() {
 // Transfers
 // ---------------------------------------------------------------------------
 
-/// Scalar increment of every count in `s`, by `counter_step`.
-fn scalar_increment(s: u64, min: usize, max: usize) -> (u64, bool) {
-    let mut cont = 0u64;
-    let mut brk = false;
-    for v in 0..64 {
-        if s >> v & 1 == 0 {
-            continue;
-        }
+/// Run the grouped increment on the count set `counts`, with `prefill`
+/// already in the continue row, and compare with `counter_step` applied
+/// to each count.
+fn check_increment(min: usize, max: usize, counts: &BTreeSet<usize>, prefill: &BTreeSet<usize>) {
+    let inc = Increment::new(min, max);
+    let w = inc.words();
+    let src = Row {
+        off: 0,
+        words: w as u32,
+    };
+    let out = Row {
+        off: w as u32,
+        words: w as u32,
+    };
+    let mut rows = vec![0u64; 2 * w];
+    for &v in counts {
+        rows[v / 64] |= 1 << (v % 64);
+    }
+    for &v in prefill {
+        rows[w + v / 64] |= 1 << (v % 64);
+    }
+    let before = rows[..w].to_vec();
+    let brk = exact::increment(&mut rows, src, out, inc);
+
+    let mut cont = prefill.clone();
+    let mut expected_brk = false;
+    for &v in counts {
         let nv = counter_step(v, min, max);
         if nv < max {
-            cont |= 1 << nv;
+            cont.insert(nv);
         }
-        if nv >= min {
-            brk = true;
-        }
+        expected_brk |= nv >= min;
     }
-    (cont, brk)
+    let got: BTreeSet<usize> = (0..64 * w)
+        .filter(|&v| rows[w + v / 64] >> (v % 64) & 1 != 0)
+        .collect();
+    let label = format!("{inc} S={counts:?}");
+    assert_eq!(got, cont, "{label}: continue (padding included)");
+    assert_eq!(brk, expected_brk, "{label}: break");
+    assert_eq!(rows[..w], before[..], "{label}: source row changed");
+}
+
+/// The members of `bits` as a set.
+fn set_of(bits: u64) -> BTreeSet<usize> {
+    (0..64).filter(|&v| bits >> v & 1 != 0).collect()
 }
 
 #[test]
-fn increment_matches_counter_step_exhaustively() {
+fn finite_increment_matches_counter_step_exhaustively() {
     for max in 1..=10usize {
         for min in 0..=max {
-            let masks = CincMasks::finite(min, max);
             // Every subset of the incoming domain 0..max.
             for s in 0..(1u64 << max) {
-                assert_eq!(
-                    exact::increment(s, masks),
-                    scalar_increment(s, min, max),
-                    "{{{min},{max}}} S={s:#b}"
-                );
+                check_increment(min, max, &set_of(s), &BTreeSet::new());
             }
         }
     }
 }
 
 #[test]
-fn increment_matches_counter_step_on_wide_words() {
+fn saturating_increment_matches_counter_step_exhaustively() {
+    for min in 0..=9usize {
+        // Every subset of the domain 0..=min.
+        for s in 0..(1u64 << (min + 1)) {
+            check_increment(min, usize::MAX, &set_of(s), &BTreeSet::new());
+        }
+    }
+}
+
+/// A random subset of `0..n`, dense or sparse, plus the edge counts.
+fn random_sets(rng: &mut Rng, n: usize) -> Vec<BTreeSet<usize>> {
+    let mut sets = vec![
+        BTreeSet::new(),
+        (0..n).collect(),
+        BTreeSet::from([0]),
+        BTreeSet::from([n - 1]),
+    ];
+    for v in [62, 63, 64, 65, 127, 128] {
+        if v < n {
+            sets.push(BTreeSet::from([v]));
+            sets.push((v.saturating_sub(1)..=v).collect());
+        }
+    }
+    for k in 0..200 {
+        let density = [2, 8, 64][k % 3];
+        sets.push((0..n).filter(|_| rng.below(density) == 0).collect());
+    }
+    sets
+}
+
+/// Multiword rows: carries across words, the last word's padding, and
+/// break ranges that straddle words.
+#[test]
+fn increment_matches_counter_step_across_words() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    for max in [31usize, 32, 33, 62, 63] {
-        for min in [0, 1, max / 2, max - 1, max] {
-            let masks = CincMasks::finite(min, max);
-            let domain = u64::MAX >> (64 - max); // 0..max
-            for _ in 0..2000 {
-                let s = rng.next() & rng.next() & domain;
-                assert_eq!(exact::increment(s, masks), scalar_increment(s, min, max));
+    for max in [31usize, 63, 64, 65, 127, 128, 129, 200] {
+        for min in [0, 1, 63, 64, max / 2, max - 1, max] {
+            if min > max {
+                continue;
             }
-            for s in [0, 1, domain, 1 << (max - 1)] {
-                assert_eq!(exact::increment(s, masks), scalar_increment(s, min, max));
+            for set in random_sets(&mut rng, max) {
+                let prefill = random_sets(&mut rng, max).swap_remove(4 + rng.below(200));
+                check_increment(min, max, &set, &prefill);
             }
+        }
+    }
+    for min in [62usize, 63, 64, 65, 127, 128, 129] {
+        for set in random_sets(&mut rng, min + 1) {
+            check_increment(min, usize::MAX, &set, &BTreeSet::new());
         }
     }
 }
@@ -612,7 +698,7 @@ fn increment_matches_counter_step_on_wide_words() {
 #[test]
 #[should_panic(expected = "reached its maximum")]
 fn increment_of_the_maximum_is_impossible() {
-    exact::increment(1 << 5, CincMasks::finite(2, 5));
+    check_increment(2, 65, &BTreeSet::from([65]), &BTreeSet::new());
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +903,10 @@ const PATTERNS: &[(&str, &[u8])] = &[
     ("(ab|cd){1,8}e", b"abcde"),
     ("a(a|aa){1,6}b", b"ab"),
     ("a{0,3}", b"ab"),
+    ("a{2,}b", b"ab"),
+    ("x(a|aa){2,}z", b"xaz"),
+    ("(ab){3,}c", b"abc"),
+    ("a{3,}|b{2,}", b"ab"),
     ("abc|abd", b"abcd"),
     ("", b"a"),
 ];
@@ -840,7 +930,17 @@ fn configurations_match_scalar_interpreter() {
 #[test]
 fn configurations_match_scalar_interpreter_on_long_inputs() {
     let mut rng = Rng(42);
-    for pattern in ["a{63}b", "x(a|aa){2,5}z", "a(a|aa){1,40}b", "(a{2,3}b)*c"] {
+    for pattern in [
+        "a{63}b",
+        "a{64}b",
+        "x(a|aa){2,5}z",
+        "a(a|aa){1,40}b",
+        "a(a|aa){1,130}b",
+        "x(a|aa){60,70}z",
+        "(a{2,3}b)*c",
+        "a{2,}b",
+        "(a|aa){65,}b",
+    ] {
         let re = forced(pattern);
         for _ in 0..30 {
             let len = 40 + rng.below(100);
@@ -992,14 +1092,66 @@ pub(crate) fn check_match_test_build(
 }
 
 #[test]
-fn boundary_patterns_63() {
-    let re = forced("a{63}b");
-    let oracle = oracle("a{63}b");
-    for n in [0, 1, 62, 63, 64, 100] {
-        let mut input = vec![b'a'; n];
-        input.push(b'b');
-        check_input(&re, &oracle, &input, n as u64, "a{63}b");
+fn word_boundary_patterns() {
+    for k in [63usize, 64, 65, 127, 128, 129] {
+        for pattern in [
+            format!("a{{{k}}}b"),
+            format!("x(a|aa){{{k}}}z"),
+            format!("a{{{k},}}b"),
+        ] {
+            let re = forced(&pattern);
+            let oracle = oracle(&pattern);
+            for n in [0, 1, k - 2, k - 1, k, k + 1, k + 2, 2 * k + 3] {
+                for input in [
+                    [vec![b'a'; n], vec![b'b']].concat(),
+                    [vec![b'x'], vec![b'a'; n], vec![b'z']].concat(),
+                ] {
+                    check_input(&re, &oracle, &input, n as u64, &pattern);
+                }
+            }
+        }
     }
+}
+
+/// Saturated counters on long streams: the domain stays `0..=min`, and
+/// nothing grows after the first call.
+#[test]
+fn saturated_counters_on_long_streams() {
+    for (pattern, fill, end, expected) in [
+        ("a{2,}b", b'a', b'b', true),
+        ("x(a|aa){100,}z", b'a', b'z', false), // no `x`
+        ("(a|aa){100,}b", b'a', b'b', true),
+        ("(ab){70,}c", b'a', b'c', false),
+    ] {
+        let re = forced(pattern);
+        let mut scratch = GroupedScratch::new();
+        let mut s = GroupedStream::new(&re, &mut scratch).unwrap();
+        let (stream_bytes, scratch_bytes) = (s.memory_bytes(), scratch.memory_bytes());
+        let block = vec![fill; 4096];
+        for _ in 0..16 {
+            s.chunk(&re, &mut scratch, &block);
+        }
+        s.chunk(&re, &mut scratch, &[end]);
+        assert_eq!(s.finish(&re, &mut scratch), expected, "`{pattern}`");
+        assert_eq!(s.memory_bytes(), stream_bytes);
+        assert_eq!(scratch.memory_bytes(), scratch_bytes);
+        let mut input = block.repeat(16);
+        input.push(end);
+        assert_eq!(
+            oracle(pattern).is_match(&input),
+            expected,
+            "`{pattern}` oracle"
+        );
+    }
+    // The phase-alternating case matches.
+    let re = forced("(ab){70,}c");
+    let mut scratch = GroupedScratch::new();
+    let mut s = GroupedStream::new(&re, &mut scratch).unwrap();
+    for _ in 0..1000 {
+        s.chunk(&re, &mut scratch, b"ab");
+    }
+    s.chunk(&re, &mut scratch, b"c");
+    assert!(s.finish(&re, &mut scratch));
 }
 
 // ---------------------------------------------------------------------------

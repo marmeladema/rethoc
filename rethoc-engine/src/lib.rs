@@ -3086,7 +3086,7 @@ impl RegexBuilder {
                     start,
                     self.counters.len(),
                     &counter_info,
-                    &grouped_nfa::Limits::P1,
+                    &grouped_nfa::Limits::DEFAULT,
                 ) {
                     Ok(plan) => grouped_nfa::GroupedNfa::Admitted(plan),
                     Err(rejection) => grouped_nfa::GroupedNfa::Rejected(rejection),

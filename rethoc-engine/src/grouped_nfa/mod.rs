@@ -19,15 +19,18 @@
 //!
 //! # Status
 //!
-//! Milestones P0 (analysis, opt-in plan) and P1 (one-word, assertion-free
-//! runtime).  The backend is selected only explicitly: compile with
+//! Milestones P0 (analysis, opt-in plan), P1 (assertion-free runtime) and
+//! P2 (multiword and saturating count domains).  The backend is selected
+//! only explicitly: compile with
 //! [`RegexConfig::grouped_nfa`](crate::RegexConfig::grouped_nfa) and run a
 //! [`GroupedStream`].  Default dispatch and the tiers are unchanged.
 //!
 //! Admitted graphs ([`analysis`]): every reachable state has one incoming
 //! scope (outside, or inside exactly one counter), the zero-width graph is
-//! acyclic, and, for this milestone, there is no assertion, no unbounded
-//! counter and no counter maximum above 63.
+//! acyclic, the frontier fits the word budget, and, until milestone P3,
+//! there is no assertion.  A finite counter's rows hold `0..=max`; an
+//! unbounded one saturates at `min` (`counter_step`), so its rows hold
+//! `0..=min`.
 //!
 //! # Streaming
 //!
@@ -73,26 +76,48 @@ impl Row {
     }
 }
 
-/// Masks of a finite one-word `CounterIncrement` with bounds `{min,max}`.
-///
-/// Its incoming counts are below `max` (continuing excludes `max`), so the
-/// incremented set `T = S << 1` lies in `1..=max` and fits the word.
+/// The bounds of a `CounterIncrement`, as the row transfer needs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CincMasks {
-    /// Counts that continue: `0..max`.
-    cont: u64,
-    /// Counts that break: `min..=max`.
-    brk: u64,
+pub(crate) enum Increment {
+    /// `{min,max}`: domain `0..=max`.  Incoming counts are below `max`
+    /// (continuing excludes `max`).
+    Finite { min: u32, max: u32 },
+    /// `{min,}`: counts saturate at `min` (`counter_step`), domain
+    /// `0..=min`.  Every incremented count continues.
+    Saturating { min: u32 },
 }
 
-impl CincMasks {
-    /// Masks for `{min,max}`, `1 <= max <= 63`, `min <= max`.
-    fn finite(min: usize, max: usize) -> Self {
-        assert!((1..64).contains(&max) && min <= max, "one-word bounds");
-        let upto_max = u64::MAX >> (63 - max);
-        Self {
-            cont: upto_max >> 1,
-            brk: upto_max & !((1u64 << min) - 1),
+impl Increment {
+    /// From `CounterIncrement` bounds (`max == usize::MAX`: unbounded).
+    /// The analysis has checked that the domain fits the word budget.
+    fn new(min: usize, max: usize) -> Self {
+        let narrow = |v: usize| u32::try_from(v).expect("domain within the word budget");
+        if max == usize::MAX {
+            Increment::Saturating { min: narrow(min) }
+        } else {
+            assert!(max >= 1 && min <= max, "admitted bounds");
+            Increment::Finite {
+                min: narrow(min),
+                max: narrow(max),
+            }
+        }
+    }
+
+    /// Words of a row of this counter.
+    #[cfg(test)]
+    fn words(self) -> usize {
+        match self {
+            Increment::Finite { max, .. } => max as usize / 64 + 1,
+            Increment::Saturating { min } => min as usize / 64 + 1,
+        }
+    }
+}
+
+impl fmt::Display for Increment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Increment::Finite { min, max } => write!(f, "{{{min},{max}}}"),
+            Increment::Saturating { min } => write!(f, "{{{min},}}"),
         }
     }
 }
@@ -104,13 +129,13 @@ pub(crate) enum ZeroOp {
     Split { src: Row, out: Row, out1: Row },
     /// Outside present: insert count zero at `out`.
     CounterInstance { src: Row, out: Row },
-    /// `T = {v + 1}`; `T ∩ 0..max` continues at `out`; Outside at `out1`
-    /// iff `T ∩ min..=max` is nonempty.
+    /// `T = {counter_step(v)}`; the counts of `T` that continue go to
+    /// `out`; Outside at `out1` iff some count of `T` breaks.
     CounterIncrement {
         src: Row,
         out: Row,
         out1: Row,
-        masks: CincMasks,
+        inc: Increment,
     },
     /// Union into `out` on `Pass` (not admitted before milestone P3).
     Assert {
@@ -229,14 +254,12 @@ impl fmt::Display for GroupedNfaPlan {
                     src,
                     out,
                     out1,
-                    masks,
+                    inc,
                 } => writeln!(
                     f,
-                    "    {} CInc cont={:#x} -> {}, brk={:#x} -> {}",
+                    "    {} CInc{inc} cont -> {}, break -> {}",
                     state_of(src),
-                    masks.cont,
                     state_of(out),
-                    masks.brk,
                     state_of(out1)
                 )?,
                 ZeroOp::Assert { kind, src, out } => writeln!(

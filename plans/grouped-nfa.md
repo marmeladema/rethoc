@@ -1,7 +1,8 @@
 # Exact grouped NFA implementation plan
 
-Status: P0 and P1 implemented in `rethoc-engine/src/grouped_nfa/` (opt-in
-`RegexConfig::grouped_nfa`, one-word assertion-free runtime); P2–P5 open; not
+Status: P0–P2 implemented in `rethoc-engine/src/grouped_nfa/` (opt-in
+`RegexConfig::grouped_nfa`, assertion-free runtime, multiword and saturating
+count domains within the 8,192-word frontier budget); P3–P5 open; not
 benchmarked. Designed against main `b0bb981e8c6cba7b23df176d79f741c3b61089a7`;
 source references below re-checked at `d82066d`. This work does not
 investigate existing tier correctness bugs.
@@ -424,6 +425,10 @@ experimental backend name, not Tier 5. Each milestone is independently reviewabl
   admitted; about 1,140 of the rejections are assertions (P3).
 - `(?:\b){2,3}` compiles to a lone `\b` without a counter; the
   zero-width-cycle test uses `(?:\b|a){2,3}` instead.
+- P2 drops the per-counter limit: a counter is admitted when the frontier
+  fits `max_row_words` (8,192 words: `a{N}` has two counted rows, so N up
+  to about 260,000; the default `max_repetition` of 1,000 is far below).
+  The increment computes word masks on the fly rather than storing them.
 - P4 must fit the checker selector into `TierChoice` and add grouped runs
   to the `assert-in-body` sweep family.
 

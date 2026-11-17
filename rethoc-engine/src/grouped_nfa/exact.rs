@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use super::{CincMasks, ConsumerKind, GroupedNfaError, GroupedNfaPlan, Row, ZeroOp};
+use super::{ConsumerKind, GroupedNfaError, GroupedNfaPlan, Increment, Row, ZeroOp};
 use crate::{AssertEval, Regex, State, StateIdx, byte_match_ci};
 
 // ---------------------------------------------------------------------------
@@ -69,21 +69,76 @@ fn union_into(from: &[u64], src: Row, to: &mut [u64], dst: Row) {
     }
 }
 
-/// A finite one-word increment of the count set `s`: the incremented
-/// counts that continue, and whether any of them breaks.
-///
-/// `T = {v + 1 : v in S}`; continue with `T ∩ 0..max`, break iff
-/// `T ∩ min..=max` is nonempty.  `S` lies below `max`, since only the
-/// continue edge returns into the body.
+/// The bits of word `i` (counts `64 i ..= 64 i + 63`) inside `lo..=hi`.
 #[inline]
-pub(crate) fn increment(s: u64, masks: CincMasks) -> (u64, bool) {
-    assert_eq!(
-        s & !masks.cont,
-        0,
-        "a count reached its maximum before the increment"
-    );
-    let t = s << 1;
-    (t & masks.cont, t & masks.brk != 0)
+fn word_mask(i: usize, lo: usize, hi: usize) -> u64 {
+    let base = i * 64;
+    if hi < lo || hi < base || lo > base + 63 {
+        return 0;
+    }
+    let a = lo.saturating_sub(base);
+    let b = (hi - base).min(63);
+    (u64::MAX >> (63 - b)) & (u64::MAX << a)
+}
+
+/// Is count `v` in the row at `off`?
+#[inline]
+fn has(rows: &[u64], off: usize, v: usize) -> bool {
+    rows[off + v / 64] >> (v % 64) & 1 != 0
+}
+
+/// Increment the count set `S = rows[src]` pointwise by `counter_step`:
+/// OR the incremented counts that continue into `rows[out]` and return
+/// whether any of them breaks.  `src` and `out` are distinct rows of one
+/// counter.
+///
+/// - Finite `{min,max}`: `T = S << 1` with carries between words.  `S`
+///   lies below `max`, since only the continue edge returns into the body,
+///   so `T` lies in `1..=max`: continue with `T ∩ 0..max`, break iff
+///   `T ∩ min..=max` is nonempty.
+/// - Saturating `{min,}`: `T = (S << 1) ∩ 0..=min`, plus `min` itself if
+///   `min ∈ S` (it stays at `min`).  All of `T` continues; break iff
+///   `min ∈ T`.  `min = 0` works: `T = {0}` whenever `S` is nonempty.
+#[inline]
+pub(crate) fn increment(rows: &mut [u64], src: Row, out: Row, inc: Increment) -> bool {
+    debug_assert_eq!(src.words, out.words, "increment across scopes");
+    debug_assert_ne!(src.off, out.off, "increment into its own row");
+    let (s0, o0, w) = (src.off as usize, out.off as usize, src.words as usize);
+    let mut carry = 0u64;
+    match inc {
+        Increment::Finite { min, max } => {
+            let (min, max) = (min as usize, max as usize);
+            assert!(
+                rows[s0 + max / 64] >> (max % 64) == 0,
+                "a count reached its maximum before the increment"
+            );
+            let mut brk = false;
+            for i in 0..w {
+                let s = rows[s0 + i];
+                let t = (s << 1) | carry;
+                carry = s >> 63;
+                brk |= t & word_mask(i, min, max) != 0;
+                rows[o0 + i] |= t & word_mask(i, 0, max - 1);
+            }
+            debug_assert_eq!(carry, 0, "counts below max fit the row");
+            brk
+        }
+        Increment::Saturating { min } => {
+            let min = min as usize;
+            let stays = has(rows, s0, min);
+            for i in 0..w {
+                let s = rows[s0 + i];
+                let t = (s << 1) | carry;
+                carry = s >> 63;
+                rows[o0 + i] |= t & word_mask(i, 0, min);
+            }
+            let reaches = min > 0 && has(rows, s0, min - 1);
+            if stays || reaches {
+                rows[o0 + min / 64] |= 1 << (min % 64);
+            }
+            stays || reaches
+        }
+    }
 }
 
 /// Does the single-byte predicate of `state` accept `b`?
@@ -135,16 +190,9 @@ pub(crate) fn close(
                 src,
                 out,
                 out1,
-                masks,
+                inc,
             } => {
-                debug_assert_eq!(src.words, 1, "one-word counters only before P2");
-                let s = closure[src.off as usize];
-                if s == 0 {
-                    continue;
-                }
-                let (cont, brk) = increment(s, masks);
-                closure[out.off as usize] |= cont;
-                if brk {
+                if !is_empty(closure, src) && increment(closure, src, out, inc) {
                     closure[out1.off as usize] |= 1;
                 }
             }
