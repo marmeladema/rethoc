@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use super::{CincMasks, Consumer, ConsumerKind, GroupedNfaPlan, Row, ZeroOp};
+use super::{Consumer, ConsumerKind, GroupedNfaPlan, Increment, Row, ZeroOp};
 use crate::{ByteMap, CounterIdx, CounterInfo, State, StateIdx};
 
 // ---------------------------------------------------------------------------
@@ -31,20 +31,17 @@ pub(crate) struct Limits {
     pub(crate) max_plan_bytes: usize,
     /// Most bytes of transient analysis arrays.
     pub(crate) max_analysis_bytes: usize,
-    /// Largest admitted finite counter maximum.  Milestone P1 keeps every
-    /// counted domain `0..=max` in one word, so `max <= 63`.
-    pub(crate) max_counter_max: usize,
 }
 
 impl Limits {
-    /// The limits of milestone P1.
-    pub(crate) const P1: Limits = Limits {
+    /// The experimental limits.  Counted domains have no limit of their
+    /// own: a counter is admitted when its rows fit `max_row_words`.
+    pub(crate) const DEFAULT: Limits = Limits {
         max_states: 4096,
         max_edges: 1 << 20,
         max_row_words: 8192,
         max_plan_bytes: 1 << 20,
         max_analysis_bytes: 2 << 20,
-        max_counter_max: 63,
     };
 }
 
@@ -77,15 +74,6 @@ pub enum Rejection {
     ZeroWidthCycle { state: u32 },
     /// Milestone exclusion: assertions arrive with milestone P3.
     Assertion { state: u32 },
-    /// Milestone exclusion: unbounded counters arrive with milestone P2.
-    UnboundedCounter { counter: u8 },
-    /// Milestone exclusion: a counted domain wider than one word arrives
-    /// with milestone P2.
-    CounterTooWide {
-        counter: u8,
-        max: usize,
-        limit: usize,
-    },
     /// The frontier would need more words than the budget.
     TooManyRowWords { words: usize, limit: usize },
     /// The retained plan arrays would exceed their budget.
@@ -138,20 +126,6 @@ impl fmt::Display for Rejection {
                     "assertion at state {state} (not admitted before milestone P3)"
                 )
             }
-            Self::UnboundedCounter { counter } => {
-                write!(
-                    f,
-                    "counter c{counter} is unbounded (not admitted before milestone P2)"
-                )
-            }
-            Self::CounterTooWide {
-                counter,
-                max,
-                limit,
-            } => write!(
-                f,
-                "counter c{counter} has max {max} > {limit} (one-word domains until milestone P2)"
-            ),
             Self::TooManyRowWords { words, limit } => {
                 write!(f, "frontier needs {words} words, limit {limit}")
             }
@@ -322,13 +296,13 @@ fn prove_scopes(
 // Counter domains
 // ---------------------------------------------------------------------------
 
-/// Bounds of each counter, from its reachable increments.
+/// Bounds of each counter, from its reachable increments.  An unbounded
+/// counter has `max == usize::MAX`.
 fn counter_bounds(
     states: &[State],
     reachable: &[StateIdx],
     counter_info: &[CounterInfo],
     num_counters: usize,
-    limits: &Limits,
 ) -> Result<Vec<Option<(usize, usize)>>, Rejection> {
     let mut bounds: Vec<Option<(usize, usize)>> = vec![None; num_counters];
     for &idx in reachable {
@@ -347,21 +321,11 @@ fn counter_bounds(
             {
                 return Err(Rejection::CounterBoundsMismatch { counter: c });
             }
-            if max == usize::MAX {
-                return Err(Rejection::UnboundedCounter { counter: c });
-            }
-            if max == 0 || min > max {
+            if max != usize::MAX && (max == 0 || min > max) {
                 return Err(Rejection::UnsupportedBounds {
                     counter: c,
                     min,
                     max,
-                });
-            }
-            if max > limits.max_counter_max {
-                return Err(Rejection::CounterTooWide {
-                    counter: c,
-                    max,
-                    limit: limits.max_counter_max,
                 });
             }
         }
@@ -424,13 +388,16 @@ fn zero_width_order(states: &[State], reachable: &[StateIdx]) -> Result<Vec<Stat
 // Plan construction
 // ---------------------------------------------------------------------------
 
-/// Words of a row in `scope`.
+/// Words of a row in `scope`.  A finite counter's domain is `0..=max`;
+/// an unbounded one saturates at `min`, so its domain is `0..=min` (never
+/// sized from the `usize::MAX` sentinel).
 fn row_words(scope: Scope, bounds: &[Option<(usize, usize)>]) -> usize {
     match scope {
         Scope::Outside => 1,
         Scope::Counter(c) => {
-            let (_, max) = bounds[c.idx()].expect("a counted scope has an increment");
-            (max + 1).div_ceil(64)
+            let (min, max) = bounds[c.idx()].expect("a counted scope has an increment");
+            let top = if max == usize::MAX { min } else { max };
+            top / 64 + 1
         }
     }
 }
@@ -477,7 +444,7 @@ pub(crate) fn analyze(
     {
         return Err(Rejection::Assertion { state: idx.0 });
     }
-    let bounds = counter_bounds(states, &reachable, counter_info, num_counters, limits)?;
+    let bounds = counter_bounds(states, &reachable, counter_info, num_counters)?;
 
     // Row layout, in topological order so a closure pass walks the arena
     // roughly front to back.
@@ -545,7 +512,8 @@ pub(crate) fn analyze(
                 src,
                 out: row(out),
                 out1: row(out1),
-                masks: CincMasks::finite(min, max),
+                // The word budget passed, so the domain fits `u32`.
+                inc: Increment::new(min, max),
             }),
             State::Assert { kind, out } => ops.push(ZeroOp::Assert {
                 kind,
