@@ -10,8 +10,8 @@ use indexmap::IndexSet;
 use std::fmt;
 
 use crate::{
-    AssertKind, CounterCtx, CounterIdx, CounterPool, CtxDedupTable, Regex, State, StateIdx,
-    byte_match_ci, counter_step,
+    AssertEval, AssertKind, CounterCtx, CounterIdx, CounterPool, CtxDedupTable, Regex, State,
+    StateIdx, byte_match_ci, counter_step,
 };
 
 use super::{DfaState, DfaStateId, DfaStateRef};
@@ -576,8 +576,11 @@ impl Tier4DfaCache {
                             self.closure_work.push(TraceFrame::Visit(out));
                         }
                         State::Assert { kind, out } => match kind {
-                            AssertKind::Start => {
-                                if at_start {
+                            // Decided by what is behind the position,
+                            // which is known here: one definition, the
+                            // assertion's own.
+                            AssertKind::Start | AssertKind::StartLF => {
+                                if kind.eval(at_start, false, prev_byte, None) == AssertEval::Pass {
                                     self.closure_work.push(TraceFrame::Unmark(i));
                                     self.closure_work.push(TraceFrame::Visit(out));
                                 } else {
@@ -593,14 +596,6 @@ impl Tier4DfaCache {
                                     self.closure_ops.extend(sub_ops);
                                 }
                                 self.closure_visited[i] = false;
-                            }
-                            AssertKind::StartLF => {
-                                if at_start || prev_byte == Some(b'\n') {
-                                    self.closure_work.push(TraceFrame::Unmark(i));
-                                    self.closure_work.push(TraceFrame::Visit(out));
-                                } else {
-                                    self.closure_visited[i] = false;
-                                }
                             }
                             _ => {
                                 debug_assert!(

@@ -184,8 +184,9 @@ with unrolling and merging off (the same three configurations as the
 `min_tier: 1` entry; the failure message names the configuration.
 
 Tiers 1–3 are also run at the minimum DFA state cap, where the cache is
-emptied every few bytes; the failure message names the cap. A behaviour
-that switches at a threshold needs tests on both sides of it.
+emptied every few bytes, and every build is repeated with byte
+equivalence classes forced on; the failure message names both. A
+behaviour that switches at a threshold needs tests on both sides of it.
 
 Entries compile with the engine's default compile limit
 (`max_estimated_states`), like user code. A pattern estimated above it
@@ -200,6 +201,12 @@ configuration, and setting it skips the default one.
 - **Precompute at build time.** Anything derivable from the NFA is
   computed in `RegexBuilder::build()` and stored on `Regex`. Hot paths do
   not recompute invariants.
+- **One definition, derived tables.** A table derived from the pattern
+  (byte classes, prefilter, tier analyses) must come from the definition
+  it summarises, not from its own list of cases. What an assertion reads
+  from the bytes around it is declared once, in `AssertKind::byte_props`
+  (an exhaustive match, checked against `eval` by a test); the byte
+  classes are built from that.
 - **A cache never changes an answer.** The DFA state tables of tiers
   1–3 are caches of something that can always be recomputed. A full
   cache is emptied and refilled (`DfaCache::evict`); a value that cannot

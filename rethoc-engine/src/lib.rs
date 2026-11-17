@@ -198,14 +198,37 @@ impl Index<ByteTableIdx> for [ByteMap] {
 // Zero-width assertions
 // ---------------------------------------------------------------------------
 
-/// The kind of zero-width assertion.
-///
-/// Each variant knows how to evaluate itself given the surrounding
-/// context (position flags and neighbouring bytes).  See [`eval`].
-///
-/// [`eval`]: AssertKind::eval
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AssertKind {
+/// Define [`AssertKind`] together with [`AssertKind::ALL`], so that the
+/// list of kinds cannot fall out of step with the enum.
+macro_rules! assert_kinds {
+    ($($(#[$doc:meta])* $name:ident,)*) => {
+        /// The kind of zero-width assertion.
+        ///
+        /// Each variant knows how to evaluate itself given the surrounding
+        /// context (position flags and neighbouring bytes).  See [`eval`].
+        ///
+        /// [`eval`]: AssertKind::eval
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum AssertKind {
+            $($(#[$doc])* $name,)*
+        }
+
+        impl AssertKind {
+            /// Every kind, in declaration order.  The tests that tie the
+            /// hand-written summaries of an assertion ([`byte_props`],
+            /// [`is_dfa_deferrable`], the DFA's stand-in for the previous
+            /// byte) to [`eval`] iterate over this.
+            ///
+            /// [`byte_props`]: AssertKind::byte_props
+            /// [`is_dfa_deferrable`]: AssertKind::is_dfa_deferrable
+            /// [`eval`]: AssertKind::eval
+            #[cfg(test)]
+            pub(crate) const ALL: &'static [AssertKind] = &[$(AssertKind::$name,)*];
+        }
+    };
+}
+
+assert_kinds! {
     /// `^`  — start of input only.
     Start,
     /// `$`  — end of input only.
@@ -249,6 +272,56 @@ pub(crate) enum AssertKind {
     WordEndAscii,
 }
 
+/// The properties of a byte that the outcome of an assertion can depend
+/// on, as a bit set.
+///
+/// An assertion looks at the byte before and the byte after a position,
+/// but only at a few facts about them.  [`AssertKind::byte_props`] names
+/// those facts for each kind, and everything that treats several bytes
+/// alike (the byte equivalence classes of the DFA tiers) must keep bytes
+/// apart that differ in a property some assertion of the pattern reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct ByteProps(u8);
+
+impl ByteProps {
+    /// No property.
+    pub(crate) const NONE: Self = Self(0);
+    /// The byte is an ASCII word byte, `[0-9A-Za-z_]`.
+    pub(crate) const WORD: Self = Self(1);
+    /// The byte is `\n`.
+    pub(crate) const LF: Self = Self(1 << 1);
+    /// The byte is `\r`.
+    pub(crate) const CR: Self = Self(1 << 2);
+
+    /// The properties `b` has.
+    #[inline]
+    pub(crate) fn of(b: u8) -> Self {
+        let mut props = Self::NONE;
+        if is_word_byte(b) {
+            props = props.union(Self::WORD);
+        }
+        if b == b'\n' {
+            props = props.union(Self::LF);
+        }
+        if b == b'\r' {
+            props = props.union(Self::CR);
+        }
+        props
+    }
+
+    /// Properties in `self` or `other`.
+    #[inline]
+    pub(crate) const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Properties in both `self` and `other`.
+    #[inline]
+    pub(crate) const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+}
+
 /// Result of evaluating an assertion at a given position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AssertEval {
@@ -286,6 +359,26 @@ pub(crate) fn byte_match_ci(input: u8, target: u8) -> bool {
 pub(crate) use prefilter::Prefilter;
 
 impl AssertKind {
+    /// The properties of the previous and of the next byte that
+    /// [`eval`](Self::eval) reads.  Two bytes that agree on them are
+    /// interchangeable for this assertion, on either side of it.
+    ///
+    /// The match is exhaustive on purpose: a new kind cannot be added
+    /// without saying what it reads, and a test checks the answer against
+    /// `eval` for every pair of bytes.
+    #[inline]
+    pub(crate) const fn byte_props(self) -> ByteProps {
+        match self {
+            AssertKind::Start | AssertKind::End => ByteProps::NONE,
+            AssertKind::StartLF | AssertKind::EndLF => ByteProps::LF,
+            AssertKind::StartCRLF | AssertKind::EndCRLF => ByteProps::LF.union(ByteProps::CR),
+            AssertKind::WordAscii
+            | AssertKind::WordAsciiNegate
+            | AssertKind::WordStartAscii
+            | AssertKind::WordEndAscii => ByteProps::WORD,
+        }
+    }
+
     /// True for the assertions that the DFA tiers defer: the word-boundary
     /// family and `EndLF`.
     ///
@@ -917,8 +1010,8 @@ pub struct Regex {
     /// the table compression keeps the working set small enough to stay in
     /// cache.
     ///
-    /// We therefore only enable byte-class compression when the NFA has more
-    /// than [`BYTE_CLASSES_NFA_THRESHOLD`] states.  Below that threshold,
+    /// We therefore only enable byte-class compression when the NFA has at
+    /// least [`RegexConfig::byte_class_min_states`] states.  Below that,
     /// `byte_classes` is the identity mapping and `num_byte_classes` is 256.
     pub(crate) byte_classes: [u8; 256],
     /// Number of distinct byte equivalence classes (the "stride" of
@@ -1354,6 +1447,15 @@ pub struct RegexConfig {
     /// This bounds the worst-case memory and compilation time for
     /// untrusted patterns.  Default: 2048.
     pub max_estimated_states: usize,
+    /// Minimum NFA state count at which the DFA tiers index their
+    /// transition tables by byte equivalence class instead of by byte.
+    /// Below it they use the byte itself and save the indirection; at or
+    /// above it the smaller rows keep more DFA states in cache.  Never
+    /// changes a match result.  `0` compresses every pattern, which the
+    /// tests and the differential tools use to exercise the classes on
+    /// small patterns; `usize::MAX` never compresses.  Default: 128.
+    #[doc(hidden)]
+    pub byte_class_min_states: usize,
 }
 
 impl Default for RegexConfig {
@@ -1363,6 +1465,7 @@ impl Default for RegexConfig {
             max_unroll_states: DEFAULT_MAX_UNROLL_STATES,
             merge_repetitions: true,
             max_estimated_states: DEFAULT_MAX_ESTIMATED_STATES,
+            byte_class_min_states: DEFAULT_BYTE_CLASS_MIN_STATES,
         }
     }
 }
@@ -1566,16 +1669,28 @@ impl RegexBuilder {
         states: &[State],
         classes: &[ByteClassBits],
         byte_tables: &[ByteMap],
-        has_deferred_assert: bool,
     ) -> ([u8; 256], usize) {
         // For each byte, build a signature: a compact key that captures
-        // its behavior across all consuming states.  Bytes with identical
-        // signatures are placed in the same equivalence class.
+        // its behavior across all consuming states and all assertions.
+        // Bytes with identical signatures are placed in the same
+        // equivalence class.
+        //
+        // First element: the byte's properties that some assertion of
+        // the pattern reads (see `AssertKind::byte_props`).  A DFA
+        // transition computed for one byte is reused for every byte of
+        // its class, and that computation evaluates assertions with the
+        // byte as their previous or next byte.
         //
         // Signature element per consuming state:
         //   0            → byte does not match this state
         //   1 + out.idx  → byte matches, transitions to `out`
         //   (for ByteTable: 1 + table_target.idx, or 0 if NONE)
+
+        // The byte properties read by the pattern's assertions.
+        let assert_props = states.iter().fold(ByteProps::NONE, |props, s| match s {
+            State::Assert { kind, .. } => props.union(kind.byte_props()),
+            _ => props,
+        });
 
         // Collect consuming state indices.
         let consuming: Vec<usize> = states
@@ -1601,10 +1716,7 @@ impl RegexBuilder {
         for b in 0..=255u8 {
             let mut sig: Vec<u32> = Vec::with_capacity(consuming.len() + 1);
 
-            // First element: word-ness (when deferred assertions are present).
-            if has_deferred_assert {
-                sig.push(if is_word_byte(b) { 1 } else { 0 });
-            }
+            sig.push(u32::from(ByteProps::of(b).intersection(assert_props).0));
 
             for &si in &consuming {
                 let action = match states[si] {
@@ -2495,13 +2607,6 @@ impl RegexBuilder {
         }
     }
 
-    /// Minimum NFA state count to enable byte equivalence class compression.
-    ///
-    /// Below this threshold the DFA uses stride=256 (identity mapping) to
-    /// avoid the ~2-3 insn/byte indirection overhead.  Above it, byte
-    /// classes compress the transition table so more DFA states fit in cache.
-    const BYTE_CLASSES_NFA_THRESHOLD: usize = 128;
-
     /// Compile a `regex-syntax` HIR into a ready-to-match [`Regex`].
     pub fn build(&mut self, hir: &Hir) -> Result<Regex, Error> {
         // Complexity check: reject patterns whose fully-unrolled cost
@@ -2799,34 +2904,18 @@ impl RegexBuilder {
         // Compute byte equivalence classes before moving data out.
         let classes_slice: Vec<ByteClassBits> = self.classes.iter().copied().collect();
         let byte_tables_slice: Vec<ByteMap> = self.byte_tables.to_vec();
-        // Deferred assertions need word-ness splitting.
-        let has_any_deferred = self.states.iter().any(|s| {
-            matches!(
-                s,
-                State::Assert { kind, .. } if matches!(
-                    kind,
-                    AssertKind::WordAscii
-                    | AssertKind::WordAsciiNegate
-                    | AssertKind::EndLF
-                )
-            )
-        });
-        let (byte_classes, num_byte_classes) =
-            if self.states.len() >= Self::BYTE_CLASSES_NFA_THRESHOLD {
-                Self::compute_byte_classes(
-                    self.states.as_slice(),
-                    &classes_slice,
-                    &byte_tables_slice,
-                    has_any_deferred,
-                )
-            } else {
-                // Identity mapping: stride=256, no indirection overhead.
-                let mut identity = [0u8; 256];
-                for (i, slot) in identity.iter_mut().enumerate() {
-                    *slot = i as u8;
-                }
-                (identity, 256)
-            };
+        let (byte_classes, num_byte_classes) = if self.states.len()
+            >= self.config.byte_class_min_states
+        {
+            Self::compute_byte_classes(self.states.as_slice(), &classes_slice, &byte_tables_slice)
+        } else {
+            // Identity mapping: stride=256, no indirection overhead.
+            let mut identity = [0u8; 256];
+            for (i, slot) in identity.iter_mut().enumerate() {
+                *slot = i as u8;
+            }
+            (identity, 256)
+        };
 
         // If the pattern can match empty, every byte is "interesting"
         // — prefilter can't help.
@@ -3177,6 +3266,9 @@ const DEFAULT_MAX_UNROLL_STATES: usize = 32;
 /// bounded repetition were fully unrolled (`estimate_nfa_states`).
 /// Used by [`RegexConfig::default()`].
 const DEFAULT_MAX_ESTIMATED_STATES: usize = 2048;
+
+/// Default for [`RegexConfig::byte_class_min_states`].
+const DEFAULT_BYTE_CLASS_MIN_STATES: usize = 128;
 
 /// Sentinel value: this counter slot is inactive (thread is not inside
 /// this counter's repetition body).
@@ -5279,25 +5371,38 @@ mod tests {
         let full = format!("(?s-u){}", pattern);
         let oracle = regex::bytes::Regex::new(&full).expect("regex crate should parse pattern");
 
-        let mut builds = vec![(format!("unroll={unroll_limit} merge=true"), re)];
+        let mut builds = vec![(unroll_limit, true, re)];
         if unroll_limit > 0 {
-            builds.push((
-                "unroll=0 merge=true".to_string(),
-                build_regex_with_config(pattern, config(0, true)),
-            ));
+            builds.push((0, true, build_regex_with_config(pattern, config(0, true))));
         }
-        builds.push((
-            "unroll=0 merge=false".to_string(),
-            build_regex_with_config(pattern, config(0, false)),
-        ));
-        for (label, re) in &builds {
-            test_all_tiers(pattern, re, &oracle, inputs, label);
+        builds.push((0, false, build_regex_with_config(pattern, config(0, false))));
+        for (unroll, merge, re) in &builds {
+            let label = format!("unroll={unroll} merge={merge}");
+            test_all_tiers(pattern, re, &oracle, inputs, &label);
             // NFA-guided input generation: walk the NFA with
             // counter-boundary schedules to produce structurally
             // meaningful inputs.  The regex crate oracle determines
             // expected results — no manual hints needed.
             let generated = generate_nfa_inputs(re, 1000);
-            test_generated(pattern, re, &oracle, &generated, label);
+            test_generated(pattern, re, &oracle, &generated, &label);
+
+            // The same build with byte equivalence classes forced on.
+            // They normally start at 128 NFA states, which few entries
+            // reach; a result must not depend on them (Bug 65).  The NFA
+            // is the same, so the generated inputs are reused; a build
+            // that already uses classes has nothing new to show.
+            if re.num_byte_classes == 256 {
+                let forced = build_regex_with_config(
+                    pattern,
+                    RegexConfig {
+                        byte_class_min_states: 0,
+                        ..config(*unroll, *merge)
+                    },
+                );
+                let label = format!("{label} byte-classes");
+                test_all_tiers(pattern, &forced, &oracle, inputs, &label);
+                test_generated(pattern, &forced, &oracle, &generated, &label);
+            }
         }
     }
 
@@ -13377,6 +13482,107 @@ mod tests {
                 ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaababc", true),
             ],
         }
+        // Bug 65: byte equivalence classes put `\n` in a class with other
+        // bytes and did not split word bytes for `\b{start}` / `\b{end}`,
+        // so a transition computed for one byte of a class was reused for
+        // a byte with a different assertion outcome.  The classes start at
+        // 128 NFA states; the runner also forces them on for every entry.
+        test_byte_classes_multiline_start {
+            pattern: "(?m:^)ab",
+            memory: 924,
+            min_tier: 1,
+            inputs: [
+                ("  \nab", true),
+                ("\n ab", false),
+                ("ab", true),
+                ("xab", false),
+                ("x\n\nab", true),
+                ("\tab\n ab", false),
+            ],
+        }
+        test_byte_classes_multiline_end {
+            pattern: "xa(?m:$)",
+            memory: 924,
+            min_tier: 1,
+            inputs: [
+                ("xa  xa\n", true),
+                ("xa\n xa !", true),
+                ("xa xa !", false),
+                ("xa", true),
+                ("xab\n", false),
+            ],
+        }
+        test_byte_classes_word_start {
+            pattern: "\\b{start}ab",
+            memory: 924,
+            min_tier: 1,
+            inputs: [
+                ("zz ab", true),
+                ("- zab", false),
+                ("ab", true),
+                ("_ab", false),
+                ("-ab", true),
+                ("z-ab", true),
+            ],
+        }
+        test_byte_classes_word_end {
+            pattern: "xa\\b{end}",
+            memory: 924,
+            min_tier: 1,
+            inputs: [
+                ("xaz xa-", true),
+                ("xa- xaz", true),
+                ("xaz xa_", false),
+                ("xa", true),
+                ("xa\n", true),
+            ],
+        }
+        // The same on patterns large enough for the classes with the
+        // default settings (a 130-byte literal as a second alternative).
+        test_byte_classes_multiline_start_large {
+            pattern: "(?m:^)ab|qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            memory: 5247,
+            min_tier: 1,
+            inputs: [
+                ("  \nab", true),
+                ("\n ab", false),
+                ("ab", true),
+                (" ab", false),
+            ],
+        }
+        test_byte_classes_multiline_end_large {
+            pattern: "xa(?m:$)|qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            memory: 5247,
+            min_tier: 1,
+            inputs: [
+                ("xa  xa\n", true),
+                ("xa xa !", false),
+                ("xa\n !", true),
+            ],
+        }
+        test_byte_classes_word_start_end_large {
+            pattern: "\\b{start}ab\\b{end}|qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            memory: 5280,
+            min_tier: 1,
+            inputs: [
+                ("zz ab", true),
+                ("- zab", false),
+                ("zz ab-", true),
+                ("zz abz", false),
+                ("_ab", false),
+            ],
+        }
+        test_byte_classes_multiline_start_counter_large {
+            pattern: "(?m:^)a{40,60}b|qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            memory: 5451,
+            min_tier: 2,
+            inputs: [
+                ("  \naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", true),
+                ("\n aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", false),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", true),
+                (" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", false),
+            ],
+        }
     }
 
     /// Every 12-letter word over `a`/`b`, concatenated: 49 KB that take a
@@ -14030,8 +14236,147 @@ mod tests {
         assert!(!has_byteci2, "plain \"a\" should not use ByteCI");
     }
 
+    /// `AssertKind::ALL` is generated with the enum; this pins its
+    /// length so that the tests below are known to cover ten kinds.
+    #[test]
+    fn test_all_assert_kinds_lists_every_kind() {
+        assert_eq!(AssertKind::ALL.len(), 10);
+        for (i, a) in AssertKind::ALL.iter().enumerate() {
+            for b in &AssertKind::ALL[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    /// The kinds that can ask to wait for the next byte are the ones the
+    /// DFA tiers know how to defer, plus the CRLF-aware anchors, which
+    /// never run on a DFA tier.
+    #[test]
+    fn test_dfa_deferrable_kinds_are_the_ones_that_defer() {
+        let bytes = || std::iter::once(None).chain((0..=255u8).map(Some));
+        for &kind in AssertKind::ALL {
+            let mut defers = false;
+            for at_start in [false, true] {
+                for at_end in [false, true] {
+                    for prev in bytes() {
+                        defers |= kind.eval(at_start, at_end, prev, None) == AssertEval::Defer;
+                    }
+                }
+            }
+            let crlf = matches!(kind, AssertKind::StartCRLF | AssertKind::EndCRLF);
+            assert_eq!(defers, kind.is_dfa_deferrable() || crlf, "{kind:?}");
+        }
+    }
+
+    /// Bug 65: `AssertKind::byte_props` names everything `eval` reads
+    /// from the previous and the next byte.  For every kind, position
+    /// flags and pair of bytes, replacing each byte by another one with
+    /// the same declared properties must not change the outcome.
+    #[test]
+    fn test_assert_byte_props_cover_everything_eval_reads() {
+        for &kind in AssertKind::ALL {
+            let props = kind.byte_props();
+            // One stand-in per combination of the declared properties.
+            let mut stand_in: [Option<u8>; 8] = [None; 8];
+            for b in 0..=255u8 {
+                let key = ByteProps::of(b).intersection(props).0 as usize;
+                stand_in[key].get_or_insert(b);
+            }
+            let canon = |b: Option<u8>| {
+                b.map(|b| stand_in[ByteProps::of(b).intersection(props).0 as usize].unwrap())
+            };
+            let bytes = || std::iter::once(None).chain((0..=255u8).map(Some));
+            for at_start in [false, true] {
+                for at_end in [false, true] {
+                    for prev in bytes() {
+                        for next in bytes() {
+                            assert_eq!(
+                                kind.eval(at_start, at_end, prev, next),
+                                kind.eval(at_start, at_end, canon(prev), canon(next)),
+                                "{kind:?} at_start={at_start} at_end={at_end} \
+                                 prev={prev:?} next={next:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The declared properties are also not wider than needed: for each
+    /// property a kind declares, some pair of bytes that differ only in
+    /// it gives different outcomes.  (An over-wide declaration is safe but
+    /// costs byte classes.)
+    #[test]
+    fn test_assert_byte_props_are_minimal() {
+        // (property, a byte with it, a byte without it and otherwise alike)
+        let witnesses = [
+            (ByteProps::WORD, b'a', b'-'),
+            (ByteProps::LF, b'\n', b'-'),
+            (ByteProps::CR, b'\r', b'-'),
+        ];
+        for &kind in AssertKind::ALL {
+            for (prop, with, without) in witnesses {
+                let declared = kind.byte_props().intersection(prop) != ByteProps::NONE;
+                let bytes = || std::iter::once(None).chain((0..=255u8).map(Some));
+                let mut matters = false;
+                for at_start in [false, true] {
+                    for at_end in [false, true] {
+                        for other in bytes() {
+                            matters |= kind.eval(at_start, at_end, Some(with), other)
+                                != kind.eval(at_start, at_end, Some(without), other);
+                            matters |= kind.eval(at_start, at_end, other, Some(with))
+                                != kind.eval(at_start, at_end, other, Some(without));
+                        }
+                    }
+                }
+                assert_eq!(declared, matters, "{kind:?} and {prop:?}");
+            }
+        }
+    }
+
+    /// Bytes that an assertion of the pattern tells apart never share a
+    /// byte class, whatever the consuming states do with them.
+    #[test]
+    fn test_byte_classes_separate_what_assertions_read() {
+        let classes_of = |pattern: &str| {
+            let re = build_regex_with_config(
+                pattern,
+                RegexConfig {
+                    byte_class_min_states: 0,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                re.num_byte_classes < 256,
+                "`{pattern}` must use byte classes"
+            );
+            re.byte_classes
+        };
+        // `.` treats every byte alike, so only the assertion can split.
+        let c = classes_of("(?s)(?m:^).");
+        assert_ne!(c[b'\n' as usize], c[b' ' as usize]);
+        assert_eq!(c[b'a' as usize], c[b' ' as usize]);
+        let c = classes_of("(?s).(?m:$)");
+        assert_ne!(c[b'\n' as usize], c[b' ' as usize]);
+        assert_eq!(c[b'\r' as usize], c[b' ' as usize]);
+        for pattern in ["(?s)\\b.", "(?s)\\B.", "(?s)\\b{start}.", "(?s).\\b{end}"] {
+            let c = classes_of(pattern);
+            assert_ne!(c[b'a' as usize], c[b' ' as usize], "{pattern}");
+            assert_eq!(c[b'a' as usize], c[b'_' as usize], "{pattern}");
+            assert_eq!(c[b'\n' as usize], c[b' ' as usize], "{pattern}");
+        }
+        let c = classes_of("(?s)(?Rm:^).");
+        assert_ne!(c[b'\n' as usize], c[b' ' as usize]);
+        assert_ne!(c[b'\r' as usize], c[b' ' as usize]);
+        assert_ne!(c[b'\r' as usize], c[b'\n' as usize]);
+        // No assertion: nothing to split.
+        let c = classes_of("(?s).");
+        assert_eq!(c[b'\n' as usize], c[b'a' as usize]);
+    }
+
     /// Byte equivalence classes are only enabled for complex patterns
-    /// (>= BYTE_CLASSES_NFA_THRESHOLD NFA states).  A simple (?i)abc
+    /// (>= DEFAULT_BYTE_CLASS_MIN_STATES NFA states).  A simple (?i)abc
     /// stays at stride=256 to avoid per-byte indirection overhead.
     /// A sufficiently large CI pattern gets compression.
     #[test]
@@ -14097,7 +14442,7 @@ mod tests {
     /// padding with additional alternations.
     #[test]
     fn test_partial_ci_byte_classes_selective() {
-        // Build a pattern large enough to exceed BYTE_CLASSES_NFA_THRESHOLD
+        // Build a pattern large enough to exceed DEFAULT_BYTE_CLASS_MIN_STATES
         // while preserving the CI/non-CI split we want to test.
         let re = build_regex_unchecked(
             "(?i)(?:abc|ghi|jkl|mno|pqr|stu|vwx|yz0|123|456|789|\

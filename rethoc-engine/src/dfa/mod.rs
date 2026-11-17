@@ -102,22 +102,31 @@ pub(super) struct DfaState {
     pub(super) prev_was_word: bool,
 }
 
+/// The byte a DFA state substitutes for the one that entered it, of which
+/// it only remembers the word-ness.
+#[inline]
+pub(super) const fn prev_stand_in(prev_was_word: bool) -> u8 {
+    if prev_was_word { b'a' } else { b' ' }
+}
+
 impl DfaState {
     /// Return a representative previous byte for assertion resolution.
     ///
-    /// Deferred assertions that depend on the previous byte are exclusively
-    /// from the word-boundary family (`\b`, `\B`, `\b{start}`, `\b{end}`),
-    /// which only inspect `is_word_byte(prev)`.  `StartLF` never defers
-    /// (it resolves immediately since `prev` is always known), and `EndLF`
-    /// does not depend on `prev` at all.  So the bool captures all needed
-    /// information without unnecessary DFA state splitting.
+    /// A DFA state remembers one bit about the byte that entered it: its
+    /// word-ness.  That is all a parked assertion can still need.  The
+    /// kinds the DFA tiers defer ([`AssertKind::is_dfa_deferrable`]) read
+    /// the previous byte through `is_word_byte` only, or not at all;
+    /// `StartLF` reads more but never waits, since the previous byte is
+    /// always known when it is reached.
+    ///
+    /// This is a second summary of what [`AssertKind::eval`] reads, so it
+    /// is checked against `eval` for every deferrable kind and every byte
+    /// (`test_prev_stand_in_is_enough_for_deferred_assertions`).  A kind
+    /// that reads anything else of the previous byte must not become
+    /// deferrable without this state learning to remember it.
     #[inline]
     pub(super) fn prev_byte_representative(&self) -> Option<u8> {
-        if self.prev_was_word {
-            Some(b'a')
-        } else {
-            Some(b' ')
-        }
+        Some(prev_stand_in(self.prev_was_word))
     }
 
     /// Resolve deferred assertions from `from_state` given that `byte` is the
@@ -1315,6 +1324,39 @@ mod tests {
             set.get_index_of(&make_ref(&nfa2, &[], true, false, false)),
             None
         );
+    }
+
+    // ── Previous-byte stand-in (Bug 65) ──
+
+    /// A DFA state keeps only the word-ness of the byte that entered it
+    /// and resolves its parked assertions with a stand-in byte.  For
+    /// every kind the DFA tiers defer, that must give the same outcome as
+    /// the real previous byte — including no previous byte at all, which
+    /// the start state records as "not a word byte".
+    #[test]
+    fn test_prev_stand_in_is_enough_for_deferred_assertions() {
+        use crate::is_word_byte;
+        let bytes = || std::iter::once(None).chain((0..=255u8).map(Some));
+        let mut deferrable = 0;
+        for &kind in AssertKind::ALL {
+            if !kind.is_dfa_deferrable() {
+                continue;
+            }
+            deferrable += 1;
+            for prev in bytes() {
+                let stand_in = Some(prev_stand_in(prev.is_some_and(is_word_byte)));
+                for at_end in [false, true] {
+                    for next in bytes() {
+                        assert_eq!(
+                            kind.eval(prev.is_none(), at_end, prev, next),
+                            kind.eval(false, at_end, stand_in, next),
+                            "{kind:?} at_end={at_end} prev={prev:?} next={next:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(deferrable, 5);
     }
 
     // ── Cache eviction (Bug 64) ──
