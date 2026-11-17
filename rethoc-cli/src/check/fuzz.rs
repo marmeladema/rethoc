@@ -19,8 +19,8 @@ use rethoc_engine::fuzz_gen::{FuzzRng, generate_inputs, generate_pattern};
 
 use super::cap::{CapArgs, Run, Verdict, cap_args, parallel, run_capped};
 use super::{
-    EXIT_ABORT, EXIT_MISMATCH, EXIT_OK, EXIT_USAGE, Failure, Reference, Subject, cap_note,
-    describe, escape, new_memory, shrink_command,
+    EXIT_ABORT, EXIT_MISMATCH, EXIT_OK, EXIT_USAGE, Failure, Reference, Subject, describe, escape,
+    new_memory, regime_note, shrink_command,
 };
 use crate::{CompileArgs, compile_args};
 
@@ -238,10 +238,23 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
                         list.join(" "),
                         escape(input)
                     );
-                    println!(
-                        "  repro: {}",
-                        shrink_command(&pattern, &subject.config, input)
-                    );
+                    // The inputs of a seed share a `MatcherMemory` (all
+                    // seeds do with --shared-memory).  A mismatch that
+                    // needs the DFA caches left by earlier inputs passes
+                    // when the input is run alone.
+                    subject.check(&mut new_memory(), input, expected, &mut failures);
+                    if failures.is_empty() {
+                        println!(
+                            "  note: this input passes on a fresh MatcherMemory; the mismatch \
+                             depends on the DFA caches left by earlier inputs.  Rerun seed {seed} \
+                             to reproduce it."
+                        );
+                    } else {
+                        println!(
+                            "  repro: {}",
+                            shrink_command(&pattern, &subject.config, input)
+                        );
+                    }
                 }
             }
         }
@@ -249,7 +262,7 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
     println!(
         "seeds {}..{end}{} cases={cases} reference-rejected={skipped} compiled={compiled} checks={checks} per-tier={per_tier:?} mismatches={mismatches}",
         args.first,
-        cap_note()
+        regime_note()
     );
     if mismatches > 0 {
         EXIT_MISMATCH
@@ -473,7 +486,7 @@ fn supervise(args: &FuzzArgs) -> i32 {
     println!(
         "fuzz seeds {}..{end}{}: failed=[{}] known-slow={:?} no-longer-slow={:?} in {:.0}s",
         args.first,
-        cap_note(),
+        regime_note(),
         failed.join(", "),
         total.known_slow,
         total.no_longer_slow,

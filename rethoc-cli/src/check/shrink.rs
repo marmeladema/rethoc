@@ -8,7 +8,7 @@ use bpaf::Bpaf;
 
 use super::{
     EXIT_MISMATCH, EXIT_OK, EXIT_REJECTED, EXIT_USAGE, Failure, Feed, Reference, Subject,
-    config_args, describe, escape, new_memory, shell_join, unescape,
+    config_args, describe, escape, new_memory, repro_env, shell_join, unescape,
 };
 use crate::{CompileArgs, compile_args};
 
@@ -49,6 +49,9 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
             return EXIT_REJECTED;
         }
     };
+    // Every check below runs on a fresh `MatcherMemory`: the result must
+    // be an input that mismatches on its own, not one that only does
+    // after the candidates tried before it filled the DFA caches.
     let mut memory = new_memory();
     let mut failures: Vec<Failure> = Vec::new();
 
@@ -60,7 +63,7 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
             Ok(s) => {
                 compiled += 1;
                 s.check(
-                    &mut memory,
+                    &mut new_memory(),
                     &input,
                     reference.is_match(&input),
                     &mut failures,
@@ -86,7 +89,7 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
     let wanted: Vec<(u8, Feed)> = failures.iter().map(|f| (f.tier, f.feed)).collect();
     let mut fails = |candidate: &[u8]| {
         subject.check(
-            &mut memory,
+            &mut new_memory(),
             candidate,
             reference.is_match(candidate),
             &mut failures,
@@ -117,7 +120,7 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
     }
 
     let expected = reference.is_match(&input);
-    subject.check(&mut memory, &input, expected, &mut failures);
+    subject.check(&mut new_memory(), &input, expected, &mut failures);
     let list: Vec<String> = failures.iter().map(|f| f.to_string()).collect();
     println!(
         "`{pattern}` {}: shrunk {original} -> {} bytes: input=\"{}\" expected={expected}: {}",
@@ -146,7 +149,7 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
         }
         cmd.push(pattern.clone());
         cmd.push(String::from_utf8_lossy(&input).into_owned());
-        println!("  trace: {}", shell_join(&cmd));
+        println!("  trace: {}{}", repro_env(), shell_join(&cmd));
     }
     EXIT_MISMATCH
 }

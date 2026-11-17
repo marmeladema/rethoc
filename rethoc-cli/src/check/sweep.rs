@@ -10,7 +10,7 @@ use std::time::Instant;
 use bpaf::Bpaf;
 
 use super::cap::{CapArgs, Verdict, cap_args, parallel, run_capped};
-use super::{EXIT_ABORT, EXIT_MISMATCH, EXIT_OK, cap_note, repro_env, shell_join};
+use super::{EXIT_ABORT, EXIT_MISMATCH, EXIT_OK, regime_note, repro_env, shell_join};
 
 /// A generated family of patterns.
 #[derive(Clone, Copy, Debug)]
@@ -19,6 +19,8 @@ pub(crate) enum Family {
     NullableCounter,
     /// See [`tier3_assert`].
     Tier3Assert,
+    /// See [`assert_edges`].
+    AssertEdges,
 }
 
 impl Family {
@@ -27,6 +29,7 @@ impl Family {
         match self {
             Self::NullableCounter => "nullable-counter",
             Self::Tier3Assert => "tier3-assert",
+            Self::AssertEdges => "assert-edges",
         }
     }
 }
@@ -38,8 +41,9 @@ impl FromStr for Family {
         match s {
             "nullable-counter" => Ok(Self::NullableCounter),
             "tier3-assert" => Ok(Self::Tier3Assert),
+            "assert-edges" => Ok(Self::AssertEdges),
             other => Err(format!(
-                "unknown family `{other}` (expected nullable-counter or tier3-assert)"
+                "unknown family `{other}` (expected nullable-counter, tier3-assert or assert-edges)"
             )),
         }
     }
@@ -59,7 +63,7 @@ pub(crate) struct SweepArgs {
     /// Caps and parallelism of the child processes
     #[bpaf(external(cap_args))]
     pub(crate) cap: CapArgs,
-    /// nullable-counter or tier3-assert
+    /// nullable-counter, tier3-assert or assert-edges
     #[bpaf(positional("FAMILY"))]
     pub(crate) family: Family,
 }
@@ -168,11 +172,50 @@ fn tier3_assert() -> Vec<SweepRun> {
         .collect()
 }
 
+/// Every assertion kind the DFA tiers support, on either side of a
+/// one-byte repetition: `prefix counted assertion suffix`, with and
+/// without unrolling.  The alphabet has two word bytes (`a`, `c`), two
+/// non-word bytes (space, `-`) and `\n`: the kinds of byte those
+/// assertions tell apart.
+///
+/// Sensitive to Bug 65 (byte equivalence classes merging such bytes)
+/// when run with `RETHOC_BYTE_CLASS_MIN_STATES=0`: the patterns are far
+/// too small to get byte classes otherwise.
+fn assert_edges() -> Vec<SweepRun> {
+    const PREFIXES: [&str; 8] = [
+        "",
+        "^",
+        "(?m:^)",
+        r"\b",
+        r"\B",
+        r"\b{start}",
+        r"\b{end}",
+        " ?",
+    ];
+    const COUNTED: [&str; 4] = ["a{2,3}", "[a-]{2,3}", "[^a]{2,3}", ".{2,}"];
+    const ASSERTIONS: [&str; 7] = ["", "$", "(?m:$)", r"\b", r"\B", r"\b{end}", r"\b{start}"];
+    const SUFFIXES: [&str; 4] = ["", "c", " c", r"\n"];
+    let mut runs = Vec::new();
+    for p in PREFIXES {
+        for c in COUNTED {
+            for a in ASSERTIONS {
+                for s in SUFFIXES {
+                    for unroll in [32, 0] {
+                        runs.push(SweepRun::new(format!("{p}{c}{a}{s}"), r"a c\n-", 6, unroll));
+                    }
+                }
+            }
+        }
+    }
+    runs
+}
+
 /// Every `brute` run of a family.
 fn runs(family: Family) -> Vec<SweepRun> {
     match family {
         Family::NullableCounter => nullable_counter(),
         Family::Tier3Assert => tier3_assert(),
+        Family::AssertEdges => assert_edges(),
     }
 }
 
@@ -212,7 +255,7 @@ pub(crate) fn run(args: &SweepArgs) -> i32 {
                     "{} unroll={}{} `{}`: {}",
                     result.verdict.label(),
                     r.unroll,
-                    cap_note(),
+                    regime_note(),
                     r.pattern,
                     result.detail()
                 );
@@ -233,7 +276,7 @@ pub(crate) fn run(args: &SweepArgs) -> i32 {
     println!(
         "sweep {}{}: runs={} ok={} mismatch={} rejected={} aborted={aborted} (timeout={} oom={} panic={} crash={}) in {:.0}s",
         args.family.name(),
-        cap_note(),
+        regime_note(),
         runs.len(),
         count(Verdict::Ok),
         count(Verdict::Mismatch),
@@ -260,6 +303,21 @@ mod tests {
     #[test]
     fn nullable_counter_matches_the_original_sweep() {
         assert_eq!(nullable_counter().len(), 3920);
+    }
+
+    #[test]
+    fn assert_edges_covers_the_bug_65_shapes() {
+        let runs = assert_edges();
+        assert_eq!(runs.len(), 8 * 4 * 7 * 4 * 2);
+        let patterns: Vec<&str> = runs.iter().map(|r| r.pattern.as_str()).collect();
+        for known in [
+            r"(?m:^)a{2,3}c",
+            r"a{2,3}(?m:$)",
+            r"\b{start}a{2,3}c",
+            r"a{2,3}\b{end}",
+        ] {
+            assert!(patterns.contains(&known), "missing {known}");
+        }
     }
 
     /// Patterns from the original (lost) Tier 3 sweep that found bugs.

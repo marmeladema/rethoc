@@ -205,7 +205,7 @@ pub(crate) fn describe(config: &RegexConfig) -> String {
     if config.max_estimated_states != RegexConfig::default().max_estimated_states {
         s.push_str(&format!(" max-states={}", config.max_estimated_states));
     }
-    s.push_str(&cap_note());
+    s.push_str(&regime_note());
     s
 }
 
@@ -214,59 +214,99 @@ pub(crate) fn describe(config: &RegexConfig) -> String {
 /// processes of `fuzz --batch` and `sweep` inherit it.
 pub(crate) const DFA_STATES_ENV: &str = "RETHOC_DFA_STATES";
 
-/// The value of [`DFA_STATES_ENV`], read once per process.
-static DFA_STATES: OnceLock<Option<usize>> = OnceLock::new();
+/// Environment variable that sets the NFA state count from which the DFA
+/// tiers use byte equivalence classes (`0`: for every pattern).
+pub(crate) const BYTE_CLASS_ENV: &str = "RETHOC_BYTE_CLASS_MIN_STATES";
 
-/// Read [`DFA_STATES_ENV`]: `None` when unset, an error message when it
-/// is not a number.
-fn read_dfa_states_env() -> Result<Option<usize>, String> {
-    match std::env::var(DFA_STATES_ENV) {
+/// Engine thresholds overridden through the environment.  Behaviour that
+/// switches at a threshold is only exercised on one side of it by small
+/// patterns and short inputs; these move the thresholds so that the
+/// checking commands reach the other side.  No setting may change a
+/// result.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Regime {
+    /// [`DFA_STATES_ENV`]: the DFA state cap.  At 8, the minimum, the DFA
+    /// caches are emptied every few bytes.
+    pub(crate) dfa_states: Option<usize>,
+    /// [`BYTE_CLASS_ENV`]: see [`RegexConfig::byte_class_min_states`].
+    pub(crate) byte_class_min_states: Option<usize>,
+}
+
+/// The environment's [`Regime`], read once per process.
+static REGIME: OnceLock<Regime> = OnceLock::new();
+
+/// Read a variable holding a number: `None` when unset, an error message
+/// when it is not a number.
+fn read_number(name: &str) -> Result<Option<usize>, String> {
+    match std::env::var(name) {
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(value)) => {
-            Err(format!("{DFA_STATES_ENV}={value:?} is not a number"))
+            Err(format!("{name}={value:?} is not a number"))
         }
         Ok(value) => value
             .parse()
             .map(Some)
-            .map_err(|_| format!("{DFA_STATES_ENV}={value:?} is not a number")),
+            .map_err(|_| format!("{name}={value:?} is not a number")),
     }
 }
 
-/// Read and check [`DFA_STATES_ENV`] before anything else runs.  A bad
+fn read_regime() -> Result<Regime, String> {
+    Ok(Regime {
+        dfa_states: read_number(DFA_STATES_ENV)?,
+        byte_class_min_states: read_number(BYTE_CLASS_ENV)?,
+    })
+}
+
+/// Read and check the regime variables before anything else runs.  A bad
 /// value is one usage error in the process the user started, not one
 /// failure per child process.
-pub(crate) fn init_dfa_states() -> Result<(), String> {
-    let states = read_dfa_states_env()?;
-    // Already set only if something asked for the value first.
-    let _ = DFA_STATES.set(states);
+pub(crate) fn init_regime() -> Result<(), String> {
+    let regime = read_regime()?;
+    // Already set only if something asked for it first.
+    let _ = REGIME.set(regime);
     Ok(())
 }
 
-/// The DFA state cap requested through [`DFA_STATES_ENV`], if any.
-pub(crate) fn dfa_states() -> Option<usize> {
-    *DFA_STATES.get_or_init(|| read_dfa_states_env().unwrap_or(None))
+/// The thresholds requested through the environment.
+pub(crate) fn regime() -> Regime {
+    *REGIME.get_or_init(|| read_regime().unwrap_or_default())
 }
 
-/// A fresh [`MatcherMemory`], with the DFA state cap of
-/// [`DFA_STATES_ENV`] applied.  A small cap makes the engine empty its
-/// DFA caches every few bytes; results must not change.
+/// A fresh [`MatcherMemory`], with the DFA state cap of the [`Regime`].
 pub(crate) fn new_memory() -> MatcherMemory {
     let mut memory = MatcherMemory::default();
-    memory.set_dfa_state_cap(dfa_states());
+    memory.set_dfa_state_cap(regime().dfa_states);
     memory
 }
 
-/// ` dfa-states=N` when a DFA state cap is set, empty otherwise.  Goes
-/// into every summary and result line, so that a run at a small cap
-/// cannot be mistaken for one at the default.
-pub(crate) fn cap_note() -> String {
-    dfa_states().map_or_else(String::new, |n| format!(" dfa-states={n}"))
+/// The regime as it appears in summary and result lines, e.g.
+/// ` dfa-states=8 byte-class-min=0`; empty at the defaults.  It goes into
+/// every such line, so that a run in another regime cannot be mistaken
+/// for one at the defaults.
+pub(crate) fn regime_note() -> String {
+    let regime = regime();
+    let mut note = String::new();
+    if let Some(n) = regime.dfa_states {
+        note.push_str(&format!(" dfa-states={n}"));
+    }
+    if let Some(n) = regime.byte_class_min_states {
+        note.push_str(&format!(" byte-class-min={n}"));
+    }
+    note
 }
 
-/// What to put in front of a reproduction command so that it runs with
-/// the same DFA state cap (empty when none is set).
+/// What to put in front of a reproduction command so that it runs in
+/// the same regime (empty at the defaults).
 pub(crate) fn repro_env() -> String {
-    dfa_states().map_or_else(String::new, |n| format!("{DFA_STATES_ENV}={n} "))
+    let regime = regime();
+    let mut env = String::new();
+    if let Some(n) = regime.dfa_states {
+        env.push_str(&format!("{DFA_STATES_ENV}={n} "));
+    }
+    if let Some(n) = regime.byte_class_min_states {
+        env.push_str(&format!("{BYTE_CLASS_ENV}={n} "));
+    }
+    env
 }
 
 /// Command-line flags that select exactly `config`.

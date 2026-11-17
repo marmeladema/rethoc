@@ -35,14 +35,16 @@ jobs:
           scripts/capped --time 1800
           target/release/rethoc fuzz --batch 250
           --allow-slow ci/known-slow-seeds.txt 0 9000
-      # The same seeds with the DFA caches at their minimum size, so that
-      # they are emptied every few bytes.  Results must not change.  Runs
-      # even when the step above failed: a failure there must not hide a
-      # regression that only shows when the cache is emptied.
-      - name: Fuzz seeds 0..9000, minimum DFA cache
+      # The same seeds on the other side of the engine's thresholds: DFA
+      # caches at their minimum size, so that they are emptied every few
+      # bytes, and byte equivalence classes for every pattern.  Results
+      # must not change.  Runs even when the step above failed: a failure
+      # there must not hide a regression that only shows here.
+      - name: Fuzz seeds 0..9000, extreme regime
         if: ${{ !cancelled() }}
         env:
           RETHOC_DFA_STATES: 8
+          RETHOC_BYTE_CLASS_MIN_STATES: 0
         run: >-
           scripts/capped --time 1800
           target/release/rethoc fuzz --batch 250
@@ -68,6 +70,8 @@ jobs:
         include:
           - family: nullable-counter
             allow-failure: false
+          - family: assert-edges
+            allow-failure: false
           - family: tier3-assert
             allow-failure: true
     steps:
@@ -78,12 +82,14 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --release -p rethoc-cli
       - run: scripts/capped --time 1800 target/release/rethoc sweep ${{ matrix.family }}
-      # Again with the DFA caches at their minimum size; runs even when
-      # the step above reported mismatches.
-      - name: Minimum DFA cache
+      # Again on the other side of the engine's thresholds (minimum DFA
+      # cache, byte classes for every pattern); runs even when the step
+      # above reported mismatches.
+      - name: Extreme regime
         if: ${{ !cancelled() }}
         env:
           RETHOC_DFA_STATES: 8
+          RETHOC_BYTE_CLASS_MIN_STATES: 0
         run: scripts/capped --time 1800 target/release/rethoc sweep ${{ matrix.family }}
 
   callgrind:
