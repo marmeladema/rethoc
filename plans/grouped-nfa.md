@@ -449,9 +449,19 @@ experimental backend name, not Tier 5. Each milestone is independently reviewabl
   all three compile configurations, with empty calls after every data call
   and `ismatch` checked against the hand-written expectation and Tier 0;
   every partition and every prefix `finish` of each gate input; all 100
-  ordered kind pairs at five positions (head, entry, body, exit, tail) under
-  two configurations, against Tier 0, the oracle and the scalar interpreter
-  (none rejected); every cut of short inputs for a subset. Mutations
+  ordered kind pairs at five positions (head, entry, body, exit, tail),
+  each with a finite `{1,3}` and a saturating `{2,}` counter, under two
+  configurations, over word, non-word, NUL, 0xFF, CR and LF bytes, against
+  Tier 0, the oracle and the scalar interpreter (none rejected); every cut
+  of short inputs for a subset. Hand-built graph fixtures cover shapes
+  that pattern normalisation might not produce: a guarded exit and a
+  guarded bypass sharing a tail state, guarded and unguarded body branches
+  sharing an increment, contradictory guards sharing an assertion node,
+  guarded and consuming entries sharing a counter instance, and a guard
+  between a finite and a saturating counter. Each runs every partition of
+  every input up to 4 bytes against Tier 0 (which parks deferred
+  assertions) and the scalar interpreter, and must have both matching and
+  non-matching inputs. Mutations
   detected by these tests: old roots kept after consumption, prev updated
   before lookahead evaluation, no EOI replay, EOI as a consumed sentinel
   byte, Defer treated as Pass.
