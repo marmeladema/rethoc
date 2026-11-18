@@ -22,6 +22,10 @@
 //! - **Full sweep** walks every node in order and copies whole arenas.
 //!   With most rows active it is cheaper than the bookkeeping above.
 //!
+//! Under the automatic choice, a frontier where no counter has counted yet
+//! takes the count-free step instead, by compile-time bitmaps
+//! ([`CountFreeTables`](super::CountFreeTables)).
+//!
 //! The automatic choice takes the full sweep for plans of at most 32 rows
 //! and when at least an eighth of the raw rows are active (measured with
 //! the counting probe: below that, on wide plans, the active rows win by
@@ -262,13 +266,13 @@ fn increment_word(rows: &mut [u64], s0: usize, o0: usize, inc: Increment) -> (bo
 
 /// Does the single-byte predicate of `state` accept `b`?
 #[inline]
-fn accepts(regex: &Regex, state: &State, b: u8) -> bool {
+pub(crate) fn accepts(classes: &[crate::ByteClassBits], state: &State, b: u8) -> bool {
     match *state {
         State::Byte { byte, .. } => b == byte,
         State::ByteCI { byte, .. } => byte_match_ci(b, byte),
         State::Wildcard { .. } => true,
         State::ByteClassStatic { table, .. } => table[b as usize],
-        State::ByteClassCustom { class, .. } => regex.classes[class.idx()].contains(b),
+        State::ByteClassCustom { class, .. } => classes[class.idx()].contains(b),
         _ => unreachable!("not a single-byte consuming state: {state:?}"),
     }
 }
@@ -383,11 +387,20 @@ fn transfer(
     false
 }
 
+/// What a consumption pass did.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Consumed {
+    /// Predicate tests.
+    pub(crate) tests: usize,
+    /// Whether every next row is exactly bit 0 (a unit frontier): every
+    /// consumer that moved a row moved exactly bit 0.
+    pub(crate) unit: bool,
+}
+
 /// Consume `b` from the closed rows into `next`/`next_active` (clean on
 /// entry; the stream passes its raw rows, cleared): every active consuming
 /// node tests its predicate once and moves its whole row.  Cleans the
-/// closure on the way (each row once read).  Returns the number of
-/// predicate tests.
+/// closure on the way (each row once read).
 pub(crate) fn consume(
     plan: &GroupedNfaPlan,
     regex: &Regex,
@@ -396,24 +409,19 @@ pub(crate) fn consume(
     next: &mut [u64],
     next_active: &mut [u64],
     b: u8,
-) -> usize {
+) -> Consumed {
     debug_assert!(is_clean(next, next_active), "next scratch is not clean");
-    let mut tests = 0;
+    let mut done = Consumed {
+        tests: 0,
+        unit: true,
+    };
     for_each_active(active, |n| {
         let node = &plan.nodes[n as usize];
-        tests += usize::from(consume_node(
-            plan,
-            regex,
-            closure,
-            node,
-            next,
-            next_active,
-            b,
-        ));
+        consume_node(plan, regex, closure, node, next, next_active, b, &mut done);
         zero_row(closure, node.row);
     });
     active.fill(0);
-    tests
+    done
 }
 
 /// [`consume`] by a full sweep over the consuming nodes; cleans the
@@ -426,29 +434,26 @@ pub(crate) fn consume_full(
     next: &mut [u64],
     next_active: &mut [u64],
     b: u8,
-) -> usize {
+) -> Consumed {
     debug_assert!(is_clean(next, next_active), "next scratch is not clean");
-    let mut tests = 0;
+    let mut done = Consumed {
+        tests: 0,
+        unit: true,
+    };
     for node in plan.consumers.iter() {
         if !is_empty_row(closure, node.row) {
-            tests += usize::from(consume_node(
-                plan,
-                regex,
-                closure,
-                node,
-                next,
-                next_active,
-                b,
-            ));
+            consume_node(plan, regex, closure, node, next, next_active, b, &mut done);
         }
     }
     closure.fill(0);
-    tests
+    done
 }
 
-/// Consume `b` at `node` (nonempty row) if it is a consuming node: move its
-/// row to the successors that accept `b`.  Returns whether it tested.
+/// Consume `b` at `node` if it is a consuming node: move its row to the
+/// successors that accept `b`, counting the test and noting whether the
+/// moved row is exactly bit 0.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn consume_node(
     plan: &GroupedNfaPlan,
     regex: &Regex,
@@ -457,10 +462,13 @@ fn consume_node(
     next: &mut [u64],
     next_active: &mut [u64],
     b: u8,
-) -> bool {
+    done: &mut Consumed,
+) {
     match node.op {
         Op::Edge { out, out_exit } => {
-            if accepts(regex, &regex.states[node.state], b) {
+            done.tests += 1;
+            if accepts(&regex.classes, &regex.states[node.state], b) {
+                done.unit = done.unit && is_unit_row(closure, node.row);
                 let w = node.row.words;
                 union_into(closure, node.row, next, out.row(w));
                 activate(next_active, out.node);
@@ -469,19 +477,32 @@ fn consume_node(
                     activate(next_active, out_exit.node);
                 }
             }
-            true
         }
         Op::Table(table) => {
+            done.tests += 1;
             let target = regex.byte_tables[table][b];
             if target != StateIdx::NONE {
+                done.unit = done.unit && is_unit_row(closure, node.row);
                 let out = plan.node_of[target.idx()];
                 union_into(closure, node.row, next, plan.row(out));
                 activate(next_active, out);
             }
-            true
         }
-        _ => false,
+        _ => {}
     }
+}
+
+/// Whether row `r` holds exactly bit 0.
+#[inline(always)]
+fn is_unit_row(rows: &[u64], r: Row) -> bool {
+    rows[r.off as usize] == 1
+        && is_empty_row(
+            rows,
+            Row {
+                off: r.off + 1,
+                words: r.words - 1,
+            },
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -497,9 +518,53 @@ pub struct GroupedScratch {
     closure: Vec<u64>,
     closure_active: Vec<u64>,
     sweep: Sweep,
-    /// Bytes stepped by the full sweep and by the active rows (for tests).
+    /// Bytes stepped by the full sweep, by the active rows and by the
+    /// count-free step (for tests).
     #[cfg(test)]
-    pub(crate) passes: [usize; 2],
+    pub(crate) passes: [usize; 3],
+}
+
+/// Run `$body` with the const `$n` bound to the count-free bitmap width
+/// `$a` (1 to [`MAX_COUNT_FREE_WORDS`](super::analysis) words), so that
+/// each width gets its own code with the bitmaps in registers.
+macro_rules! by_width {
+    ($a:expr, |$n:ident| $body:expr) => {
+        match $a {
+            1 => {
+                const $n: usize = 1;
+                $body
+            }
+            2 => {
+                const $n: usize = 2;
+                $body
+            }
+            3 => {
+                const $n: usize = 3;
+                $body
+            }
+            4 => {
+                const $n: usize = 4;
+                $body
+            }
+            5 => {
+                const $n: usize = 5;
+                $body
+            }
+            6 => {
+                const $n: usize = 6;
+                $body
+            }
+            7 => {
+                const $n: usize = 7;
+                $body
+            }
+            8 => {
+                const $n: usize = 8;
+                $body
+            }
+            a => unreachable!("count-free bitmaps of {a} words"),
+        }
+    };
 }
 
 /// Plans of at most this many rows always take the full sweep: it costs
@@ -507,7 +572,9 @@ pub struct GroupedScratch {
 const SMALL_PLAN_ROWS: usize = 32;
 
 /// Which pass a byte runs (see the module documentation).  Both give the
-/// same rows; tests and the counting probe force each.
+/// same rows; tests and the counting probe force each.  Forcing a pass also
+/// turns off the count-free step, so that the general step can be tested
+/// and measured against it.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Sweep {
@@ -581,6 +648,9 @@ pub struct GroupedStream {
     raw_active: Box<[u64]>,
     /// Active raw rows: none means idle.
     live: u32,
+    /// Every active raw row holds exactly bit 0 (kept exactly by every
+    /// step).
+    unit: bool,
     prev: Option<u8>,
     at_start: bool,
     matched: bool,
@@ -598,6 +668,7 @@ impl GroupedStream {
             raw: vec![0; plan.words()].into_boxed_slice(),
             raw_active: vec![0; plan.active_words()].into_boxed_slice(),
             live: 0,
+            unit: true,
             prev: None,
             at_start: true,
             matched: false,
@@ -613,6 +684,7 @@ impl GroupedStream {
         let plan = self.plan(regex);
         clear(plan, &mut self.raw, &mut self.raw_active);
         self.live = 0;
+        self.unit = true;
         self.prev = None;
         self.at_start = true;
         self.matched = false;
@@ -630,10 +702,57 @@ impl GroupedStream {
         }
         scratch.prepare(plan);
         let prefilter = &regex.prefilter;
-        let skip = plan.skip_when_idle && !matches!(prefilter, crate::Prefilter::None);
+        let has_prefilter = !matches!(prefilter, crate::Prefilter::None);
+        let skip = plan.skip_when_idle && has_prefilter;
+        // The count-free step runs under the automatic choice only: forcing
+        // a pass runs the general step, which the tests compare with it.
+        let tables = plan
+            .count_free
+            .as_deref()
+            .filter(|_| scratch.sweep == Sweep::Auto);
         let mut i = 0;
         while i < input.len() {
-            if skip && self.live == 0 {
+            if let Some(tables) = tables {
+                if self.live == 0 {
+                    // Find the next byte that starts something: the others
+                    // leave an empty frontier empty.
+                    let found = loop {
+                        let rest = &input[i..];
+                        let off = if has_prefilter {
+                            prefilter.find(rest)
+                        } else {
+                            rest.iter().position(|&b| tables.starts[b as usize])
+                        };
+                        match off {
+                            Some(off) if tables.starts[rest[off] as usize] => break Some(i + off),
+                            Some(off) => i += off + 1,
+                            None => break None,
+                        }
+                        if i >= input.len() {
+                            break None;
+                        }
+                    };
+                    let Some(j) = found else {
+                        self.prev = input.last().copied();
+                        self.at_start = false;
+                        return;
+                    };
+                    i = j;
+                }
+                if self.unit && self.all_count_free(tables) {
+                    let (next, found) = by_width!(tables.a, |A| self
+                        .count_free_run::<A>(plan, tables, regex, input, i));
+                    #[cfg(test)]
+                    {
+                        scratch.passes[2] += next - i + usize::from(found);
+                    }
+                    if found {
+                        return;
+                    }
+                    i = next;
+                    continue;
+                }
+            } else if skip && self.live == 0 {
                 // The closure of an empty frontier is the start closure,
                 // the same at every boundary, without a match; a byte the
                 // prefilter rules out leaves the frontier empty.
@@ -656,7 +775,149 @@ impl GroupedStream {
             }
             i += 1;
         }
+        if let Some(tables) = tables
+            && self.unit
+            && self.all_count_free(tables)
+        {
+            self.matched |= by_width!(tables.a, |A| self.count_free_matches::<A>(tables));
+            return;
+        }
         self.provisional(plan, scratch, Boundary::UnknownNext);
+    }
+
+    /// Whether every active raw node is count-free.
+    #[inline(always)]
+    fn all_count_free(&self, fast: &super::CountFreeTables) -> bool {
+        self.raw_active
+            .iter()
+            .zip(fast.statics.iter())
+            .all(|(r, s)| r & !s == 0)
+    }
+
+    /// The closure bitmap of the unit, count-free frontier `active`, of
+    /// `A` words.
+    /// (`closure` and `start` from the tables, passed as locals so that
+    /// they stay in registers.)
+    #[inline(always)]
+    fn count_free_closure<const A: usize>(
+        closure: &[u64],
+        start: [u64; A],
+        active: &[u64; A],
+    ) -> [u64; A] {
+        let mut clos = start;
+        for (i, &word) in active.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let n = i * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let c = &closure[n * A..][..A];
+                for j in 0..A {
+                    clos[j] |= c[j];
+                }
+            }
+        }
+        clos
+    }
+
+    /// Whether the closure of a unit, count-free frontier reaches `Match`.
+    fn count_free_matches<const A: usize>(&self, fast: &super::CountFreeTables) -> bool {
+        let active: [u64; A] = self.raw_active[..A].try_into().unwrap();
+        let start = fast.start_closure[..A].try_into().unwrap();
+        let clos = Self::count_free_closure::<A>(&fast.closure, start, &active);
+        (0..A).any(|i| clos[i] & fast.matches[i] != 0)
+    }
+
+    /// [`step`](Self::step) on a unit, count-free frontier, by bitmaps of
+    /// `A` words ([`CountFreeTables`](super::CountFreeTables)), from
+    /// `input[i]` while the frontier stays nonempty and count-free (it
+    /// stays unit).  The frontier is only its active bitmap, kept in
+    /// registers: the raw rows are written once, when the run ends.
+    /// Returns the next byte's index and whether a match was found (before
+    /// the byte at that index).
+    #[inline(always)]
+    fn count_free_run<const A: usize>(
+        &mut self,
+        plan: &GroupedNfaPlan,
+        fast: &super::CountFreeTables,
+        regex: &Regex,
+        input: &[u8],
+        mut i: usize,
+    ) -> (usize, bool) {
+        debug_assert!(self.unit && self.all_count_free(fast));
+        let first = i;
+        // Everything the loop reads, as locals, so that it stays in
+        // registers.
+        let nodes: &[super::Node] = &plan.nodes;
+        let node_of: &[NodeIdx] = &plan.node_of;
+        let byte_tables = &regex.byte_tables;
+        let (closure, accepts): (&[u64], &[u64]) = (&fast.closure, &fast.accept);
+        let start: [u64; A] = fast.start_closure[..A].try_into().unwrap();
+        let matches: [u64; A] = fast.matches[..A].try_into().unwrap();
+        let statics: [u64; A] = fast.statics[..A].try_into().unwrap();
+        let entry: [u64; A] = self.raw_active[..A].try_into().unwrap();
+        let mut active = entry;
+        let found = loop {
+            let b = input[i];
+            let clos = Self::count_free_closure::<A>(closure, start, &active);
+            if (0..A).any(|k| clos[k] & matches[k] != 0) {
+                break true;
+            }
+            let mut next = [0u64; A];
+            let mut set = |n: NodeIdx| {
+                // `min` folds to 0 at one word.
+                next[(n as usize / 64).min(A - 1)] |= 1 << (n % 64);
+            };
+            let accept = &accepts[b as usize * A..][..A];
+            for k in 0..A {
+                let mut fire = clos[k] & accept[k];
+                while fire != 0 {
+                    let c = k * 64 + fire.trailing_zeros() as usize;
+                    fire &= fire - 1;
+                    match nodes[c].op {
+                        Op::Edge { out, out_exit } => {
+                            set(out.node);
+                            if out_exit != Succ::NONE {
+                                set(out_exit.node);
+                            }
+                        }
+                        Op::Table(t) => set(node_of[byte_tables[t][b].idx()]),
+                        _ => unreachable!("only consumers accept bytes"),
+                    }
+                }
+            }
+
+            active = next;
+            i += 1;
+            if i == input.len()
+                || active.iter().all(|&w| w == 0)
+                || (0..A).any(|k| active[k] & !statics[k] != 0)
+            {
+                break false;
+            }
+        };
+        // The rows are written once per run: a row of a unit frontier is
+        // its first word, 1 or 0, so only rows that changed are stored.
+        let raw = &mut *self.raw;
+        for k in 0..A {
+            for (mut bits, value) in [(entry[k] & !active[k], 0), (active[k] & !entry[k], 1)] {
+                while bits != 0 {
+                    let n = k * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    raw[nodes[n].row.off as usize] = value;
+                }
+            }
+        }
+        self.raw_active[..A].copy_from_slice(&active);
+        self.live = active.iter().map(|w| w.count_ones()).sum();
+        self.unit = true;
+        if i > first {
+            self.prev = Some(input[i - 1]);
+            self.at_start = false;
+        }
+        if found {
+            self.matched = true;
+        }
+        (i, found)
     }
 
     /// Signal end of input and return the final result.
@@ -769,7 +1030,7 @@ impl GroupedStream {
             }
             raw.fill(0);
             raw_active.fill(0);
-            consume_full(plan, regex, closure, raw, raw_active, b);
+            self.unit = consume_full(plan, regex, closure, raw, raw_active, b).unit;
         } else {
             if close(plan, raw, raw_active, closure, active, ctx) {
                 clear(plan, closure, active);
@@ -777,7 +1038,7 @@ impl GroupedStream {
                 return true;
             }
             clear(plan, raw, raw_active);
-            consume(plan, regex, closure, active, raw, raw_active, b);
+            self.unit = consume(plan, regex, closure, active, raw, raw_active, b).unit;
         }
         self.live = raw_active.iter().map(|w| w.count_ones()).sum();
         self.prev = Some(b);
@@ -789,6 +1050,12 @@ impl GroupedStream {
     #[cfg(test)]
     pub(crate) fn raw(&self) -> &[u64] {
         &self.raw
+    }
+
+    /// Whether every active raw row holds exactly bit 0 (for tests).
+    #[cfg(test)]
+    pub(crate) fn unit(&self) -> bool {
+        self.unit
     }
 
     /// The active bitmap of the raw rows (for tests).

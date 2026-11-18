@@ -223,13 +223,59 @@ pub(crate) struct GroupedNfaPlan {
     /// every boundary and never matches: bytes the regex's prefilter rules
     /// out can then be skipped while the frontier is empty.
     skip_when_idle: bool,
+    /// Compile-time tables for count-free frontiers, when the start node
+    /// is count-free and the bitmaps are at most 8 words (512 rows).
+    pub(crate) count_free: Option<Box<CountFreeTables>>,
+}
+
+/// Compile-time tables for frontiers where no counter has counted yet.
+///
+/// A raw frontier is *unit* when every active row holds exactly bit 0
+/// (Outside, or count 0).  A node is *count-free* when its zero-width
+/// closure reaches no assertion and no `CounterIncrement`: from a unit row
+/// that closure is a fixed set of nodes, each holding bit 0 (`Split`
+/// copies, `CounterInstance` turns Outside into count 0), whatever the
+/// boundary.  So when the raw frontier is unit and all its nodes are
+/// count-free, the closure is the OR of their closure bitmaps and the
+/// start's, the consumers that fire are that bitmap AND the byte's
+/// acceptance bitmap, and their successors, each holding bit 0, are the
+/// next raw frontier: a step by bitmaps, without the closure pass.
+#[derive(Debug)]
+pub(crate) struct CountFreeTables {
+    /// Words per bitmap (`active_words`).
+    pub(crate) a: usize,
+    /// Closure bitmap of each count-free node (`a` words per node; zero
+    /// for the others).
+    pub(crate) closure: Box<[u64]>,
+    /// Consuming nodes that accept each byte (`a` words per byte).
+    pub(crate) accept: Box<[u64]>,
+    /// The count-free nodes.
+    pub(crate) statics: Box<[u64]>,
+    /// The `Match` nodes.
+    pub(crate) matches: Box<[u64]>,
+    /// Closure bitmap of the start node.
+    pub(crate) start_closure: Box<[u64]>,
+    /// Whether some consumer of the start closure accepts each byte: from
+    /// an empty frontier, the other bytes leave it empty.
+    pub(crate) starts: Box<[bool; 256]>,
+}
+
+impl CountFreeTables {
+    /// Heap bytes of the tables of a plan of `nodes` nodes and `a` bitmap
+    /// words, the boxed struct included.
+    fn bytes_for(nodes: usize, a: usize) -> usize {
+        size_of::<Self>() + (nodes + 256 + 3) * a * size_of::<u64>() + size_of::<[bool; 256]>()
+    }
 }
 
 impl GroupedNfaPlan {
-    /// Heap bytes of a plan with these array lengths.
-    fn heap_bytes_for(states: usize, nodes: usize) -> usize {
+    /// Heap bytes of a plan with these array lengths, and count-free
+    /// tables of `count_free` bitmap words if any.
+    fn heap_bytes_for(states: usize, nodes: usize, count_free: Option<usize>) -> usize {
         // `node_of`, the nodes, and their copies split in two lists.
-        states * size_of::<NodeIdx>() + 2 * nodes * size_of::<Node>()
+        states * size_of::<NodeIdx>()
+            + 2 * nodes * size_of::<Node>()
+            + count_free.map_or(0, |a| CountFreeTables::bytes_for(nodes, a))
     }
 
     /// Heap bytes of this plan's arrays.
@@ -238,7 +284,11 @@ impl GroupedNfaPlan {
             self.zero_width.len() + self.consumers.len(),
             self.nodes.len()
         );
-        Self::heap_bytes_for(self.node_of.len(), self.nodes.len())
+        Self::heap_bytes_for(
+            self.node_of.len(),
+            self.nodes.len(),
+            self.count_free.as_ref().map(|t| t.a),
+        )
     }
 
     /// Words in one frontier.
@@ -280,11 +330,12 @@ impl fmt::Display for GroupedNfaPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "  rows: {} ({} words), start state {}, skip when idle: {}",
+            "  rows: {} ({} words), start state {}, skip when idle: {}, count-free tables: {}",
             self.nodes.len(),
             self.words,
             self.nodes[self.start as usize].state,
-            self.skip_when_idle
+            self.skip_when_idle,
+            self.count_free.is_some()
         )?;
         let st = |s: Succ| -> String {
             if s.node == NO_NODE {

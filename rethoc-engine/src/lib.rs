@@ -3075,6 +3075,7 @@ impl RegexBuilder {
             Box::new(
                 match grouped_nfa::analyze(
                     &self.states,
+                    &classes_slice,
                     &byte_tables_slice,
                     start,
                     self.counters.len(),

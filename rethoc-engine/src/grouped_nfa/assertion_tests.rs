@@ -469,6 +469,7 @@ fn fixture_regex(states: Vec<State>, num_counters: usize) -> Regex {
     re.counter_body_states = Box::default();
     let analysis = super::analyze(
         &re.states,
+        &re.classes,
         &re.byte_tables,
         re.start,
         num_counters,

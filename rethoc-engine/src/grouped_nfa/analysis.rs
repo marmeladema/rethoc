@@ -9,8 +9,9 @@
 
 use std::fmt;
 
+use super::CountFreeTables;
 use super::{GroupedNfaPlan, Increment, NO_NODE, Node, NodeIdx, Op, Row, Succ};
-use crate::{AssertKind, ByteMap, CounterIdx, CounterInfo, State, StateIdx};
+use crate::{AssertKind, ByteClassBits, ByteMap, CounterIdx, CounterInfo, State, StateIdx};
 
 // ---------------------------------------------------------------------------
 // Limits and rejections
@@ -444,14 +445,14 @@ pub(crate) const fn reviewed(kind: AssertKind) -> bool {
 }
 
 /// Upper bound of the transient analysis arrays for `states` states:
-/// labels, indegrees, predecessors and two sets of visited flags indexed by
+/// labels, indegrees, predecessors and three sets of flags indexed by
 /// state, the reachable list, the work stacks and the order (each at most
 /// one entry per state), and the bounds per counter.
 pub(crate) fn analysis_bytes(states: usize, num_counters: usize) -> usize {
     states
         * (size_of::<Option<Scope>>()
             + size_of::<u32>()
-            + 2 * size_of::<bool>()
+            + 3 * size_of::<bool>()
             + 5 * size_of::<StateIdx>())
         + num_counters * size_of::<Option<(usize, usize)>>()
 }
@@ -459,6 +460,7 @@ pub(crate) fn analysis_bytes(states: usize, num_counters: usize) -> usize {
 /// Analyse the final state array and build a plan, or say why not.
 pub(crate) fn analyze(
     states: &[State],
+    classes: &[ByteClassBits],
     byte_tables: &[ByteMap],
     start: StateIdx,
     num_counters: usize,
@@ -503,7 +505,17 @@ pub(crate) fn analyze(
         });
     }
 
-    let plan_bytes = GroupedNfaPlan::heap_bytes_for(states.len(), order.len());
+    // Count-free tables: when the start node is count-free (it seeds every
+    // closure) and the bitmaps are small enough.  They are optional: a plan
+    // that fits without them is admitted without them.
+    let a = order.len().div_ceil(64);
+    let mut count_free =
+        (a <= MAX_COUNT_FREE_WORDS && closure_is_count_free(states, start)).then_some(a);
+    let mut plan_bytes = GroupedNfaPlan::heap_bytes_for(states.len(), order.len(), count_free);
+    if plan_bytes > limits.max_plan_bytes && count_free.is_some() {
+        count_free = None;
+        plan_bytes = GroupedNfaPlan::heap_bytes_for(states.len(), order.len(), None);
+    }
     if plan_bytes > limits.max_plan_bytes {
         return Err(Rejection::PlanTooLarge {
             bytes: plan_bytes,
@@ -587,7 +599,18 @@ pub(crate) fn analyze(
     let (consumers, zero_width): (Vec<Node>, Vec<Node>) = nodes
         .iter()
         .partition(|n| matches!(n.op, Op::Edge { .. } | Op::Table(_)));
+    let count_free = count_free.map(|a| {
+        Box::new(count_free_tables(
+            &nodes,
+            node(start),
+            a,
+            states,
+            classes,
+            byte_tables,
+        ))
+    });
     let plan = GroupedNfaPlan {
+        count_free,
         zero_width: zero_width.into_boxed_slice(),
         consumers: consumers.into_boxed_slice(),
         start: node(start),
@@ -599,6 +622,103 @@ pub(crate) fn analyze(
     };
     debug_assert_eq!(plan.heap_bytes(), plan_bytes);
     Ok(plan)
+}
+
+/// Most bitmap words for which count-free tables are built: 512 rows.
+/// Their size grows with rows times words.
+const MAX_COUNT_FREE_WORDS: usize = 8;
+
+/// Whether the zero-width closure of `start` reaches neither an assertion
+/// nor a `CounterIncrement`.
+fn closure_is_count_free(states: &[State], start: StateIdx) -> bool {
+    let mut seen = vec![false; states.len()];
+    let mut stack = vec![start];
+    while let Some(idx) = stack.pop() {
+        if std::mem::replace(&mut seen[idx.idx()], true) {
+            continue;
+        }
+        match states[idx] {
+            State::Assert { .. } | State::CounterIncrement { .. } => return false,
+            ref s => for_each_zero_width_successor(s, |t| stack.push(t)),
+        }
+    }
+    true
+}
+
+/// Build the count-free tables (see [`CountFreeTables`]); the start node
+/// must be count-free.
+fn count_free_tables(
+    nodes: &[Node],
+    start: NodeIdx,
+    a: usize,
+    states: &[State],
+    classes: &[ByteClassBits],
+    byte_tables: &[ByteMap],
+) -> CountFreeTables {
+    let r = nodes.len();
+    let bit = |n: usize| (n / 64, 1u64 << (n % 64));
+    let mut count_free = vec![false; r];
+    let mut closure = vec![0u64; r * a];
+    // Successors come later in node order: fill backwards.
+    for n in (0..r).rev() {
+        let succs: &[Succ] = match &nodes[n].op {
+            Op::Assert { .. } | Op::CounterIncrement { .. } => continue,
+            Op::Split { out, out1 } => &[*out, *out1],
+            Op::CounterInstance { out } => std::slice::from_ref(out),
+            Op::Match | Op::Edge { .. } | Op::Table(_) => &[],
+        };
+        if !succs.iter().all(|s| count_free[s.node as usize]) {
+            continue;
+        }
+        count_free[n] = true;
+        let (w, m) = bit(n);
+        closure[n * a + w] |= m;
+        for s in succs {
+            let src = s.node as usize * a;
+            for i in 0..a {
+                closure[n * a + i] |= closure[src + i];
+            }
+        }
+    }
+    let start = start as usize;
+    assert!(count_free[start], "the start node is count-free");
+    let mut accept = vec![0u64; 256 * a];
+    let (mut statics, mut matches) = (vec![0u64; a], vec![0u64; a]);
+    for (n, node) in nodes.iter().enumerate() {
+        let (w, m) = bit(n);
+        if count_free[n] {
+            statics[w] |= m;
+        }
+        match node.op {
+            Op::Match => matches[w] |= m,
+            Op::Edge { .. } | Op::Table(_) => {
+                for b in 0..=255u8 {
+                    let accepted = match node.op {
+                        Op::Table(t) => byte_tables[t][b] != StateIdx::NONE,
+                        _ => super::exact::accepts(classes, &states[node.state.idx()], b),
+                    };
+                    if accepted {
+                        accept[b as usize * a + w] |= m;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let start_closure: Box<[u64]> = closure[start * a..][..a].into();
+    let mut starts = Box::new([false; 256]);
+    for (b, s) in starts.iter_mut().enumerate() {
+        *s = (0..a).any(|i| start_closure[i] & accept[b * a + i] != 0);
+    }
+    CountFreeTables {
+        a,
+        closure: closure.into_boxed_slice(),
+        accept: accept.into_boxed_slice(),
+        statics: statics.into_boxed_slice(),
+        matches: matches.into_boxed_slice(),
+        start_closure,
+        starts,
+    }
 }
 
 /// Check (in debug builds) what the transfers assume of a successor
