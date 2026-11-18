@@ -57,6 +57,7 @@
 
 mod analysis;
 mod exact;
+pub(crate) mod sparse;
 pub mod stats;
 
 use std::fmt;
@@ -64,8 +65,11 @@ use std::fmt;
 use crate::{AssertKind, ByteTableIdx, Regex, StateIdx};
 
 pub use analysis::Rejection;
-pub(crate) use analysis::{Limits, Scope, analyze};
+#[cfg(test)]
+pub(crate) use analysis::analyze;
+pub(crate) use analysis::{Limits, Scope, layout, structure};
 pub use exact::{GroupedMatcher, GroupedScratch, GroupedStream, Sweep};
+pub use sparse::{SparseMatcher, SparseRejection, SparseScratch, SparseStream};
 
 // ---------------------------------------------------------------------------
 // Plan
@@ -402,6 +406,49 @@ impl GroupedNfa {
     }
 }
 
+/// The outcome of the sparse counting analysis of a regex compiled with
+/// [`RegexConfig::sparse_counting`](crate::RegexConfig::sparse_counting).
+#[derive(Debug)]
+pub(crate) enum SparseCounting {
+    Admitted(sparse::SparsePlan),
+    Rejected(SparseRejection),
+}
+
+impl SparseCounting {
+    /// Heap bytes beyond the boxed enum itself.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            SparseCounting::Admitted(plan) => plan.heap_bytes(),
+            SparseCounting::Rejected(_) => 0,
+        }
+    }
+}
+
+/// Why a regex cannot run on the sparse counting variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SparseCountingError {
+    /// The regex was compiled without
+    /// [`RegexConfig::sparse_counting`](crate::RegexConfig::sparse_counting).
+    NotRequested,
+    /// The analysis rejected the graph.
+    Rejected(SparseRejection),
+}
+
+impl fmt::Display for SparseCountingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotRequested => write!(
+                f,
+                "sparse counting was not analysed for this regex (compile with \
+                 RegexConfig::sparse_counting)"
+            ),
+            Self::Rejected(r) => write!(f, "not admitted by sparse counting: {r}"),
+        }
+    }
+}
+
+impl std::error::Error for SparseCountingError {}
+
 /// Why a regex cannot run on the grouped backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupedNfaError {
@@ -438,6 +485,22 @@ impl Regex {
             Some(GroupedNfa::Rejected(r)) => Err(GroupedNfaError::Rejected(*r)),
             Some(GroupedNfa::Admitted(plan)) => Ok(plan),
         }
+    }
+
+    /// The sparse counting plan of this regex, or why there is none.
+    pub(crate) fn sparse_plan(&self) -> Result<&sparse::SparsePlan, SparseCountingError> {
+        match self.sparse_counting.as_deref() {
+            None => Err(SparseCountingError::NotRequested),
+            Some(SparseCounting::Rejected(r)) => Err(SparseCountingError::Rejected(*r)),
+            Some(SparseCounting::Admitted(plan)) => Ok(plan),
+        }
+    }
+
+    /// Whether this regex can run on the sparse counting variant, and why
+    /// not.
+    #[doc(hidden)]
+    pub fn sparse_counting_admission(&self) -> Result<(), SparseCountingError> {
+        self.sparse_plan().map(|_| ())
     }
 
     /// Whether this regex can run on the grouped NFA, and

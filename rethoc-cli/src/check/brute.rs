@@ -31,6 +31,10 @@ pub(crate) struct BruteArgs {
     /// does not admit are rejected
     #[bpaf(long)]
     pub(crate) grouped_nfa: bool,
+    /// Check only the NFA and the experimental sparse counting variant
+    /// of the grouped NFA; patterns it does not admit are rejected
+    #[bpaf(long)]
+    pub(crate) sparse_counting: bool,
     /// Mismatching inputs to print per configuration; stops after the
     /// length where this many were found
     #[bpaf(long, argument("N"), fallback(3), display_fallback)]
@@ -69,7 +73,12 @@ pub(crate) fn run(args: &BruteArgs) -> i32 {
     let mut failures: Vec<Failure> = Vec::new();
     let (mut checked, mut mismatched) = (0usize, 0usize);
     for config in args.compile.check_configs() {
-        let choice = super::TierChoice::new(args.tier, args.skip_tier, args.grouped_nfa);
+        let choice = super::TierChoice::new(
+            args.tier,
+            args.skip_tier,
+            args.grouped_nfa,
+            args.sparse_counting,
+        );
         let subject = match Subject::compile(pattern, &config, choice, &mut memory) {
             Ok(s) => s,
             Err(e) => {

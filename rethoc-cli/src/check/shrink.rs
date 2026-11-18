@@ -23,6 +23,10 @@ pub(crate) struct ShrinkArgs {
     /// does not admit are rejected
     #[bpaf(long)]
     pub(crate) grouped_nfa: bool,
+    /// Check only the NFA and the experimental sparse counting variant
+    /// of the grouped NFA; patterns it does not admit are rejected
+    #[bpaf(long)]
+    pub(crate) sparse_counting: bool,
     /// Without --unroll-limit/--no-merge, use the first of the three
     /// standard configurations where the input mismatches
     #[bpaf(external(compile_args))]
@@ -66,7 +70,7 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
         match Subject::compile(
             pattern,
             &config,
-            super::TierChoice::new(args.tier, None, args.grouped_nfa),
+            super::TierChoice::new(args.tier, None, args.grouped_nfa, args.sparse_counting),
             &mut memory,
         ) {
             Ok(s) => {
@@ -161,6 +165,7 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
         match traced.backend {
             Backend::Tier(t) => cmd.extend(["--tier".into(), t.to_string()]),
             Backend::Grouped => cmd.push("--grouped-nfa".into()),
+            Backend::Sparse => cmd.push("--sparse-counting".into()),
         }
         cmd.extend(config_args(&subject.config));
         if pattern.starts_with('-') || input.starts_with(b"-") {

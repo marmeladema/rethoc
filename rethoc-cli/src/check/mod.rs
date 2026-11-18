@@ -19,7 +19,9 @@ pub(crate) mod sweep;
 use std::fmt;
 use std::sync::OnceLock;
 
-use rethoc_engine::{GroupedNfaError, GroupedNfaMode, MatcherMemory, Regex, RegexConfig};
+use rethoc_engine::{
+    GroupedNfaError, GroupedNfaMode, MatcherMemory, Regex, RegexConfig, SparseCountingError,
+};
 
 use crate::CompileArgs;
 
@@ -80,6 +82,10 @@ impl fmt::Display for Feed {
 pub(crate) enum Backend {
     Tier(u8),
     Grouped,
+    /// The experimental sparse counting variant of the grouped NFA
+    /// (`plans/sparse-counting-sets.md`): never selected automatically,
+    /// forced here on what it admits.
+    Sparse,
 }
 
 impl Backend {
@@ -92,17 +98,20 @@ impl fmt::Display for Backend {
         match self {
             Self::Tier(t) => write!(f, "tier{t}"),
             Self::Grouped => f.write_str("grouped"),
+            Self::Sparse => f.write_str("sparse"),
         }
     }
 }
 
-/// `[0, 3, grouped]`: tiers by number, then the grouped NFA.
+/// `[0, 3, grouped, sparse]`: tiers by number, then the grouped NFA and
+/// its sparse counting variant.
 pub(crate) fn backend_list(backends: &[Backend]) -> String {
     let names: Vec<String> = backends
         .iter()
         .map(|b| match b {
             Backend::Tier(t) => t.to_string(),
             Backend::Grouped => "grouped".into(),
+            Backend::Sparse => "sparse".into(),
         })
         .collect();
     format!("[{}]", names.join(", "))
@@ -130,6 +139,7 @@ pub(crate) enum Rejection {
     Compile(rethoc_engine::Error),
     NotEligible { tier: u8, min_tier: u8 },
     NotAdmitted(GroupedNfaError),
+    SparseNotAdmitted(SparseCountingError),
 }
 
 impl fmt::Display for Rejection {
@@ -140,6 +150,7 @@ impl fmt::Display for Rejection {
                 write!(f, "not eligible for tier {tier} (min_tier={min_tier})")
             }
             Self::NotAdmitted(e) => write!(f, "{e}"),
+            Self::SparseNotAdmitted(e) => write!(f, "{e}"),
         }
     }
 }
@@ -147,28 +158,39 @@ impl fmt::Display for Rejection {
 /// Which backends a check runs, next to the NFA.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum TierChoice {
-    /// Every tier the pattern is eligible for, and the grouped NFA if it
-    /// admits the pattern.
+    /// Every tier the pattern is eligible for, and the grouped NFA and
+    /// its sparse counting variant, each if it admits the pattern.
     #[default]
     All,
     /// Only this tier; a pattern not eligible for it is rejected.
     Only(u8),
-    /// Every eligible tier but this one, and the grouped NFA.
+    /// Every eligible tier but this one, the grouped NFA and its sparse
+    /// counting variant.
     Except(u8),
     /// Only the grouped NFA; a pattern it does not admit is rejected.
     Grouped,
+    /// Only the sparse counting variant; a pattern it does not admit is
+    /// rejected.
+    Sparse,
 }
 
 impl TierChoice {
-    /// From `--tier`, `--skip-tier` and `--grouped-nfa` (the command line
-    /// is checked for combining them before this is called).
-    pub(crate) fn new(only: Option<u8>, skip: Option<u8>, grouped: bool) -> Self {
-        match (only, skip, grouped) {
-            (_, _, true) => Self::Grouped,
-            (Some(t), _, _) => Self::Only(t),
-            (None, Some(t), _) => Self::Except(t),
-            (None, None, false) => Self::All,
+    /// From `--tier`, `--skip-tier`, `--grouped-nfa` and
+    /// `--sparse-counting` (the command line is checked for combining them
+    /// before this is called).
+    pub(crate) fn new(only: Option<u8>, skip: Option<u8>, grouped: bool, sparse: bool) -> Self {
+        match (only, skip, grouped, sparse) {
+            (_, _, _, true) => Self::Sparse,
+            (_, _, true, _) => Self::Grouped,
+            (Some(t), _, _, _) => Self::Only(t),
+            (None, Some(t), _, _) => Self::Except(t),
+            (None, None, false, false) => Self::All,
         }
+    }
+
+    /// Whether the sparse counting variant is among the backends to check.
+    fn wants_sparse(self) -> bool {
+        matches!(self, Self::All | Self::Except(_) | Self::Sparse)
     }
 
     /// Whether the grouped NFA is among the backends to check.
@@ -189,6 +211,9 @@ pub(crate) struct Subject {
     pub(crate) backends: Vec<Backend>,
     /// Why the grouped NFA is not among the backends, when it was wanted.
     pub(crate) grouped_rejection: Option<GroupedNfaError>,
+    /// Why the sparse counting variant is not among the backends, when it
+    /// was wanted.
+    pub(crate) sparse_rejection: Option<SparseCountingError>,
 }
 
 impl Subject {
@@ -207,10 +232,11 @@ impl Subject {
         } else {
             GroupedNfaMode::Auto
         };
+        compiled.sparse_counting = choice.wants_sparse();
         let regex = Regex::with_config(pattern, compiled).map_err(Rejection::Compile)?;
         let candidates: Vec<u8> = match choice {
             TierChoice::All => (0..=4).collect(),
-            TierChoice::Only(0) | TierChoice::Grouped => vec![0],
+            TierChoice::Only(0) | TierChoice::Grouped | TierChoice::Sparse => vec![0],
             TierChoice::Only(t) => vec![0, t],
             TierChoice::Except(skip) => (0..=4).filter(|&t| t == 0 || t != skip).collect(),
         };
@@ -237,13 +263,25 @@ impl Subject {
                 Err(e) => grouped_rejection = Some(e),
             }
         }
+        let mut sparse_rejection = None;
+        if choice.wants_sparse() {
+            match regex.sparse_counting_admission() {
+                Ok(()) => backends.push(Backend::Sparse),
+                Err(e) if choice == TierChoice::Sparse => {
+                    return Err(Rejection::SparseNotAdmitted(e));
+                }
+                Err(e) => sparse_rejection = Some(e),
+            }
+        }
         let mut config = config.clone();
         config.grouped_nfa = GroupedNfaMode::Auto;
+        config.sparse_counting = false;
         Ok(Self {
             config,
             regex,
             backends,
             grouped_rejection,
+            sparse_rejection,
         })
     }
 
@@ -257,6 +295,9 @@ impl Subject {
             self.regex.engine()
         );
         if let Some(e) = &self.grouped_rejection {
+            s.push_str(&format!(" ({e})"));
+        }
+        if let Some(e) = &self.sparse_rejection {
             s.push_str(&format!(" ({e})"));
         }
         s
@@ -290,26 +331,17 @@ impl Subject {
         feed: Feed,
         input: &[u8],
     ) -> bool {
-        let tier = match backend {
-            Backend::Tier(t) => t,
-            Backend::Grouped => {
-                let mut m = memory
-                    .matcher_grouped(&self.regex)
-                    .expect("the grouped NFA was checked for admission");
-                match feed {
-                    Feed::Whole => m.chunk(input),
-                    Feed::Bytewise => {
-                        for b in input {
-                            m.chunk(std::slice::from_ref(b));
-                        }
-                    }
-                }
-                return m.finish();
-            }
+        let mut m = match backend {
+            Backend::Tier(tier) => memory
+                .matcher_for_tier(&self.regex, tier)
+                .expect("tier was checked for eligibility"),
+            Backend::Grouped => memory
+                .matcher_grouped(&self.regex)
+                .expect("the grouped NFA was checked for admission"),
+            Backend::Sparse => memory
+                .matcher_sparse(&self.regex)
+                .expect("sparse counting was checked for admission"),
         };
-        let mut m = memory
-            .matcher_for_tier(&self.regex, tier)
-            .expect("tier was checked for eligibility");
         match feed {
             Feed::Whole => m.chunk(input),
             Feed::Bytewise => {
@@ -403,8 +435,9 @@ pub(crate) fn regime() -> Regime {
 }
 
 /// A fresh [`MatcherMemory`], with the DFA state cap of the [`Regime`].  It
-/// also holds the grouped NFA's scratch and stream storage, so that
-/// `--shared-memory` shares those across regexes too.
+/// also holds the scratch and stream storage of the grouped NFA and of its
+/// sparse counting variant, so that `--shared-memory` shares those across
+/// regexes too.
 pub(crate) fn new_memory() -> MatcherMemory {
     let mut memory = MatcherMemory::default();
     memory.set_dfa_state_cap(regime().dfa_states);
@@ -541,24 +574,45 @@ mod tests {
         let p = "(?:a|bb){2,3}c";
         assert_eq!(
             tiers(p, TierChoice::All).as_deref(),
-            Ok("[0, 3, 4, grouped]")
+            Ok("[0, 3, 4, grouped, sparse]")
         );
         assert_eq!(
             tiers(p, TierChoice::Except(3)).as_deref(),
-            Ok("[0, 4, grouped]")
+            Ok("[0, 4, grouped, sparse]")
         );
         assert_eq!(tiers(p, TierChoice::Only(3)).as_deref(), Ok("[0, 3]"));
         assert_eq!(tiers(p, TierChoice::Grouped).as_deref(), Ok("[0, grouped]"));
+        assert_eq!(tiers(p, TierChoice::Sparse).as_deref(), Ok("[0, sparse]"));
         assert!(tiers(p, TierChoice::Only(2)).is_err());
         // A nested counter: not admitted by the grouped NFA.
         let nested = "x((a|aa){2,3}){2,3}z";
         assert_eq!(tiers(nested, TierChoice::All).as_deref(), Ok("[0, 4]"));
         let rejected = tiers(nested, TierChoice::Grouped).unwrap_err();
         assert!(rejected.contains("nested"), "{rejected}");
-        assert_eq!(TierChoice::new(Some(3), None, false), TierChoice::Only(3));
-        assert_eq!(TierChoice::new(None, Some(3), false), TierChoice::Except(3));
-        assert_eq!(TierChoice::new(None, None, false), TierChoice::All);
-        assert_eq!(TierChoice::new(None, None, true), TierChoice::Grouped);
+        let rejected = tiers(nested, TierChoice::Sparse).unwrap_err();
+        assert!(rejected.contains("sparse counting"), "{rejected}");
+        // An unbounded counter: the grouped NFA runs it, its sparse
+        // variant does not.
+        let unbounded = "x(?:a|aa){2,}z";
+        assert_eq!(
+            tiers(unbounded, TierChoice::Except(3)).as_deref(),
+            Ok("[0, 4, grouped]")
+        );
+        assert!(tiers(unbounded, TierChoice::Sparse).is_err());
+        assert_eq!(
+            TierChoice::new(Some(3), None, false, false),
+            TierChoice::Only(3)
+        );
+        assert_eq!(
+            TierChoice::new(None, Some(3), false, false),
+            TierChoice::Except(3)
+        );
+        assert_eq!(TierChoice::new(None, None, false, false), TierChoice::All);
+        assert_eq!(
+            TierChoice::new(None, None, true, false),
+            TierChoice::Grouped
+        );
+        assert_eq!(TierChoice::new(None, None, false, true), TierChoice::Sparse);
     }
 
     #[test]

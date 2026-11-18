@@ -466,6 +466,20 @@ impl fmt::Display for DumpRegex<'_> {
             }
         }
 
+        // -- Sparse counting (when requested) ----------------------------------
+        match r.sparse_counting.as_deref() {
+            None => {}
+            Some(crate::grouped_nfa::SparseCounting::Rejected(reason)) => {
+                writeln!(f, "Sparse counting (experimental): rejected: {reason}")?;
+                writeln!(f)?;
+            }
+            Some(crate::grouped_nfa::SparseCounting::Admitted(plan)) => {
+                writeln!(f, "Sparse counting (experimental): admitted")?;
+                write!(f, "{plan}")?;
+                writeln!(f)?;
+            }
+        }
+
         // -- Auxiliary Arrays --------------------------------------------------
         writeln!(f, "Auxiliary Arrays:")?;
         if r.state_can_reach_match.is_empty() {
