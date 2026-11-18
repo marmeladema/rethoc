@@ -1,0 +1,3690 @@
+{
+  "status": "Historical production measurements before PR 24 review follow-ups, including the measured cache-layout fix. Measurements captured before committing; both Cargo build and target directories isolated. Diagnostic-only engine follow-ups were not rebenchmarked.",
+  "measured_engine_commit": "c25c3a81359f8214f08e487580eacf27ea30483a",
+  "baseline_commit": "e654f78748ad5fd04c94340bad3f5b434b976f38",
+  "environment": {
+    "baseline_commit": "e654f78748ad5fd04c94340bad3f5b434b976f38",
+    "architecture": "aarch64",
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+    "valgrind": "valgrind-3.25.1",
+    "runner": "/tmp/rethoc-tier1-tools/bin/gungraun-runner 0.20.0",
+    "baseline_name": "tier1_verified",
+    "callgrind_stream_bytes": 65536,
+    "criterion_stream_bytes": 262144,
+    "short_stream_bytes": 32,
+    "chunk_sizes": [
+      1,
+      16384
+    ],
+    "state_caps": [
+      "default",
+      8
+    ],
+    "byte_classes": [
+      "identity",
+      "forced"
+    ],
+    "notes": [
+      "Setup checks fixtures against regex oracle.",
+      "Forced tiers ensure baseline and candidate use same engines.",
+      "Both build.build-dir and CARGO_TARGET_DIR explicitly isolated; sanity base Regex752 / CRLF Tier1 refused, candidate Regex760 / CRLF Tier1 accepted.",
+      "Final evidence is verified-baseline-* plus final-* logs and isolated semantic sanity checks; earlier candidate comparisons are superseded.",
+      "Cache state counts and evictions measured through existing MatcherMemory Debug; no production instrumentation."
+    ],
+    "baseline_target": "/tmp/rethoc-tier1-native-base-target",
+    "baseline_build": "/tmp/rethoc-tier1-base-build",
+    "candidate_target": "/tmp/rethoc-tier1-native-candidate-target",
+    "candidate_build": "/tmp/rethoc-tier1-candidate-build",
+    "cargo": "/home/elie/.cargo/bin/cargo",
+    "cpu": {
+      "Architecture": "aarch64",
+      "CPU(s)": "8",
+      "Vendor ID": "Apple",
+      "Model name": "-",
+      "Thread(s) per core": "1"
+    },
+    "linker": "clang with -Clink-arg=-fuse-ld=wild from user Cargo configuration"
+  },
+  "isolation": {
+    "baseline_sanity": "Regex=752; counter-free CRLF forced Tier1 rejected",
+    "candidate_sanity": "Regex=760; all24 new-support NFA/Tier1 oracle checks passed",
+    "build_dirs": [
+      "/tmp/rethoc-tier1-base-build",
+      "/tmp/rethoc-tier1-candidate-build"
+    ],
+    "target_dirs": [
+      "/tmp/rethoc-tier1-native-base-target",
+      "/tmp/rethoc-tier1-native-candidate-target"
+    ],
+    "discarded_runs": "Earlier logs without final-/verified- prefixes and verified candidate runs before redundant-table removal are not this final result. Global Cargo build.build-dir initially caused executable sharing; both build and target dirs are now isolated."
+  },
+  "commands": [
+    {
+      "cwd": "/tmp/rethoc-tier1-base-e654f78",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-base-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/tmp/rethoc-tier1-base-e654f78/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-base-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions",
+        "--",
+        "^(tier1_assertions/(word|nonword|directional|lf|endlf|end|mixed)/direct/(warm|cold)|tier1_assertions_compile/(literal_sparse|word|lf|end))$",
+        "--warm-up-time",
+        "1",
+        "--save-baseline",
+        "tier1_verified"
+      ]
+    },
+    {
+      "cwd": "/tmp/rethoc-tier1-base-e654f78",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-base-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/tmp/rethoc-tier1-base-e654f78/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-base-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions_compile_limits",
+        "--",
+        "--warm-up-time",
+        "1",
+        "--save-baseline",
+        "tier1_verified"
+      ]
+    },
+    {
+      "cwd": "/tmp/rethoc-tier1-base-e654f78",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-base-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/tmp/rethoc-tier1-base-e654f78/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-base-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions_profile",
+        "--",
+        "--save-baseline=tier1_verified"
+      ]
+    },
+    {
+      "cwd": "/tmp/rethoc-tier1-base-e654f78",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-base-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/tmp/rethoc-tier1-base-e654f78/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-base-build\"",
+        "bench",
+        "--bench",
+        "reengage_profile",
+        "--",
+        "--save-baseline=tier1_verified"
+      ]
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions",
+        "--",
+        "^(tier1_assertions/(word|nonword|directional|lf|endlf|end|mixed)/direct/(warm|cold)|tier1_assertions_compile/(literal_sparse|word|lf|end))$",
+        "--warm-up-time",
+        "1",
+        "--baseline",
+        "tier1_verified"
+      ]
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions_compile_limits",
+        "--",
+        "--warm-up-time",
+        "1",
+        "--baseline",
+        "tier1_verified"
+      ]
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions_profile",
+        "--",
+        "--baseline=tier1_verified"
+      ]
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "reengage_profile",
+        "--",
+        "--baseline=tier1_verified"
+      ]
+    },
+    {
+      "cwd": "/tmp/rethoc-tier1-base-e654f78",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-base-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/tmp/rethoc-tier1-base-e654f78/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-base-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions_compile_limits",
+        "--",
+        "simple_tails",
+        "--warm-up-time",
+        "1",
+        "--save-baseline",
+        "tier1_simple_confirm"
+      ]
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions_compile_limits",
+        "--",
+        "simple_tails",
+        "--warm-up-time",
+        "1",
+        "--baseline",
+        "tier1_simple_confirm"
+      ]
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions_new",
+        "--",
+        "--warm-up-time",
+        "1"
+      ]
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions",
+        "--",
+        "^(tier1_assertions/(word|nonword|directional|lf|endlf|end|mixed)/direct/(warm|cold)|tier1_assertions_compile/(literal_sparse|word|lf|end))$",
+        "--warm-up-time",
+        "1",
+        "--baseline",
+        "tier1_verified"
+      ],
+      "log": "/tmp/rethoc-tier1-layout-final-candidate-criterion.log",
+      "status": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 73.626
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions_compile_limits",
+        "--",
+        "--warm-up-time",
+        "1",
+        "--baseline",
+        "tier1_verified"
+      ],
+      "log": "/tmp/rethoc-tier1-layout-final-candidate-limits.log",
+      "status": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 13.863
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions_new",
+        "--",
+        "--warm-up-time",
+        "1"
+      ],
+      "log": "/tmp/rethoc-tier1-layout-final-candidate-new.log",
+      "status": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 96.881
+    },
+    {
+      "cwd": "/tmp/rethoc-tier1-base-e654f78",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-base-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/tmp/rethoc-tier1-base-e654f78/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-base-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions",
+        "--",
+        "^tier1_assertions/mixed/classes/warm$",
+        "--warm-up-time",
+        "1",
+        "--save-baseline",
+        "tier1_layout_mixed"
+      ],
+      "log": "/tmp/rethoc-tier1-layout-final-baseline-mixed.log",
+      "status": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 4.228
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions",
+        "--",
+        "^tier1_assertions/mixed/classes/warm$",
+        "--warm-up-time",
+        "1",
+        "--baseline",
+        "tier1_layout_mixed"
+      ],
+      "log": "/tmp/rethoc-tier1-layout-final-candidate-mixed.log",
+      "status": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 4.279
+    },
+    {
+      "cwd": "/tmp/rethoc-tier1-base-e654f78",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-base-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/tmp/rethoc-tier1-base-e654f78/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-base-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions",
+        "--",
+        "^(tier1_assertions/(nonword|mixed)/direct/warm|tier1_assertions_compile/end)$",
+        "--warm-up-time",
+        "1",
+        "--save-baseline",
+        "tier1_layout_repeat"
+      ],
+      "log": "/tmp/rethoc-tier1-layout-final-baseline-repeat.log",
+      "status": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 10.557
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions",
+        "--",
+        "^(tier1_assertions/(nonword|mixed)/direct/warm|tier1_assertions_compile/end)$",
+        "--warm-up-time",
+        "1",
+        "--baseline",
+        "tier1_layout_repeat"
+      ],
+      "log": "/tmp/rethoc-tier1-layout-final-candidate-repeat.log",
+      "status": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 11.231
+    },
+    {
+      "cwd": "/tmp/rethoc-tier1-base-e654f78",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-base-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/tmp/rethoc-tier1-base-e654f78/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-base-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions_compile_limits",
+        "--",
+        "--warm-up-time",
+        "1",
+        "--save-baseline",
+        "tier1_layout_repeat"
+      ],
+      "log": "/tmp/rethoc-tier1-layout-final-baseline-limits-repeat.log",
+      "status": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 12.252
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions_compile_limits",
+        "--",
+        "--warm-up-time",
+        "1",
+        "--baseline",
+        "tier1_layout_repeat"
+      ],
+      "log": "/tmp/rethoc-tier1-layout-final-candidate-limits-repeat.log",
+      "status": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 12.461
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "tier1_assertions_profile",
+        "--",
+        "--baseline=tier1_verified"
+      ],
+      "log": "/tmp/rethoc-tier1-layout-final-candidate-profile.log",
+      "status": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 33.088
+    },
+    {
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "env": {
+        "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-native-candidate-target",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped"
+      },
+      "prepend_PATH": "/tmp/rethoc-tier1-tools/bin",
+      "argv": [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"",
+        "bench",
+        "--bench",
+        "reengage_profile",
+        "--",
+        "--baseline=tier1_verified"
+      ],
+      "log": "/tmp/rethoc-tier1-layout-final-candidate-reengage.log",
+      "status": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 10.352
+    }
+  ],
+  "callgrind_focused": {
+    "summary": "Gungraun result: Ok. 55 without regressions; 0 regressed; 0 filtered; 55 benchmarks finished in 27.1540s",
+    "limits_percent": {
+      "Instructions": 5,
+      "Bcm": 100
+    },
+    "cases": {
+      "scan/literal_sparse_direct_cold": {
+        "Instructions": {
+          "baseline": 22155,
+          "candidate": 22055,
+          "percent": -0.45137
+        },
+        "Bcm": {
+          "baseline": 139,
+          "candidate": 139,
+          "percent": 0.0
+        }
+      },
+      "scan/literal_sparse_direct_warm": {
+        "Instructions": {
+          "baseline": 20866,
+          "candidate": 20670,
+          "percent": -0.93933
+        },
+        "Bcm": {
+          "baseline": 72,
+          "candidate": 80,
+          "percent": 11.11111
+        }
+      },
+      "scan/literal_dense_direct_cold": {
+        "Instructions": {
+          "baseline": 3446985,
+          "candidate": 3446378,
+          "percent": -0.01761
+        },
+        "Bcm": {
+          "baseline": 32994,
+          "candidate": 32974,
+          "percent": -0.06062
+        }
+      },
+      "scan/literal_dense_direct_warm": {
+        "Instructions": {
+          "baseline": 3443086,
+          "candidate": 3443013,
+          "percent": -0.00212
+        },
+        "Bcm": {
+          "baseline": 32865,
+          "candidate": 32871,
+          "percent": 0.01826
+        }
+      },
+      "scan/no_prefilter_direct_cold": {
+        "Instructions": {
+          "baseline": 2826566,
+          "candidate": 2825871,
+          "percent": -0.02459
+        },
+        "Bcm": {
+          "baseline": 224,
+          "candidate": 225,
+          "percent": 0.44643
+        }
+      },
+      "scan/no_prefilter_direct_warm": {
+        "Instructions": {
+          "baseline": 2821545,
+          "candidate": 2821417,
+          "percent": -0.00454
+        },
+        "Bcm": {
+          "baseline": 98,
+          "candidate": 98,
+          "percent": 0.0
+        }
+      },
+      "scan/word_direct_cold": {
+        "Instructions": {
+          "baseline": 2310121,
+          "candidate": 2308304,
+          "percent": -0.07865
+        },
+        "Bcm": {
+          "baseline": 355,
+          "candidate": 317,
+          "percent": -10.70423
+        }
+      },
+      "scan/word_direct_warm": {
+        "Instructions": {
+          "baseline": 2298885,
+          "candidate": 2298425,
+          "percent": -0.02001
+        },
+        "Bcm": {
+          "baseline": 125,
+          "candidate": 113,
+          "percent": -9.6
+        }
+      },
+      "scan/word_late_direct_cold": {
+        "Instructions": {
+          "baseline": 2311359,
+          "candidate": 2310024,
+          "percent": -0.05776
+        },
+        "Bcm": {
+          "baseline": 349,
+          "candidate": 334,
+          "percent": -4.29799
+        }
+      },
+      "scan/word_late_direct_warm": {
+        "Instructions": {
+          "baseline": 2299292,
+          "candidate": 2299493,
+          "percent": 0.00874
+        },
+        "Bcm": {
+          "baseline": 136,
+          "candidate": 140,
+          "percent": 2.94118
+        }
+      },
+      "scan/nonword_direct_cold": {
+        "Instructions": {
+          "baseline": 2303058,
+          "candidate": 2303004,
+          "percent": -0.00234
+        },
+        "Bcm": {
+          "baseline": 231,
+          "candidate": 225,
+          "percent": -2.5974
+        }
+      },
+      "scan/nonword_direct_warm": {
+        "Instructions": {
+          "baseline": 2297004,
+          "candidate": 2297057,
+          "percent": 0.00231
+        },
+        "Bcm": {
+          "baseline": 104,
+          "candidate": 98,
+          "percent": -5.76923
+        }
+      },
+      "scan/directional_direct_cold": {
+        "Instructions": {
+          "baseline": 6253008,
+          "candidate": 2375600,
+          "percent": -62.00868
+        },
+        "Bcm": {
+          "baseline": 11302,
+          "candidate": 11290,
+          "percent": -0.10618
+        }
+      },
+      "scan/directional_direct_warm": {
+        "Instructions": {
+          "baseline": 6241295,
+          "candidate": 2364333,
+          "percent": -62.11791
+        },
+        "Bcm": {
+          "baseline": 11051,
+          "candidate": 11053,
+          "percent": 0.0181
+        }
+      },
+      "scan/lf_direct_cold": {
+        "Instructions": {
+          "baseline": 7697049,
+          "candidate": 2413532,
+          "percent": -68.64341
+        },
+        "Bcm": {
+          "baseline": 24128,
+          "candidate": 18189,
+          "percent": -24.61456
+        }
+      },
+      "scan/lf_direct_warm": {
+        "Instructions": {
+          "baseline": 7688948,
+          "candidate": 2405157,
+          "percent": -68.7193
+        },
+        "Bcm": {
+          "baseline": 23947,
+          "candidate": 17985,
+          "percent": -24.89665
+        }
+      },
+      "scan/lf_late_direct_cold": {
+        "Instructions": {
+          "baseline": 7698521,
+          "candidate": 2414478,
+          "percent": -68.63712
+        },
+        "Bcm": {
+          "baseline": 24151,
+          "candidate": 18212,
+          "percent": -24.59111
+        }
+      },
+      "scan/lf_late_direct_warm": {
+        "Instructions": {
+          "baseline": 7691000,
+          "candidate": 2405441,
+          "percent": -68.72395
+        },
+        "Bcm": {
+          "baseline": 23981,
+          "candidate": 17986,
+          "percent": -24.99896
+        }
+      },
+      "scan/endlf_direct_cold": {
+        "Instructions": {
+          "baseline": 2288729,
+          "candidate": 2287681,
+          "percent": -0.04579
+        },
+        "Bcm": {
+          "baseline": 12257,
+          "candidate": 12224,
+          "percent": -0.26923
+        }
+      },
+      "scan/endlf_direct_warm": {
+        "Instructions": {
+          "baseline": 2280176,
+          "candidate": 2280468,
+          "percent": 0.01281
+        },
+        "Bcm": {
+          "baseline": 12044,
+          "candidate": 12042,
+          "percent": -0.01661
+        }
+      },
+      "scan/end_direct_cold": {
+        "Instructions": {
+          "baseline": 3142185,
+          "candidate": 3141090,
+          "percent": -0.03485
+        },
+        "Bcm": {
+          "baseline": 16714,
+          "candidate": 16699,
+          "percent": -0.08975
+        }
+      },
+      "scan/end_direct_warm": {
+        "Instructions": {
+          "baseline": 3132893,
+          "candidate": 3133199,
+          "percent": 0.00977
+        },
+        "Bcm": {
+          "baseline": 16501,
+          "candidate": 16496,
+          "percent": -0.0303
+        }
+      },
+      "scan/end_late_direct_cold": {
+        "Instructions": {
+          "baseline": 3143341,
+          "candidate": 3142200,
+          "percent": -0.0363
+        },
+        "Bcm": {
+          "baseline": 16739,
+          "candidate": 16723,
+          "percent": -0.09559
+        }
+      },
+      "scan/end_late_direct_warm": {
+        "Instructions": {
+          "baseline": 3133796,
+          "candidate": 3134146,
+          "percent": 0.01117
+        },
+        "Bcm": {
+          "baseline": 16517,
+          "candidate": 16516,
+          "percent": -0.00605
+        }
+      },
+      "scan/anchored_direct_cold": {
+        "Instructions": {
+          "baseline": 12723346,
+          "candidate": 2696958,
+          "percent": -78.80308
+        },
+        "Bcm": {
+          "baseline": 239,
+          "candidate": 243,
+          "percent": 1.67364
+        }
+      },
+      "scan/anchored_direct_warm": {
+        "Instructions": {
+          "baseline": 12716016,
+          "candidate": 2689925,
+          "percent": -78.84617
+        },
+        "Bcm": {
+          "baseline": 94,
+          "candidate": 99,
+          "percent": 5.31915
+        }
+      },
+      "scan/mixed_direct_cold": {
+        "Instructions": {
+          "baseline": 2313002,
+          "candidate": 2311323,
+          "percent": -0.07259
+        },
+        "Bcm": {
+          "baseline": 379,
+          "candidate": 358,
+          "percent": -5.5409
+        }
+      },
+      "scan/mixed_direct_warm": {
+        "Instructions": {
+          "baseline": 2299335,
+          "candidate": 2299505,
+          "percent": 0.00739
+        },
+        "Bcm": {
+          "baseline": 135,
+          "candidate": 129,
+          "percent": -4.44444
+        }
+      },
+      "scan/churn_direct_cold": {
+        "Instructions": {
+          "baseline": 2946962,
+          "candidate": 2924959,
+          "percent": -0.74663
+        },
+        "Bcm": {
+          "baseline": 3099,
+          "candidate": 2930,
+          "percent": -5.45337
+        }
+      },
+      "scan/churn_direct_warm": {
+        "Instructions": {
+          "baseline": 2873545,
+          "candidate": 2873200,
+          "percent": -0.01201
+        },
+        "Bcm": {
+          "baseline": 2310,
+          "candidate": 2319,
+          "percent": 0.38961
+        }
+      },
+      "scan/word_bytewise_warm": {
+        "Instructions": {
+          "baseline": 5772081,
+          "candidate": 5771590,
+          "percent": -0.00851
+        },
+        "Bcm": {
+          "baseline": 121,
+          "candidate": 108,
+          "percent": -10.7438
+        }
+      },
+      "scan/lf_bytewise_warm": {
+        "Instructions": {
+          "baseline": 11162168,
+          "candidate": 5878384,
+          "percent": -47.33654
+        },
+        "Bcm": {
+          "baseline": 59683,
+          "candidate": 41807,
+          "percent": -29.95158
+        }
+      },
+      "scan/end_bytewise_warm": {
+        "Instructions": {
+          "baseline": 6671600,
+          "candidate": 6671892,
+          "percent": 0.00438
+        },
+        "Bcm": {
+          "baseline": 16483,
+          "candidate": 16476,
+          "percent": -0.04247
+        }
+      },
+      "scan/mixed_bytewise_warm": {
+        "Instructions": {
+          "baseline": 5772620,
+          "candidate": 5772814,
+          "percent": 0.00336
+        },
+        "Bcm": {
+          "baseline": 135,
+          "candidate": 127,
+          "percent": -5.92593
+        }
+      },
+      "scan/word_classes_warm": {
+        "Instructions": {
+          "baseline": 2364382,
+          "candidate": 2364139,
+          "percent": -0.01028
+        },
+        "Bcm": {
+          "baseline": 110,
+          "candidate": 115,
+          "percent": 4.54545
+        }
+      },
+      "scan/lf_classes_warm": {
+        "Instructions": {
+          "baseline": 7736571,
+          "candidate": 2452904,
+          "percent": -68.29469
+        },
+        "Bcm": {
+          "baseline": 23930,
+          "candidate": 17976,
+          "percent": -24.8809
+        }
+      },
+      "scan/end_classes_warm": {
+        "Instructions": {
+          "baseline": 3264006,
+          "candidate": 3264305,
+          "percent": 0.00916
+        },
+        "Bcm": {
+          "baseline": 16491,
+          "candidate": 16496,
+          "percent": 0.03032
+        }
+      },
+      "scan/mixed_classes_warm": {
+        "Instructions": {
+          "baseline": 2363768,
+          "candidate": 2364253,
+          "percent": 0.02052
+        },
+        "Bcm": {
+          "baseline": 103,
+          "candidate": 109,
+          "percent": 5.82524
+        }
+      },
+      "scan/churn_tiny_cold": {
+        "Instructions": {
+          "baseline": 138543508,
+          "candidate": 94493345,
+          "percent": -31.79518
+        },
+        "Bcm": {
+          "baseline": 607028,
+          "candidate": 615500,
+          "percent": 1.39565
+        }
+      },
+      "scan/churn_tiny_warm": {
+        "Instructions": {
+          "baseline": 138537181,
+          "candidate": 94411754,
+          "percent": -31.85096
+        },
+        "Bcm": {
+          "baseline": 606905,
+          "candidate": 611118,
+          "percent": 0.69418
+        }
+      },
+      "scan/word_short_cold": {
+        "Instructions": {
+          "baseline": 18071,
+          "candidate": 16562,
+          "percent": -8.3504
+        },
+        "Bcm": {
+          "baseline": 401,
+          "candidate": 372,
+          "percent": -7.23192
+        }
+      },
+      "scan/lf_short_cold": {
+        "Instructions": {
+          "baseline": 16188,
+          "candidate": 14772,
+          "percent": -8.74722
+        },
+        "Bcm": {
+          "baseline": 350,
+          "candidate": 365,
+          "percent": 4.28571
+        }
+      },
+      "scan/end_short_cold": {
+        "Instructions": {
+          "baseline": 14812,
+          "candidate": 13372,
+          "percent": -9.72185
+        },
+        "Bcm": {
+          "baseline": 371,
+          "candidate": 295,
+          "percent": -20.48518
+        }
+      },
+      "scan/mixed_short_cold": {
+        "Instructions": {
+          "baseline": 20497,
+          "candidate": 17783,
+          "percent": -13.24096
+        },
+        "Bcm": {
+          "baseline": 363,
+          "candidate": 347,
+          "percent": -4.40771
+        }
+      },
+      "scan/tier2_short_cold": {
+        "Instructions": {
+          "baseline": 30031,
+          "candidate": 30034,
+          "percent": 0.00999
+        },
+        "Bcm": {
+          "baseline": 361,
+          "candidate": 373,
+          "percent": 3.3241
+        }
+      },
+      "scan/tier3_short_cold": {
+        "Instructions": {
+          "baseline": 39699,
+          "candidate": 39712,
+          "percent": 0.03275
+        },
+        "Bcm": {
+          "baseline": 501,
+          "candidate": 532,
+          "percent": 6.18762
+        }
+      },
+      "scan/tier4_short_cold": {
+        "Instructions": {
+          "baseline": 78646,
+          "candidate": 78559,
+          "percent": -0.11062
+        },
+        "Bcm": {
+          "baseline": 803,
+          "candidate": 830,
+          "percent": 3.36239
+        }
+      },
+      "compile/literal": {
+        "Instructions": {
+          "baseline": 15196,
+          "candidate": 14256,
+          "percent": -6.18584
+        },
+        "Bcm": {
+          "baseline": 420,
+          "candidate": 423,
+          "percent": 0.71429
+        }
+      },
+      "compile/word": {
+        "Instructions": {
+          "baseline": 23362,
+          "candidate": 22456,
+          "percent": -3.87809
+        },
+        "Bcm": {
+          "baseline": 624,
+          "candidate": 613,
+          "percent": -1.76282
+        }
+      },
+      "compile/lf": {
+        "Instructions": {
+          "baseline": 25458,
+          "candidate": 24552,
+          "percent": -3.5588
+        },
+        "Bcm": {
+          "baseline": 638,
+          "candidate": 633,
+          "percent": -0.7837
+        }
+      },
+      "compile/end": {
+        "Instructions": {
+          "baseline": 21308,
+          "candidate": 21020,
+          "percent": -1.35161
+        },
+        "Bcm": {
+          "baseline": 562,
+          "candidate": 555,
+          "percent": -1.24555
+        }
+      },
+      "compile/mixed": {
+        "Instructions": {
+          "baseline": 31018,
+          "candidate": 29913,
+          "percent": -3.56245
+        },
+        "Bcm": {
+          "baseline": 750,
+          "candidate": 758,
+          "percent": 1.06667
+        }
+      },
+      "compile/tier2": {
+        "Instructions": {
+          "baseline": 104086,
+          "candidate": 103513,
+          "percent": -0.55051
+        },
+        "Bcm": {
+          "baseline": 2190,
+          "candidate": 2231,
+          "percent": 1.87215
+        }
+      },
+      "compile/tier3": {
+        "Instructions": {
+          "baseline": 212517,
+          "candidate": 211677,
+          "percent": -0.39526
+        },
+        "Bcm": {
+          "baseline": 3435,
+          "candidate": 3457,
+          "percent": 0.64047
+        }
+      },
+      "compile/tier4": {
+        "Instructions": {
+          "baseline": 48042,
+          "candidate": 47881,
+          "percent": -0.33512
+        },
+        "Bcm": {
+          "baseline": 1056,
+          "candidate": 1102,
+          "percent": 4.35606
+        }
+      }
+    }
+  },
+  "callgrind_reengage": {
+    "summary": "Gungraun result: Ok. 19 without regressions; 0 regressed; 0 filtered; 19 benchmarks finished in 8.51296s",
+    "limits_percent": {
+      "Instructions": 5,
+      "Bcm": 100
+    },
+    "cases": {
+      "scan/tier2_gap_once": {
+        "Instructions": {
+          "baseline": 225621,
+          "candidate": 225591,
+          "percent": -0.0133
+        },
+        "Bcm": {
+          "baseline": 1081,
+          "candidate": 1017,
+          "percent": -5.92044
+        }
+      },
+      "scan/tier3_candidate_once": {
+        "Instructions": {
+          "baseline": 89102,
+          "candidate": 89156,
+          "percent": 0.0606
+        },
+        "Bcm": {
+          "baseline": 289,
+          "candidate": 276,
+          "percent": -4.49827
+        }
+      },
+      "scan/tier3_gap_once": {
+        "Instructions": {
+          "baseline": 164254,
+          "candidate": 164308,
+          "percent": 0.03288
+        },
+        "Bcm": {
+          "baseline": 1067,
+          "candidate": 956,
+          "percent": -10.403
+        }
+      },
+      "scan/tier3_two_gaps_once": {
+        "Instructions": {
+          "baseline": 189043,
+          "candidate": 189097,
+          "percent": 0.02856
+        },
+        "Bcm": {
+          "baseline": 1235,
+          "candidate": 1105,
+          "percent": -10.52632
+        }
+      },
+      "scan/tier2_word_boundary_gap_once": {
+        "Instructions": {
+          "baseline": 11604343,
+          "candidate": 11604362,
+          "percent": 0.00016
+        },
+        "Bcm": {
+          "baseline": 653,
+          "candidate": 661,
+          "percent": 1.22511
+        }
+      },
+      "scan/tier2_anchored_gap_once": {
+        "Instructions": {
+          "baseline": 16048114,
+          "candidate": 16048115,
+          "percent": 1e-05
+        },
+        "Bcm": {
+          "baseline": 566,
+          "candidate": 537,
+          "percent": -5.12367
+        }
+      },
+      "scan/tier2_anchored_dead": {
+        "Instructions": {
+          "baseline": 16023070,
+          "candidate": 16023075,
+          "percent": 3e-05
+        },
+        "Bcm": {
+          "baseline": 352,
+          "candidate": 339,
+          "percent": -3.69318
+        }
+      },
+      "scan/tier3_no_prefilter_gap_once": {
+        "Instructions": {
+          "baseline": 1661790,
+          "candidate": 1661793,
+          "percent": 0.00018
+        },
+        "Bcm": {
+          "baseline": 1040,
+          "candidate": 929,
+          "percent": -10.67308
+        }
+      },
+      "scan/tier3_dense_candidates": {
+        "Instructions": {
+          "baseline": 17796482,
+          "candidate": 17993138,
+          "percent": 1.10503
+        },
+        "Bcm": {
+          "baseline": 66106,
+          "candidate": 66099,
+          "percent": -0.01059
+        }
+      },
+      "scan/tier3_candidate_run": {
+        "Instructions": {
+          "baseline": 15482750,
+          "candidate": 15482756,
+          "percent": 4e-05
+        },
+        "Bcm": {
+          "baseline": 301,
+          "candidate": 305,
+          "percent": 1.3289
+        }
+      },
+      "scan/tier3_no_prefilter_start": {
+        "Instructions": {
+          "baseline": 1587224,
+          "candidate": 1587227,
+          "percent": 0.00019
+        },
+        "Bcm": {
+          "baseline": 267,
+          "candidate": 263,
+          "percent": -1.49813
+        }
+      },
+      "scan/tier2_dense_candidates": {
+        "Instructions": {
+          "baseline": 11644760,
+          "candidate": 11644763,
+          "percent": 3e-05
+        },
+        "Bcm": {
+          "baseline": 66034,
+          "candidate": 66011,
+          "percent": -0.03483
+        }
+      },
+      "scan/tier2_gap_text": {
+        "Instructions": {
+          "baseline": 754996,
+          "candidate": 755001,
+          "percent": 0.00066
+        },
+        "Bcm": {
+          "baseline": 10454,
+          "candidate": 10133,
+          "percent": -3.07059
+        }
+      },
+      "scan/tier3_gaps_text": {
+        "Instructions": {
+          "baseline": 958316,
+          "candidate": 970339,
+          "percent": 1.2546
+        },
+        "Bcm": {
+          "baseline": 6334,
+          "candidate": 6320,
+          "percent": -0.22103
+        }
+      },
+      "scan/tier3_rule_text": {
+        "Instructions": {
+          "baseline": 4771583,
+          "candidate": 4929949,
+          "percent": 3.31894
+        },
+        "Bcm": {
+          "baseline": 23736,
+          "candidate": 23735,
+          "percent": -0.00421
+        }
+      },
+      "scan/control_tier1_literal_text": {
+        "Instructions": {
+          "baseline": 619270,
+          "candidate": 593590,
+          "percent": -4.14682
+        },
+        "Bcm": {
+          "baseline": 10114,
+          "candidate": 9886,
+          "percent": -2.2543
+        }
+      },
+      "scan/control_tier1_no_prefilter_text": {
+        "Instructions": {
+          "baseline": 4147000,
+          "candidate": 4090108,
+          "percent": -1.37188
+        },
+        "Bcm": {
+          "baseline": 49821,
+          "candidate": 49641,
+          "percent": -0.36129
+        }
+      },
+      "scan/control_tier2_live_counter": {
+        "Instructions": {
+          "baseline": 37932267,
+          "candidate": 37932272,
+          "percent": 1e-05
+        },
+        "Bcm": {
+          "baseline": 412065,
+          "candidate": 412025,
+          "percent": -0.00971
+        }
+      },
+      "scan/control_tier3_live_instances": {
+        "Instructions": {
+          "baseline": 18794939,
+          "candidate": 18809411,
+          "percent": 0.077
+        },
+        "Bcm": {
+          "baseline": 178496,
+          "candidate": 178488,
+          "percent": -0.00448
+        }
+      }
+    }
+  },
+  "criterion_existing": {
+    "tier1_assertions/word/direct/warm": {
+      "time_seconds_95ci_point": [
+        0.0005616499999999999,
+        0.00056223,
+        0.00056297
+      ],
+      "change_percent_95ci_point": [
+        -0.6116,
+        -0.1891,
+        0.1804
+      ],
+      "criterion_classification": "No change in performance detected."
+    },
+    "tier1_assertions/word/direct/cold": {
+      "time_seconds_95ci_point": [
+        0.00056292,
+        0.0005648,
+        0.00056856
+      ],
+      "change_percent_95ci_point": [
+        0.1755,
+        1.001,
+        1.8737
+      ],
+      "criterion_classification": "Change within noise threshold."
+    },
+    "tier1_assertions/nonword/direct/warm": {
+      "time_seconds_95ci_point": [
+        0.0005656699999999999,
+        0.00057864,
+        0.0006009199999999999
+      ],
+      "change_percent_95ci_point": [
+        1.0457,
+        3.0283,
+        5.9873
+      ],
+      "criterion_classification": "Performance has regressed."
+    },
+    "tier1_assertions/nonword/direct/cold": {
+      "time_seconds_95ci_point": [
+        0.00056935,
+        0.00057051,
+        0.0005718899999999999
+      ],
+      "change_percent_95ci_point": [
+        0.3166,
+        0.8753,
+        1.3965
+      ],
+      "criterion_classification": "Change within noise threshold."
+    },
+    "tier1_assertions/directional/direct/warm": {
+      "time_seconds_95ci_point": [
+        0.00040622,
+        0.00040802,
+        0.00041073
+      ],
+      "change_percent_95ci_point": [
+        -53.911,
+        -53.559,
+        -53.209
+      ],
+      "criterion_classification": "Performance has improved."
+    },
+    "tier1_assertions/directional/direct/cold": {
+      "time_seconds_95ci_point": [
+        0.00040663999999999994,
+        0.00040858999999999996,
+        0.00041114999999999994
+      ],
+      "change_percent_95ci_point": [
+        -53.598,
+        -53.312,
+        -53.028
+      ],
+      "criterion_classification": "Performance has improved."
+    },
+    "tier1_assertions/lf/direct/warm": {
+      "time_seconds_95ci_point": [
+        0.0004485,
+        0.00045317999999999997,
+        0.00046016
+      ],
+      "change_percent_95ci_point": [
+        -58.831,
+        -58.331,
+        -57.824
+      ],
+      "criterion_classification": "Performance has improved."
+    },
+    "tier1_assertions/lf/direct/cold": {
+      "time_seconds_95ci_point": [
+        0.00044456,
+        0.00044858999999999996,
+        0.00045167
+      ],
+      "change_percent_95ci_point": [
+        -60.63,
+        -60.254,
+        -59.889
+      ],
+      "criterion_classification": "Performance has improved."
+    },
+    "tier1_assertions/endlf/direct/warm": {
+      "time_seconds_95ci_point": [
+        0.00044632,
+        0.00046275,
+        0.00048341
+      ],
+      "change_percent_95ci_point": [
+        0.8709,
+        3.5715,
+        7.5615
+      ],
+      "criterion_classification": "Change within noise threshold."
+    },
+    "tier1_assertions/endlf/direct/cold": {
+      "time_seconds_95ci_point": [
+        0.00043746,
+        0.00044376999999999996,
+        0.00045238999999999994
+      ],
+      "change_percent_95ci_point": [
+        -0.6212,
+        0.1992,
+        1.222
+      ],
+      "criterion_classification": "No change in performance detected."
+    },
+    "tier1_assertions/end/direct/warm": {
+      "time_seconds_95ci_point": [
+        0.00059257,
+        0.0006322799999999999,
+        0.00068246
+      ],
+      "change_percent_95ci_point": [
+        -2.8822,
+        2.3132,
+        9.3591
+      ],
+      "criterion_classification": "No change in performance detected."
+    },
+    "tier1_assertions/end/direct/cold": {
+      "time_seconds_95ci_point": [
+        0.0005892499999999999,
+        0.0005990599999999999,
+        0.00061071
+      ],
+      "change_percent_95ci_point": [
+        0.5931,
+        1.7338,
+        2.9817
+      ],
+      "criterion_classification": "Change within noise threshold."
+    },
+    "tier1_assertions/mixed/direct/warm": {
+      "time_seconds_95ci_point": [
+        0.0005695,
+        0.0005878599999999999,
+        0.0006234
+      ],
+      "change_percent_95ci_point": [
+        1.2536,
+        3.5197,
+        7.3436
+      ],
+      "criterion_classification": "Performance has regressed."
+    },
+    "tier1_assertions/mixed/direct/cold": {
+      "time_seconds_95ci_point": [
+        0.00057113,
+        0.00057365,
+        0.00057608
+      ],
+      "change_percent_95ci_point": [
+        -4.2003,
+        -1.4903,
+        0.8653
+      ],
+      "criterion_classification": "No change in performance detected."
+    },
+    "tier1_assertions_compile/literal_sparse": {
+      "time_seconds_95ci_point": [
+        6.3005e-07,
+        6.4178e-07,
+        6.5618e-07
+      ],
+      "change_percent_95ci_point": [
+        -5.4831,
+        -2.0298,
+        0.8821
+      ],
+      "criterion_classification": "No change in performance detected."
+    },
+    "tier1_assertions_compile/word": {
+      "time_seconds_95ci_point": [
+        1.127e-06,
+        1.1462000000000001e-06,
+        1.1817999999999998e-06
+      ],
+      "change_percent_95ci_point": [
+        -4.0079,
+        0.6954,
+        8.341
+      ],
+      "criterion_classification": "No change in performance detected."
+    },
+    "tier1_assertions_compile/lf": {
+      "time_seconds_95ci_point": [
+        1.2015e-06,
+        1.2128e-06,
+        1.2258e-06
+      ],
+      "change_percent_95ci_point": [
+        -5.5094,
+        -3.9989,
+        -2.577
+      ],
+      "criterion_classification": "Performance has improved."
+    },
+    "tier1_assertions_compile/end": {
+      "time_seconds_95ci_point": [
+        9.7015e-07,
+        9.8387e-07,
+        1.0027e-06
+      ],
+      "change_percent_95ci_point": [
+        1.5827,
+        2.5388,
+        3.5111
+      ],
+      "criterion_classification": "Performance has regressed."
+    }
+  },
+  "criterion_near_limit": {
+    "tier1_assertions_compile_limits/simple_tails": {
+      "time_seconds_95ci_point": [
+        0.00086998,
+        0.0009050299999999999,
+        0.00097365
+      ],
+      "change_percent_95ci_point": [
+        12.685,
+        21.692,
+        34.006
+      ],
+      "criterion_classification": "Performance has regressed."
+    },
+    "tier1_assertions_compile_limits/acyclic_branching": {
+      "time_seconds_95ci_point": [
+        0.00080206,
+        0.00082922,
+        0.00087745
+      ],
+      "change_percent_95ci_point": [
+        0.9702,
+        4.4547,
+        9.1631
+      ],
+      "criterion_classification": "Change within noise threshold."
+    },
+    "tier1_assertions_compile_limits/epsilon_cycles": {
+      "time_seconds_95ci_point": [
+        0.00069859,
+        0.0007213499999999999,
+        0.00076097
+      ],
+      "change_percent_95ci_point": [
+        -3.1857,
+        -0.9578,
+        2.6304
+      ],
+      "criterion_classification": "No change in performance detected."
+    }
+  },
+  "criterion_new_absolute": {
+    "tier1_assertions_new/crlf_lines/tier0/chunk1": {
+      "time_seconds_95ci_point": [
+        0.0016408,
+        0.001655,
+        0.0016695
+      ]
+    },
+    "tier1_assertions_new/crlf_lines/tier0/chunk16384": {
+      "time_seconds_95ci_point": [
+        0.0014773000000000002,
+        0.0014872000000000002,
+        0.0015049
+      ]
+    },
+    "tier1_assertions_new/crlf_lines/tier1/chunk1": {
+      "time_seconds_95ci_point": [
+        0.00023993,
+        0.00024121,
+        0.00024285
+      ]
+    },
+    "tier1_assertions_new/crlf_lines/tier1/chunk16384": {
+      "time_seconds_95ci_point": [
+        0.00010518999999999999,
+        0.0001077,
+        0.00011373999999999999
+      ]
+    },
+    "tier1_assertions_new/crlf_end/tier0/chunk1": {
+      "time_seconds_95ci_point": [
+        0.0008972699999999999,
+        0.0009012299999999999,
+        0.00090657
+      ]
+    },
+    "tier1_assertions_new/crlf_end/tier0/chunk16384": {
+      "time_seconds_95ci_point": [
+        0.00069686,
+        0.00069907,
+        0.0007010599999999999
+      ]
+    },
+    "tier1_assertions_new/crlf_end/tier1/chunk1": {
+      "time_seconds_95ci_point": [
+        0.00023806999999999998,
+        0.00024247999999999997,
+        0.0002463
+      ]
+    },
+    "tier1_assertions_new/crlf_end/tier1/chunk16384": {
+      "time_seconds_95ci_point": [
+        0.00010723,
+        0.00010762,
+        0.00010809999999999998
+      ]
+    },
+    "tier1_assertions_new/crlf_chain/tier0/chunk1": {
+      "time_seconds_95ci_point": [
+        0.0017495000000000002,
+        0.0017822,
+        0.0018389
+      ]
+    },
+    "tier1_assertions_new/crlf_chain/tier0/chunk16384": {
+      "time_seconds_95ci_point": [
+        0.0015657000000000002,
+        0.0015718000000000002,
+        0.0015777000000000002
+      ]
+    },
+    "tier1_assertions_new/crlf_chain/tier1/chunk1": {
+      "time_seconds_95ci_point": [
+        0.00019237,
+        0.00019277,
+        0.00019327
+      ]
+    },
+    "tier1_assertions_new/crlf_chain/tier1/chunk16384": {
+      "time_seconds_95ci_point": [
+        0.00014238,
+        0.00014738999999999998,
+        0.00015523
+      ]
+    },
+    "tier1_assertions_new/repaired_lf_chain/tier0/chunk1": {
+      "time_seconds_95ci_point": [
+        0.001719,
+        0.0017244,
+        0.0017314000000000001
+      ]
+    },
+    "tier1_assertions_new/repaired_lf_chain/tier0/chunk16384": {
+      "time_seconds_95ci_point": [
+        0.0015492,
+        0.001554,
+        0.0015593999999999998
+      ]
+    },
+    "tier1_assertions_new/repaired_lf_chain/tier1/chunk1": {
+      "time_seconds_95ci_point": [
+        0.00019202,
+        0.00019308000000000001,
+        0.00019450999999999998
+      ]
+    },
+    "tier1_assertions_new/repaired_lf_chain/tier1/chunk16384": {
+      "time_seconds_95ci_point": [
+        0.00014021000000000001,
+        0.00014466,
+        0.0001513
+      ]
+    },
+    "tier1_assertions_new/repaired_eof/tier0/chunk1": {
+      "time_seconds_95ci_point": [
+        0.001351,
+        0.0014074,
+        0.0014831000000000002
+      ]
+    },
+    "tier1_assertions_new/repaired_eof/tier0/chunk16384": {
+      "time_seconds_95ci_point": [
+        0.0011604,
+        0.0011633,
+        0.0011666
+      ]
+    },
+    "tier1_assertions_new/repaired_eof/tier1/chunk1": {
+      "time_seconds_95ci_point": [
+        0.00023502,
+        0.00023609,
+        0.00023758
+      ]
+    },
+    "tier1_assertions_new/repaired_eof/tier1/chunk16384": {
+      "time_seconds_95ci_point": [
+        0.00015746,
+        0.00015891999999999998,
+        0.0001604
+      ]
+    },
+    "tier1_assertions_new/repaired_empty/tier0/chunk1": {
+      "time_seconds_95ci_point": [
+        5.9524000000000004e-08,
+        5.969e-08,
+        5.9866e-08
+      ]
+    },
+    "tier1_assertions_new/repaired_empty/tier0/chunk16384": {
+      "time_seconds_95ci_point": [
+        6.027100000000001e-08,
+        6.0742e-08,
+        6.1294e-08
+      ]
+    },
+    "tier1_assertions_new/repaired_empty/tier1/chunk1": {
+      "time_seconds_95ci_point": [
+        1.9229e-08,
+        1.9306e-08,
+        1.9385e-08
+      ]
+    },
+    "tier1_assertions_new/repaired_empty/tier1/chunk16384": {
+      "time_seconds_95ci_point": [
+        1.9272e-08,
+        1.9399e-08,
+        1.9552000000000002e-08
+      ]
+    }
+  },
+  "criterion_new_nfa_over_tier1_time_ratio": {
+    "tier1_assertions_new/crlf_lines/tier1/chunk1": 6.861,
+    "tier1_assertions_new/crlf_lines/tier1/chunk16384": 13.809,
+    "tier1_assertions_new/crlf_end/tier1/chunk1": 3.717,
+    "tier1_assertions_new/crlf_end/tier1/chunk16384": 6.496,
+    "tier1_assertions_new/crlf_chain/tier1/chunk1": 9.245,
+    "tier1_assertions_new/crlf_chain/tier1/chunk16384": 10.664,
+    "tier1_assertions_new/repaired_lf_chain/tier1/chunk1": 8.931,
+    "tier1_assertions_new/repaired_lf_chain/tier1/chunk16384": 10.742,
+    "tier1_assertions_new/repaired_eof/tier1/chunk1": 5.961,
+    "tier1_assertions_new/repaired_eof/tier1/chunk16384": 7.32,
+    "tier1_assertions_new/repaired_empty/tier1/chunk1": 3.092,
+    "tier1_assertions_new/repaired_empty/tier1/chunk16384": 3.131
+  },
+  "layout_and_compiled_memory": {
+    "baseline": {
+      "Regex_bytes": 752,
+      "MatcherMemory_bytes": 1592,
+      "compiled": [
+        {
+          "pattern_debug": "\"foo\"",
+          "compiled_bytes": 884,
+          "tier1": true
+        },
+        {
+          "pattern_debug": "\"\\\\bfoo\\\\b\"",
+          "compiled_bytes": 950,
+          "tier1": true
+        },
+        {
+          "pattern_debug": "\"(?m)^foo$\"",
+          "compiled_bytes": 950,
+          "tier1": true
+        },
+        {
+          "pattern_debug": "\"foo$\"",
+          "compiled_bytes": 917,
+          "tier1": true
+        },
+        {
+          "pattern_debug": "\"\\\\bfoo\\\\b(?m:$)\"",
+          "compiled_bytes": 983,
+          "tier1": true
+        },
+        {
+          "pattern_debug": "\"(?Rm)^foo$\"",
+          "compiled_bytes": 1646,
+          "tier1": false
+        }
+      ]
+    },
+    "candidate": {
+      "Regex_bytes": 760,
+      "MatcherMemory_bytes": 1640,
+      "compiled": [
+        {
+          "pattern_debug": "\"foo\"",
+          "compiled_bytes": 888,
+          "tier1": true
+        },
+        {
+          "pattern_debug": "\"\\\\bfoo\\\\b\"",
+          "compiled_bytes": 980,
+          "tier1": true
+        },
+        {
+          "pattern_debug": "\"(?m)^foo$\"",
+          "compiled_bytes": 980,
+          "tier1": true
+        },
+        {
+          "pattern_debug": "\"foo$\"",
+          "compiled_bytes": 946,
+          "tier1": true
+        },
+        {
+          "pattern_debug": "\"\\\\bfoo\\\\b(?m:$)\"",
+          "compiled_bytes": 1014,
+          "tier1": true
+        },
+        {
+          "pattern_debug": "\"(?Rm)^foo$\"",
+          "compiled_bytes": 980,
+          "tier1": true
+        }
+      ]
+    }
+  },
+  "near_limit_graphs": {
+    "simple_tails": {
+      "states": 1801,
+      "assertions": 900,
+      "splits": 0,
+      "compiled_bytes_base_candidate": [
+        60185,
+        62010
+      ]
+    },
+    "acyclic_branching": {
+      "states": 1801,
+      "assertions": 900,
+      "splits": 450,
+      "compiled_bytes_base_candidate": [
+        60185,
+        62010
+      ]
+    },
+    "epsilon_cycles": {
+      "states": 1751,
+      "assertions": 500,
+      "splits": 750,
+      "compiled_bytes_base_candidate": [
+        58535,
+        60310
+      ]
+    }
+  },
+  "peak_rss_kib": {
+    "base": 5100,
+    "candidate": 4732
+  },
+  "cache_comparison": [
+    {
+      "case": "literal",
+      "classes": false,
+      "cap": null,
+      "stream": 1,
+      "states_base_candidate": [
+        2,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "literal",
+      "classes": false,
+      "cap": null,
+      "stream": 2,
+      "states_base_candidate": [
+        2,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "literal",
+      "classes": false,
+      "cap": 8,
+      "stream": 1,
+      "states_base_candidate": [
+        2,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "literal",
+      "classes": false,
+      "cap": 8,
+      "stream": 2,
+      "states_base_candidate": [
+        2,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "literal",
+      "classes": true,
+      "cap": null,
+      "stream": 1,
+      "states_base_candidate": [
+        2,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "literal",
+      "classes": true,
+      "cap": null,
+      "stream": 2,
+      "states_base_candidate": [
+        2,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "literal",
+      "classes": true,
+      "cap": 8,
+      "stream": 1,
+      "states_base_candidate": [
+        2,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "literal",
+      "classes": true,
+      "cap": 8,
+      "stream": 2,
+      "states_base_candidate": [
+        2,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "word",
+      "classes": false,
+      "cap": null,
+      "stream": 1,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "word",
+      "classes": false,
+      "cap": null,
+      "stream": 2,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "word",
+      "classes": false,
+      "cap": 8,
+      "stream": 1,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "word",
+      "classes": false,
+      "cap": 8,
+      "stream": 2,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "word",
+      "classes": true,
+      "cap": null,
+      "stream": 1,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "word",
+      "classes": true,
+      "cap": null,
+      "stream": 2,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "word",
+      "classes": true,
+      "cap": 8,
+      "stream": 1,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "word",
+      "classes": true,
+      "cap": 8,
+      "stream": 2,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf",
+      "classes": false,
+      "cap": null,
+      "stream": 1,
+      "states_base_candidate": [
+        4,
+        4
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf",
+      "classes": false,
+      "cap": null,
+      "stream": 2,
+      "states_base_candidate": [
+        4,
+        4
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf",
+      "classes": false,
+      "cap": 8,
+      "stream": 1,
+      "states_base_candidate": [
+        4,
+        4
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf",
+      "classes": false,
+      "cap": 8,
+      "stream": 2,
+      "states_base_candidate": [
+        4,
+        4
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf",
+      "classes": true,
+      "cap": null,
+      "stream": 1,
+      "states_base_candidate": [
+        4,
+        4
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf",
+      "classes": true,
+      "cap": null,
+      "stream": 2,
+      "states_base_candidate": [
+        4,
+        4
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf",
+      "classes": true,
+      "cap": 8,
+      "stream": 1,
+      "states_base_candidate": [
+        4,
+        4
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf",
+      "classes": true,
+      "cap": 8,
+      "stream": 2,
+      "states_base_candidate": [
+        4,
+        4
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf_context",
+      "classes": false,
+      "cap": null,
+      "stream": 1,
+      "states_base_candidate": [
+        3,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf_context",
+      "classes": false,
+      "cap": null,
+      "stream": 2,
+      "states_base_candidate": [
+        3,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf_context",
+      "classes": false,
+      "cap": 8,
+      "stream": 1,
+      "states_base_candidate": [
+        3,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf_context",
+      "classes": false,
+      "cap": 8,
+      "stream": 2,
+      "states_base_candidate": [
+        3,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf_context",
+      "classes": true,
+      "cap": null,
+      "stream": 1,
+      "states_base_candidate": [
+        2,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf_context",
+      "classes": true,
+      "cap": null,
+      "stream": 2,
+      "states_base_candidate": [
+        2,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf_context",
+      "classes": true,
+      "cap": 8,
+      "stream": 1,
+      "states_base_candidate": [
+        2,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "endlf_context",
+      "classes": true,
+      "cap": 8,
+      "stream": 2,
+      "states_base_candidate": [
+        2,
+        2
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "mixed",
+      "classes": false,
+      "cap": null,
+      "stream": 1,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "mixed",
+      "classes": false,
+      "cap": null,
+      "stream": 2,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "mixed",
+      "classes": false,
+      "cap": 8,
+      "stream": 1,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "mixed",
+      "classes": false,
+      "cap": 8,
+      "stream": 2,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "mixed",
+      "classes": true,
+      "cap": null,
+      "stream": 1,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "mixed",
+      "classes": true,
+      "cap": null,
+      "stream": 2,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "mixed",
+      "classes": true,
+      "cap": 8,
+      "stream": 1,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "mixed",
+      "classes": true,
+      "cap": 8,
+      "stream": 2,
+      "states_base_candidate": [
+        5,
+        5
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "churn",
+      "classes": false,
+      "cap": null,
+      "stream": 1,
+      "states_base_candidate": [
+        30,
+        30
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "churn",
+      "classes": false,
+      "cap": null,
+      "stream": 2,
+      "states_base_candidate": [
+        30,
+        30
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "churn",
+      "classes": false,
+      "cap": 8,
+      "stream": 1,
+      "states_base_candidate": [
+        3,
+        3
+      ],
+      "evictions_base_candidate": [
+        2642,
+        2642
+      ]
+    },
+    {
+      "case": "churn",
+      "classes": false,
+      "cap": 8,
+      "stream": 2,
+      "states_base_candidate": [
+        3,
+        3
+      ],
+      "evictions_base_candidate": [
+        5284,
+        5284
+      ]
+    },
+    {
+      "case": "churn",
+      "classes": true,
+      "cap": null,
+      "stream": 1,
+      "states_base_candidate": [
+        30,
+        30
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "churn",
+      "classes": true,
+      "cap": null,
+      "stream": 2,
+      "states_base_candidate": [
+        30,
+        30
+      ],
+      "evictions_base_candidate": [
+        0,
+        0
+      ]
+    },
+    {
+      "case": "churn",
+      "classes": true,
+      "cap": 8,
+      "stream": 1,
+      "states_base_candidate": [
+        3,
+        3
+      ],
+      "evictions_base_candidate": [
+        2642,
+        2642
+      ]
+    },
+    {
+      "case": "churn",
+      "classes": true,
+      "cap": 8,
+      "stream": 2,
+      "states_base_candidate": [
+        3,
+        3
+      ],
+      "evictions_base_candidate": [
+        5284,
+        5284
+      ]
+    }
+  ],
+  "limitations": [
+    "Wall-clock timings are sampled on one aarch64 machine, not universal performance guarantees.",
+    "Peak RSS includes the benchmark executable/harness and all three fixture setups; small differences do not isolate analysis allocation.",
+    "Cache measurements use16KiB deterministic streams twice, not all possible inputs.",
+    "New-support ratios apply only to these fixed64KiB/empty fixtures; they are not regressions against previously incorrect Tier1 answers.",
+    "Final-source near-limit simple_tails compilation increased in both measured rounds; fresh-pair means rise about49.58us/+6.30%. Other small native differences vary between rounds; both are retained."
+  ],
+  "artifacts": {
+    "base": {
+      "tier1_assertions": {
+        "path": "/tmp/rethoc-tier1-base-build/release/build/rethoc-engine/2298ccc08d95b3d4/out/tier1_assertions-2298ccc08d95b3d4",
+        "sha256": "0f954c0ce337c959943e2815d8068eb7871902223a5545956514982da4c33ff4"
+      },
+      "tier1_assertions_profile": {
+        "path": "/tmp/rethoc-tier1-base-build/release/build/rethoc-engine/c49d524922decdf8/out/tier1_assertions_profile-c49d524922decdf8",
+        "sha256": "88cbe14ae21269d00c981a2d13eb34ef4876d6f799f0ad560ec9dc6c36aa13c2"
+      },
+      "reengage_profile": {
+        "path": "/tmp/rethoc-tier1-base-build/release/build/rethoc-engine/1e0bacb328a46a63/out/reengage_profile-1e0bacb328a46a63",
+        "sha256": "bac5dc410c688f61bb47952c2757cc99a31c8c1ba929a7fab7c2c0e1147f60a8"
+      },
+      "tier1_assertions_compile_limits": {
+        "path": "/tmp/rethoc-tier1-base-build/release/build/rethoc-engine/ab8208bf1f86c93e/out/tier1_assertions_compile_limits-ab8208bf1f86c93e",
+        "sha256": "17f1b2bffeec56380150d04809b8cd4c34cf57cdf074a44d19f5e77522ba810c"
+      }
+    },
+    "candidate": {
+      "tier1_assertions": {
+        "path": "/tmp/rethoc-tier1-candidate-build/release/build/rethoc-engine/2298ccc08d95b3d4/out/tier1_assertions-2298ccc08d95b3d4",
+        "sha256": "48b5166294ae7ebe6738fb27e4354d223a61b62afc4d5315aab19be03cb94cfd"
+      },
+      "tier1_assertions_profile": {
+        "path": "/tmp/rethoc-tier1-candidate-build/release/build/rethoc-engine/c49d524922decdf8/out/tier1_assertions_profile-c49d524922decdf8",
+        "sha256": "b5b6a5544e880c6de05a6fe0c46eac4b7317ce6825f241d1c6219fddea4e94ba"
+      },
+      "reengage_profile": {
+        "path": "/tmp/rethoc-tier1-candidate-build/release/build/rethoc-engine/1e0bacb328a46a63/out/reengage_profile-1e0bacb328a46a63",
+        "sha256": "88b9822fc77482d47d8ee903b3ce1a3326e9f3bebdb76fce1af2a6a8402fd447"
+      },
+      "tier1_assertions_compile_limits": {
+        "path": "/tmp/rethoc-tier1-candidate-build/release/build/rethoc-engine/ab8208bf1f86c93e/out/tier1_assertions_compile_limits-ab8208bf1f86c93e",
+        "sha256": "f0fb4635bc10744c36061826366863c71b886d63d1e55f7a4d4c2b2a63de250c"
+      },
+      "tier1_assertions_new": {
+        "path": "/tmp/rethoc-tier1-candidate-build/release/build/rethoc-engine/239ef35742ac68b0/out/tier1_assertions_new-239ef35742ac68b0",
+        "sha256": "a05fccd55afe6f0d67667f0a1b6c367d477be471121050991a345eba59c499da"
+      }
+    }
+  },
+  "logs": [
+    "/tmp/rethoc-tier1-final-base-cache.log",
+    "/tmp/rethoc-tier1-final-base-rss.log",
+    "/tmp/rethoc-tier1-final-candidate-cache.log",
+    "/tmp/rethoc-tier1-final-candidate-criterion.log",
+    "/tmp/rethoc-tier1-final-candidate-limits.log",
+    "/tmp/rethoc-tier1-final-candidate-profile.log",
+    "/tmp/rethoc-tier1-final-candidate-reengage.log",
+    "/tmp/rethoc-tier1-final-candidate-rss.log",
+    "/tmp/rethoc-tier1-final-check-debug.log",
+    "/tmp/rethoc-tier1-final-check-fmt.log",
+    "/tmp/rethoc-tier1-final-check-memory-bless.log",
+    "/tmp/rethoc-tier1-final-check-release.log",
+    "/tmp/rethoc-tier1-final-clippy.log",
+    "/tmp/rethoc-tier1-final-new-criterion.log",
+    "/tmp/rethoc-tier1-final-simple-baseline.log",
+    "/tmp/rethoc-tier1-final-simple-candidate.log",
+    "/tmp/rethoc-tier1-final-summary.log",
+    "/tmp/rethoc-tier1-final-sweep-tier1-assert-default.log",
+    "/tmp/rethoc-tier1-layout-final-baseline-limits-repeat.log",
+    "/tmp/rethoc-tier1-layout-final-baseline-mixed.log",
+    "/tmp/rethoc-tier1-layout-final-baseline-repeat.log",
+    "/tmp/rethoc-tier1-layout-final-candidate-cache.log",
+    "/tmp/rethoc-tier1-layout-final-candidate-criterion.log",
+    "/tmp/rethoc-tier1-layout-final-candidate-limits-repeat.log",
+    "/tmp/rethoc-tier1-layout-final-candidate-limits.log",
+    "/tmp/rethoc-tier1-layout-final-candidate-mixed.log",
+    "/tmp/rethoc-tier1-layout-final-candidate-new.log",
+    "/tmp/rethoc-tier1-layout-final-candidate-profile.log",
+    "/tmp/rethoc-tier1-layout-final-candidate-reengage.log",
+    "/tmp/rethoc-tier1-layout-final-candidate-repeat.log",
+    "/tmp/rethoc-tier1-layout-final-candidate-rss.log",
+    "/tmp/rethoc-tier1-verified-baseline-criterion.log",
+    "/tmp/rethoc-tier1-verified-baseline-limits.log",
+    "/tmp/rethoc-tier1-verified-baseline-profile.log",
+    "/tmp/rethoc-tier1-verified-baseline-reengage.log"
+  ],
+  "candidate_sources_sha256": {
+    "rethoc-cli/src/check/sweep.rs": "285b1ccd3d45575545d186638d14ffd5c7f832d910b53c223ba71cc0cd6e8a3f",
+    "rethoc-engine/benches/common/tier1_assertion_cases.rs": "2e9e16b7ffc793b57676806d49d3e13e430a08c04d3412f10db0dcf74f21059f",
+    "rethoc-engine/benches/tier1_assertions.rs": "7f8e904563647b0460d28ca5d2e8f5556759ce01ceb26b42b23def13b182013b",
+    "rethoc-engine/benches/tier1_assertions_compile_limits.rs": "2f823ce0d3aeaa9305656413556f09275e8eefdaf026bf1cb7b44cb9c7c212fb",
+    "rethoc-engine/benches/tier1_assertions_new.rs": "d024832bda5a8435d2207302e4fab8d926eeffc70f71f7c90baf5125c08794b3",
+    "rethoc-engine/benches/tier1_assertions_profile.rs": "4b004183a94638bddc7ea4f21f04dc5fa915dfc1b96ec39b360381c86b25cbe5",
+    "rethoc-engine/src/dfa/mod.rs": "73617fe99f162ac43dd7bc3412937c49fd263f78cd5619852f10b36b67ad4fd7",
+    "rethoc-engine/src/dfa/tier1.rs": "1d4068b6423e4a2394897c39901bf528b58a630ad803be2739ccc0478227fabf",
+    "rethoc-engine/src/dfa/tier1/analysis.rs": "b6b8f16b507b9b5f80e96dead016094ea7840ff61106ba5e7a90926f70586034",
+    "rethoc-engine/src/dfa/tier1/assertion_tests.rs": "ea71c1adc829fe98c256fcad473c0ffbc9cfb485a3d74880b8ddd285f76c9497",
+    "rethoc-engine/src/dfa/tier2/mod.rs": "6cef711660e2e1d5c14a3b73ff085fb8551a04c65b9216ae993ee9f7b302c296",
+    "rethoc-engine/src/dfa/tier3/effects.rs": "5fe379fa9c37a3594144b2eac79e3b50905916b4f8998eed3df57a92ca1487fe",
+    "rethoc-engine/src/dfa/tier4.rs": "83c873b6fa9870c6874043f845f8bc546431d9224114e12eba51bf0efe782c90",
+    "rethoc-engine/src/dump.rs": "85ad61e70061e9e25d229d9358886c5bb83383fc3205c8919169f50e6527c7d3",
+    "rethoc-engine/src/grouped_nfa/selection_tests.rs": "62abc7ece693aeb1e7bb87ef7e8b128b5d959bd9074d7210e0e19fc63c16e0e8",
+    "rethoc-engine/src/lib.rs": "d3d0e7f277b715d9ad2904ad68d91ab706abafc56973ca77f843f0a06b85f87d"
+  },
+  "baseline_data_copy": {
+    "from": "/tmp/rethoc-tier1-native-base-target/{criterion,gungraun}",
+    "to": "/tmp/rethoc-tier1-native-candidate-target/{criterion,gungraun}",
+    "when": "after baseline suites, before candidate suites; data only, no build files"
+  },
+  "supplementary_probe_sources": {
+    "cache_and_layout_rust": "use rethoc_engine::{MatcherMemory, Regex, RegexConfig};\n\nfn main() {\n    println!(\"Regex={} MatcherMemory={}\", std::mem::size_of::<Regex>(), std::mem::size_of::<MatcherMemory>());\n    for pattern in [\"foo\", r\"\\bfoo\\b\", r\"(?m)^foo$\", r\"foo$\", r\"\\bfoo\\b(?m:$)\", r\"(?Rm)^foo$\"] {\n        let regex = Regex::new(pattern).unwrap();\n        let mut memory = MatcherMemory::default();\n        println!(\"pattern={pattern:?} memory={} tier1={}\", regex.memory_size(), memory.matcher_for_tier(&regex, 1).is_ok());\n    }\n    let cases: &[(&str, &str, &[u8])] = &[\n        (\"literal\", \"foo\", b\"fxfx bar \"),\n        (\"word\", r\"\\bfoo\\b\", b\" fooX !fooX \\n\\r\"),\n        (\"endlf\", r\"foo(?m:$)\", b\"fooX\\r\\n\"),\n        (\"endlf_context\", r\".(?m:$)\", b\"word space \\r \\xff\"),\n        (\"mixed\", r\"\\bfoo\\b(?m:$)\", b\" fooX !fooX \\n\\r\"),\n        (\"churn\", r\"[ab]*a[ab]{5}z\", b\"aaaaaabaaaabbaababababbbabbbbbb\"),\n    ];\n    for &(name, pattern, repeated) in cases {\n        for classes in [false, true] {\n            let regex = Regex::with_config(pattern, RegexConfig { byte_class_min_states: if classes { 0 } else { usize::MAX }, ..RegexConfig::default() }).unwrap();\n            for cap in [None, Some(8)] {\n                let mut memory = MatcherMemory::default();\n                memory.set_dfa_state_cap(cap);\n                let input: Vec<_> = repeated.iter().copied().cycle().take(16 * 1024).collect();\n                for pass in 0..2 {\n                    let mut matcher = memory.matcher_for_tier(&regex, 1).unwrap();\n                    matcher.chunk(&input);\n                    let matched = matcher.finish();\n                    println!(\"CACHE name={name} classes={classes} cap={cap:?} pass={pass} matched={matched} {memory:?}\");\n                }\n            }\n        }\n    }\n}\n",
+    "peak_rss_c": "#include <stdio.h>\n#include <stdlib.h>\n#include <sys/resource.h>\n#include <sys/types.h>\n#include <sys/wait.h>\n#include <unistd.h>\nint main(int argc, char **argv) {\n    if (argc < 2) return 2;\n    pid_t pid = fork();\n    if (pid == -1) return 2;\n    if (pid == 0) {\n        execv(argv[1], argv + 1);\n        _exit(127);\n    }\n    int status;\n    struct rusage usage;\n    if (wait4(pid, &status, 0, &usage) == -1) return 2;\n    fprintf(stderr, \"PEAK_RSS_KIB=%ld\\n\", usage.ru_maxrss);\n    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);\n}\n"
+  },
+  "supplementary_probe_commands": [
+    "Run the cache/layout source in a temporary Rust package depending by path on the corresponding baseline or candidate rethoc-engine, with that revision's isolated build and target directories.",
+    "clang -O2 /tmp/rethoc-tier1-measure-rss.c -o /tmp/rethoc-tier1-measure-rss",
+    "scripts/capped --time 30 -- /tmp/rethoc-tier1-measure-rss COMPILE_LIMIT_BINARY --test",
+    "CARGO_TARGET_DIR=/tmp/rethoc-tier1-native-candidate-target CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER=\"$PWD/scripts/capped\" /home/elie/.cargo/bin/cargo --config 'build.build-dir=\"/tmp/rethoc-tier1-candidate-build\"' run --release --manifest-path /tmp/rethoc-tier1-layout-probe/candidate/Cargo.toml > /tmp/rethoc-tier1-layout-final-candidate-cache.log 2>&1",
+    "scripts/capped --time 30 -- /tmp/rethoc-tier1-measure-rss /tmp/rethoc-tier1-candidate-build/release/build/rethoc-engine/ab8208bf1f86c93e/out/tier1_assertions_compile_limits-ab8208bf1f86c93e --test > /tmp/rethoc-tier1-layout-final-candidate-rss.log 2>&1",
+    "scripts/capped --time 20 -- llvm-objdump -d --demangle --line-numbers --start-address=0x156820 --stop-address=0x15686c /tmp/rethoc-tier1-candidate-build/release/build/rethoc-engine/c49d524922decdf8/out/tier1_assertions_profile-c49d524922decdf8",
+    "scripts/capped --time 20 -- llvm-dwarfdump --name=Tier1DfaCache --show-children /tmp/rethoc-tier1-candidate-build/release/build/rethoc-engine/c49d524922decdf8/out/tier1_assertions_profile-c49d524922decdf8"
+  ],
+  "mixed_classes_warm_instruction_increase": {
+    "case": "scan/mixed_classes_warm",
+    "baseline_instructions": 2363768,
+    "candidate_instructions": 2429766,
+    "delta_instructions": 65998,
+    "delta_percent": 2.7920675802362904,
+    "cached_transition_executions": 65537,
+    "extra_instructions_per_cached_transition": 1,
+    "instructions_explained_by_load_pair_split": 65537,
+    "fraction_of_increase_explained": 0.993014939846662,
+    "remaining_instruction_delta_not_isolated": 461,
+    "finding": "Final AArch64 machine code separates the transition-vector length and stride loads: the baseline uses one paired load, while the candidate uses two scalar loads. Debug line profiles record exactly 65,537 additional instructions in the inlined vector-to-slice conversion, matching one extra instruction per cached transition. This identifies a per-byte scan cost from changed cache layout, rather than an assertion-evaluation or compile/preparation cost.",
+    "baseline_machine_code": [
+      {
+        "address": "0x157c30",
+        "instruction": "ldp x1, x8, [x22, #0x88]",
+        "meaning": "load transition vector length (offset 0x88) and stride (offset 0x90)"
+      }
+    ],
+    "candidate_machine_code": [
+      {
+        "address": "0x156838",
+        "instruction": "ldr x8, [x22, #0xc0]",
+        "meaning": "load stride"
+      },
+      {
+        "address": "0x156844",
+        "instruction": "ldr x1, [x22, #0x88]",
+        "meaning": "load transition vector length"
+      }
+    ],
+    "profile_line_evidence": {
+      "alloc_vec_mod_rs_1785_inlined_anymatcher_chunk_baseline_Ir": 65537,
+      "alloc_vec_mod_rs_1785_inlined_anymatcher_chunk_candidate_Ir": 131074,
+      "tier1_rs_inlined_anymatcher_chunk_baseline_Ir": 1245215,
+      "tier1_rs_inlined_anymatcher_chunk_candidate_Ir": 1245215,
+      "total_conditional_branches_baseline": 590585,
+      "total_conditional_branches_candidate": 590664
+    },
+    "interpretation_limits": [
+      "This explains the generated-code instruction increase for this workload and this AArch64 compiler/build. It does not imply a universal wall-clock slowdown.",
+      "Native Criterion comparisons sampled direct mode, not the forced-class mixed case. Direct mixed timings did not significantly regress; forced-class native throughput was not measured in this final timing pass.",
+      "The remaining 461 instructions were not isolated to individual stream-preparation, EOF or cleanup operations."
+    ],
+    "baseline_binary": "/tmp/rethoc-tier1-base-build/release/build/rethoc-engine/c49d524922decdf8/out/tier1_assertions_profile-c49d524922decdf8",
+    "candidate_binary": "/tmp/rethoc-tier1-pre-layout-profile",
+    "commands": [
+      "scripts/capped --time 20 -- callgrind_annotate --auto=no --threshold=99 /tmp/rethoc-tier1-native-candidate-target/gungraun/rethoc-engine/tier1_assertions_profile/assertions/bench_scan.mixed_classes_warm/callgrind.bench_scan.mixed_classes_warm.out.base@tier1_verified > /tmp/rethoc-tier1-mixed-classes-base-annotate.txt",
+      "scripts/capped --time 20 -- callgrind_annotate --auto=no --threshold=99 /tmp/rethoc-tier1-native-candidate-target/gungraun/rethoc-engine/tier1_assertions_profile/assertions/bench_scan.mixed_classes_warm/callgrind.bench_scan.mixed_classes_warm.out > /tmp/rethoc-tier1-mixed-classes-candidate-annotate.txt",
+      "scripts/capped --time 20 -- callgrind_annotate --auto=yes --show=Ir,Dr,Dw,Bc --threshold=99 /tmp/rethoc-tier1-native-candidate-target/gungraun/rethoc-engine/tier1_assertions_profile/assertions/bench_scan.mixed_classes_warm/callgrind.bench_scan.mixed_classes_warm.out.base@tier1_verified > /tmp/rethoc-tier1-mixed-classes-base-source.txt",
+      "scripts/capped --time 20 -- callgrind_annotate --auto=yes --show=Ir,Dr,Dw,Bc --threshold=99 /tmp/rethoc-tier1-native-candidate-target/gungraun/rethoc-engine/tier1_assertions_profile/assertions/bench_scan.mixed_classes_warm/callgrind.bench_scan.mixed_classes_warm.out > /tmp/rethoc-tier1-mixed-classes-candidate-source.txt",
+      "scripts/capped --time 20 -- llvm-objdump -d --demangle --line-numbers --start-address=0x157c18 --stop-address=0x157c58 /tmp/rethoc-tier1-base-build/release/build/rethoc-engine/c49d524922decdf8/out/tier1_assertions_profile-c49d524922decdf8",
+      "scripts/capped --time 20 -- llvm-objdump -d --demangle --line-numbers --start-address=0x156820 --stop-address=0x156864 /tmp/rethoc-tier1-candidate-build/release/build/rethoc-engine/c49d524922decdf8/out/tier1_assertions_profile-c49d524922decdf8"
+    ],
+    "evidence": [
+      {
+        "path": "/tmp/rethoc-tier1-mixed-classes-base-annotate.txt",
+        "sha256": "3ee6e3ea32a319c40a30ba5d3b46ae08ea5be280c6d3133c6386a3d01bfaf085"
+      },
+      {
+        "path": "/tmp/rethoc-tier1-mixed-classes-candidate-annotate.txt",
+        "sha256": "5be65d2375a4c2f1593bc82d1ba88246ba48166b978e23847efa755142c0d9dc"
+      },
+      {
+        "path": "/tmp/rethoc-tier1-mixed-classes-base-source.txt",
+        "sha256": "b07b10fe7fa06a946cfbd98ecc3732c53df859b987b233a8c39943213a62cafb"
+      },
+      {
+        "path": "/tmp/rethoc-tier1-mixed-classes-candidate-source.txt",
+        "sha256": "8e20936343724b67b9acfa970cf3f15e7a7974693c0e2e1f215fc117fa6c6d92"
+      },
+      {
+        "path": "/tmp/rethoc-tier1-mixed-classes-base-disasm.txt",
+        "sha256": "8b39217b9472519ff711423b54f44b2efb3fc78ab9500dc945717ab65132ae26"
+      },
+      {
+        "path": "/tmp/rethoc-tier1-mixed-classes-candidate-disasm.txt",
+        "sha256": "29d510d6fe4e5ff7b380d6d0755e20f7bf127542bb6a1e76b6b5cf831fc2221c"
+      }
+    ],
+    "status": "Historical diagnosis before final layout fix; no longer the final performance result.",
+    "candidate_binary_sha256": "e8bf2c9c175d42c77037967347161c265370384f6937a76e0d3a4fdaaac3389b",
+    "preserved_raw_profile": "/tmp/rethoc-tier1-mixed-classes-pre-layout.out"
+  },
+  "criterion_mixed_classes_fresh_baseline": {
+    "tier1_assertions/mixed/classes/warm": {
+      "time_seconds_95ci_point": [
+        0.0007110199999999999,
+        0.0007307999999999999,
+        0.00075723
+      ]
+    }
+  },
+  "criterion_mixed_classes_fresh_candidate": {
+    "tier1_assertions/mixed/classes/warm": {
+      "time_seconds_95ci_point": [
+        0.0007022,
+        0.00070374,
+        0.00070558
+      ],
+      "change_percent_95ci_point": [
+        -4.77,
+        -2.9342,
+        -1.4802
+      ],
+      "criterion_classification": "Performance has improved."
+    }
+  },
+  "historical_near_limit_timing_variability": {
+    "scope": "Before cache-layout-only change; preserved to show process-to-process variability, not a final-source measurement.",
+    "baseline": {
+      "tier1_assertions_compile_limits/simple_tails": {
+        "time_seconds_95ci_point": [
+          0.0008599500000000001,
+          0.00086486,
+          0.00086998
+        ]
+      }
+    },
+    "candidate": {
+      "tier1_assertions_compile_limits/simple_tails": {
+        "time_seconds_95ci_point": [
+          0.00074635,
+          0.0007531199999999999,
+          0.00075903
+        ],
+        "change_percent_95ci_point": [
+          -13.845,
+          -13.13,
+          -12.26
+        ],
+        "criterion_classification": "Performance has improved."
+      }
+    }
+  },
+  "layout_fix": {
+    "change": "repr(C) Tier1DfaCache with inner, transitions, stride, dead_transitions, targets in that order. Correctness does not depend on Vec internal order.",
+    "final_mixed_classes_instructions": {
+      "baseline": 2363768,
+      "candidate": 2364253,
+      "percent": 0.02052
+    },
+    "prior_diagnosis_key": "mixed_classes_warm_instruction_increase",
+    "native_fresh_pair_keys": [
+      "criterion_mixed_classes_fresh_baseline",
+      "criterion_mixed_classes_fresh_candidate"
+    ],
+    "cache_size_bytes": 200,
+    "alignment_bytes": 8,
+    "verified_field_offsets": {
+      "inner": 0,
+      "transitions": 120,
+      "stride": 144,
+      "dead_transitions": 152,
+      "targets": 176
+    },
+    "verified_paired_load": {
+      "address": "0x156838",
+      "instruction": "ldp x1, x8, [x22, #0x88]"
+    },
+    "remaining_mixed_total_instruction_delta": 485,
+    "remaining_delta_qualification": "The extra per-transition instruction is gone; the remaining 485 instructions per measured 64 KiB stream were not isolated individually.",
+    "evidence": [
+      {
+        "path": "/tmp/rethoc-tier1-layout-final-cache-dwarf.txt",
+        "sha256": "072ba764875de1337b1d14dd3c0503f9b010b7149bddb67731e831e33e98dba9"
+      },
+      {
+        "path": "/tmp/rethoc-tier1-layout-final-mixed-disasm.txt",
+        "sha256": "9fb2054c794be0b854084d3c8c92efe0b0acbfa70d4b030e3005c7fc40a8b5ce"
+      },
+      {
+        "path": "/tmp/rethoc-tier1-layout-final-mixed-annotate.txt",
+        "sha256": "da4852779a9bc1bef9a0dae95598d1eeea2b49045521d5219f6cccd36e363bed"
+      }
+    ]
+  },
+  "criterion_existing_fresh_repeat_baseline": {
+    "tier1_assertions/nonword/direct/warm": {
+      "time_seconds_95ci_point": [
+        0.00056171,
+        0.00056275,
+        0.00056383
+      ]
+    },
+    "tier1_assertions/mixed/direct/warm": {
+      "time_seconds_95ci_point": [
+        0.00056385,
+        0.00058407,
+        0.00061707
+      ]
+    },
+    "tier1_assertions_compile/end": {
+      "time_seconds_95ci_point": [
+        9.6014e-07,
+        9.6567e-07,
+        9.711000000000001e-07
+      ]
+    }
+  },
+  "criterion_existing_fresh_repeat_candidate": {
+    "tier1_assertions/nonword/direct/warm": {
+      "time_seconds_95ci_point": [
+        0.00055773,
+        0.0005591,
+        0.0005604
+      ],
+      "change_percent_95ci_point": [
+        -1.0286,
+        -0.8267,
+        -0.6148
+      ],
+      "criterion_classification": "Change within noise threshold."
+    },
+    "tier1_assertions/mixed/direct/warm": {
+      "time_seconds_95ci_point": [
+        0.0005660800000000001,
+        0.00056885,
+        0.0005724199999999999
+      ],
+      "change_percent_95ci_point": [
+        -3.4444,
+        -0.9405,
+        0.6763
+      ],
+      "criterion_classification": "No change in performance detected."
+    },
+    "tier1_assertions_compile/end": {
+      "time_seconds_95ci_point": [
+        9.7417e-07,
+        1.0221e-06,
+        1.0873e-06
+      ],
+      "change_percent_95ci_point": [
+        0.9634,
+        3.3152,
+        7.0983
+      ],
+      "criterion_classification": "Change within noise threshold."
+    }
+  },
+  "criterion_near_limit_fresh_repeat_baseline": {
+    "tier1_assertions_compile_limits/simple_tails": {
+      "time_seconds_95ci_point": [
+        0.00076595,
+        0.0008200299999999999,
+        0.0008598999999999999
+      ]
+    },
+    "tier1_assertions_compile_limits/acyclic_branching": {
+      "time_seconds_95ci_point": [
+        0.00080358,
+        0.00092129,
+        0.0010074
+      ]
+    },
+    "tier1_assertions_compile_limits/epsilon_cycles": {
+      "time_seconds_95ci_point": [
+        0.0007159199999999999,
+        0.0008104099999999999,
+        0.00088024
+      ]
+    }
+  },
+  "criterion_near_limit_fresh_repeat_candidate": {
+    "tier1_assertions_compile_limits/simple_tails": {
+      "time_seconds_95ci_point": [
+        0.0008339199999999999,
+        0.0008362999999999999,
+        0.00083958
+      ],
+      "change_percent_95ci_point": [
+        3.1321,
+        6.3016,
+        9.2519
+      ],
+      "criterion_classification": "Performance has regressed."
+    },
+    "tier1_assertions_compile_limits/acyclic_branching": {
+      "time_seconds_95ci_point": [
+        0.00079439,
+        0.00083218,
+        0.00087572
+      ],
+      "change_percent_95ci_point": [
+        -11.14,
+        -4.9196,
+        1.2482
+      ],
+      "criterion_classification": "No change in performance detected."
+    },
+    "tier1_assertions_compile_limits/epsilon_cycles": {
+      "time_seconds_95ci_point": [
+        0.0006909899999999999,
+        0.00069458,
+        0.00069883
+      ],
+      "change_percent_95ci_point": [
+        -12.746,
+        -7.8648,
+        -3.0942
+      ],
+      "criterion_classification": "Performance has improved."
+    }
+  },
+  "near_limit_simple_tails_fresh_mean_estimates": {
+    "base": {
+      "confidence_interval": {
+        "confidence_level": 0.95,
+        "lower_bound": 765481.6744673564,
+        "upper_bound": 810636.4755175445
+      },
+      "point_estimate": 786831.4397197836,
+      "standard_error": 11646.453920039414,
+      "unit": "nanoseconds",
+      "source": "/tmp/rethoc-tier1-native-base-target/criterion/tier1_assertions_compile_limits/simple_tails/tier1_layout_repeat/estimates.json"
+    },
+    "candidate": {
+      "confidence_interval": {
+        "confidence_level": 0.95,
+        "lower_bound": 834509.1014015423,
+        "upper_bound": 838605.8036261373
+      },
+      "point_estimate": 836414.5235692321,
+      "standard_error": 1048.361648126584,
+      "unit": "nanoseconds",
+      "source": "/tmp/rethoc-tier1-native-candidate-target/criterion/tier1_assertions_compile_limits/simple_tails/new/estimates.json"
+    }
+  },
+  "final_performance_interpretation": {
+    "native_comparison_policy": "Retained both initial final-source comparisons and exactly one fresh paired repeat of the three flagged native cases and all three near-limit shapes. No additional repeat was selected to obtain a desired result.",
+    "native_estimate_format": "time_seconds_95ci_point contains the printed interval endpoints and point estimate; Criterion prints regression slope for these cases, whereas its change percentage compares means. Those two point ratios can differ, especially with outliers.",
+    "direct_scan_outliers": "Initial nonword warm +3.03% and mixed warm +3.52% were not reproduced: fresh paired changes were -0.83% (within noise threshold) and -0.94% (no change detected). Treat these small native differences as uncertain; do not claim universal zero overhead.",
+    "small_compile_end": "Initial +2.54%; fresh +3.32% with interval +0.96..+7.10% and Criterion classification within noise threshold. Retain this small measured build-time difference; instruction count improves.",
+    "near_limit_simple_tails": {
+      "states": 1801,
+      "assertions": 900,
+      "initial_mean_change_percent_95ci_point": [
+        12.685,
+        21.692,
+        34.006
+      ],
+      "fresh_mean_change_percent_95ci_point": [
+        3.1321,
+        6.3016,
+        9.2519
+      ],
+      "fresh_baseline_mean_us": 786.8314397197836,
+      "fresh_candidate_mean_us": 836.4145235692321,
+      "fresh_extra_mean_us": 49.58308384944848,
+      "conclusion": "Both final-source rounds show a build-time increase; retain the fresh +6.30% / about 49.58 us as an explicit bounded compile tradeoff, with substantial baseline/process variability. No further native repeat was performed."
+    },
+    "forced_classes_mixed": "Fresh baseline/candidate native comparison improves -2.93% (95% CI -4.77..-1.48%). Final Callgrind increase is +0.02052%, after verified removal of the extra per-transition load instruction.",
+    "remaining_reengage_increase": "The historically named tier3_rule_text workload automatically selects GroupedStream in both builds. Its +3.31894% instruction increase is unchanged by the cache-layout fix, below the unchanged gate, and attributable almost entirely to prefilter/NEON generated code: the candidate calls memclass_neon out of line where the baseline profile attributes the NEON work to the inlined prefilter. This remains a measured cross-engine generated-code cost; no SIMD change was made."
+  },
+  "reengage_largest_increase_investigation": {
+    "case": "scan/tier3_rule_text",
+    "actual_backend": "GroupedStream (automatic selection in cases::scan via memory.matcher(re))",
+    "baseline_instructions": 4771583,
+    "candidate_instructions": 4929949,
+    "delta_instructions": 158366,
+    "prefilter_and_neon_instructions_baseline": 796990,
+    "prefilter_and_neon_instructions_candidate": 955273,
+    "prefilter_and_neon_delta": 158283,
+    "fraction_of_total_delta": 0.9994758976042838,
+    "grouped_chunk_delta": 80,
+    "remaining_delta": 3,
+    "finding": "The profile attributes baseline NEON work to Prefilter::find (inlined) and candidate NEON work to separately called memclass_neon functions. Summing every source-file attribution for those functions accounts for 99.95% of the whole-benchmark instruction increase. This supports a generated-code/inlining cost, not an increase in assertion evaluation work. No native timing comparison for this existing reengage workload was added.",
+    "policy": "Retained under the unchanged gate; no unrelated SIMD implementation or inlining attribute change.",
+    "evidence": [
+      {
+        "path": "/tmp/rethoc-tier1-layout-final-reengage-base-annotate.txt",
+        "sha256": "0939b932f50a2f2f21613abd0e1edce8fd782014c817e0b1c2418a8e17e863dc"
+      },
+      {
+        "path": "/tmp/rethoc-tier1-layout-final-reengage-candidate-annotate.txt",
+        "sha256": "7cb2f5fe0804bd34436094b220d09312aa61215184dc9857873fe15eb9276bba"
+      }
+    ],
+    "annotation_command": "scripts/capped --time 20 -- callgrind_annotate --auto=no --show=Ir --threshold=100 PROFILE",
+    "profiles": [
+      "/tmp/rethoc-tier1-native-candidate-target/gungraun/rethoc-engine/reengage_profile/reengage/bench_scan.tier3_rule_text/callgrind.bench_scan.tier3_rule_text.out.base@tier1_verified",
+      "/tmp/rethoc-tier1-native-candidate-target/gungraun/rethoc-engine/reengage_profile/reengage/bench_scan.tier3_rule_text/callgrind.bench_scan.tier3_rule_text.out"
+    ]
+  },
+  "assertion_lookup_hoist": {
+    "finding": 7,
+    "baseline_commit": "b5968d651fa39b2aefcc9a5b2a20cebb16c5d75b",
+    "engine_commit": "026d6e9b1641f51df4cb74fc3261f57b4c217253",
+    "scope": "One validated assertion-analysis lookup per assertion-enabled closure call. No lookup for the assertion-free specialization. Comparison is against the preceding PR head, not main.",
+    "source_sha256": {
+      "rethoc-engine/src/dfa/tier1.rs": "dc5ca68067ba35ac9ee90bdaab5ac0a2d618683ce92ffdb82fea5d23727f8f53"
+    },
+    "cargo_lock_sha256": "318562bec1327ce3684fde74c6b7d98ec0cb2a638e9e48da3953d69a0359bb53",
+    "limits_percent": {
+      "Instructions": 5,
+      "Bcm": 100
+    },
+    "baseline_name": "pr24_hoist",
+    "assertions": {
+      "cases": 55,
+      "regressions": 0,
+      "Instructions": {
+        "min": {
+          "case": "scan/churn_tiny_cold",
+          "baseline": 94651927,
+          "candidate": 94417261,
+          "percent": -0.2479252218499471
+        },
+        "max": {
+          "case": "scan/mixed_short_cold",
+          "baseline": 17749,
+          "candidate": 17779,
+          "percent": 0.1690236069637726
+        }
+      },
+      "Bcm": {
+        "min": {
+          "case": "scan/churn_tiny_cold",
+          "baseline": 655693,
+          "candidate": 581653,
+          "percent": -11.291869823225198
+        },
+        "max": {
+          "case": "scan/anchored_direct_warm",
+          "baseline": 91,
+          "candidate": 100,
+          "percent": 9.89010989010989
+        }
+      }
+    },
+    "reengagement": {
+      "cases": 19,
+      "regressions": 0,
+      "Instructions": {
+        "min": {
+          "case": "scan/control_tier1_literal_text",
+          "baseline": 593590,
+          "candidate": 593583,
+          "percent": -0.0011792651493455078
+        },
+        "max": {
+          "case": "scan/tier3_no_prefilter_gap_once",
+          "baseline": 1661793,
+          "candidate": 1661824,
+          "percent": 0.001865454963403986
+        }
+      },
+      "Bcm": {
+        "min": {
+          "case": "scan/tier3_no_prefilter_gap_once",
+          "baseline": 1028,
+          "candidate": 939,
+          "percent": -8.657587548638132
+        },
+        "max": {
+          "case": "scan/tier2_anchored_gap_once",
+          "baseline": 517,
+          "candidate": 575,
+          "percent": 11.218568665377177
+        }
+      }
+    },
+    "commands": [
+      {
+        "role": "baseline",
+        "bench": "tier1_assertions_profile",
+        "exit_code": 0,
+        "seconds": 29.75,
+        "command": [
+          "/home/elie/.cargo/bin/cargo",
+          "--config",
+          "build.build-dir=\"/tmp/rethoc-pr24-hoist-baseline-build\"",
+          "bench",
+          "--bench",
+          "tier1_assertions_profile",
+          "--",
+          "--save-baseline=pr24_hoist"
+        ],
+        "target": "/tmp/rethoc-pr24-hoist-baseline-target",
+        "build": "/tmp/rethoc-pr24-hoist-baseline-build",
+        "log": "/tmp/rethoc-pr24-hoist-baseline-tier1_assertions_profile.log",
+        "log_sha256": "525a5e1cb72eef15e24235818dbd3d0abf75f8b6b7b274169d72c40b6b761179"
+      },
+      {
+        "role": "baseline",
+        "bench": "reengage_profile",
+        "exit_code": 0,
+        "seconds": 10.99,
+        "command": [
+          "/home/elie/.cargo/bin/cargo",
+          "--config",
+          "build.build-dir=\"/tmp/rethoc-pr24-hoist-baseline-build\"",
+          "bench",
+          "--bench",
+          "reengage_profile",
+          "--",
+          "--save-baseline=pr24_hoist"
+        ],
+        "target": "/tmp/rethoc-pr24-hoist-baseline-target",
+        "build": "/tmp/rethoc-pr24-hoist-baseline-build",
+        "log": "/tmp/rethoc-pr24-hoist-baseline-reengage_profile.log",
+        "log_sha256": "e7c45916e87d819eb07b5043cdaccda2178980d4f6167e907ad263e2b6e3b10e"
+      },
+      {
+        "role": "candidate",
+        "bench": "tier1_assertions_profile",
+        "exit_code": 0,
+        "seconds": 57.16,
+        "command": [
+          "/home/elie/.cargo/bin/cargo",
+          "--config",
+          "build.build-dir=\"/tmp/rethoc-pr24-hoist-candidate-build\"",
+          "bench",
+          "--bench",
+          "tier1_assertions_profile",
+          "--",
+          "--baseline=pr24_hoist"
+        ],
+        "target": "/tmp/rethoc-pr24-hoist-candidate-target",
+        "build": "/tmp/rethoc-pr24-hoist-candidate-build",
+        "log": "/tmp/rethoc-pr24-hoist-candidate-tier1_assertions_profile.log",
+        "log_sha256": "2fe29115293ec2dd54c138acb6a529f59014bf42c3df4fc8bd256211b7c960bd"
+      },
+      {
+        "role": "candidate",
+        "bench": "reengage_profile",
+        "exit_code": 0,
+        "seconds": 9.97,
+        "command": [
+          "/home/elie/.cargo/bin/cargo",
+          "--config",
+          "build.build-dir=\"/tmp/rethoc-pr24-hoist-candidate-build\"",
+          "bench",
+          "--bench",
+          "reengage_profile",
+          "--",
+          "--baseline=pr24_hoist"
+        ],
+        "target": "/tmp/rethoc-pr24-hoist-candidate-target",
+        "build": "/tmp/rethoc-pr24-hoist-candidate-build",
+        "log": "/tmp/rethoc-pr24-hoist-candidate-reengage_profile.log",
+        "log_sha256": "ec488abecd32bbf2de80f0fd8526e12d889e7186b088cbb10ceb88ae990392a6"
+      }
+    ],
+    "environment": {
+      "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+      "architecture": "aarch64",
+      "valgrind": "valgrind-3.25.1",
+      "runner": "/tmp/rethoc-tier1-tools/bin/gungraun-runner 0.20.0",
+      "cargo_runner": "Each checkout used its own scripts/capped via CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER.",
+      "isolation": "Separate build and target directories; identical Cargo.lock and benchmark sources; only measurement baselines copied."
+    },
+    "limitations": [
+      "Callgrind instruction and branch-miss counts, not wall-clock throughput measurements. Small mixed changes do not establish a significant speedup."
+    ]
+  },
+  "boxed_empty_analysis": {
+    "baseline_commit": "e959fdbcd569b5c7be1e18810a3e6c0196710d2b",
+    "engine_commit": "e7676d0dd0064786624fb9579c2c68119040bc37",
+    "scope": "Keep Box<Tier1Assertions>, remove Option, use an empty entries slice when analysis is unused; comparison against preceding PR head.",
+    "limits_percent": {
+      "Instructions": 5,
+      "Bcm": 100
+    },
+    "measurements": {
+      "tier1_assertions_profile": {
+        "summary": "Gungraun result: Ok. 55 without regressions; 0 regressed; 0 filtered; 55 benchmarks finished in 24.0215s",
+        "categories": {
+          "scan": {
+            "cases": 47,
+            "Instructions": {
+              "min": {
+                "case": "scan/mixed_direct_warm",
+                "baseline": 2299536,
+                "candidate": 2299504,
+                "percent": -0.001391585084991059
+              },
+              "max": {
+                "case": "scan/tier4_short_cold",
+                "baseline": 78559,
+                "candidate": 79574,
+                "percent": 1.2920225562952685
+              }
+            },
+            "Bcm": {
+              "min": {
+                "case": "scan/word_short_cold",
+                "baseline": 359,
+                "candidate": 331,
+                "percent": -7.7994428969359335
+              },
+              "max": {
+                "case": "scan/no_prefilter_direct_cold",
+                "baseline": 208,
+                "candidate": 241,
+                "percent": 15.865384615384615
+              }
+            }
+          },
+          "compile": {
+            "cases": 8,
+            "Instructions": {
+              "min": {
+                "case": "compile/end",
+                "baseline": 21159,
+                "candidate": 21152,
+                "percent": -0.03308284890590293
+              },
+              "max": {
+                "case": "compile/literal",
+                "baseline": 14395,
+                "candidate": 14696,
+                "percent": 2.091003820771101
+              }
+            },
+            "Bcm": {
+              "min": {
+                "case": "compile/word",
+                "baseline": 610,
+                "candidate": 595,
+                "percent": -2.459016393442623
+              },
+              "max": {
+                "case": "compile/literal",
+                "baseline": 391,
+                "candidate": 417,
+                "percent": 6.649616368286445
+              }
+            }
+          },
+          "tier1_scan": {
+            "cases": 44,
+            "Instructions": {
+              "min": {
+                "case": "scan/mixed_direct_warm",
+                "baseline": 2299536,
+                "candidate": 2299504,
+                "percent": -0.001391585084991059
+              },
+              "max": {
+                "case": "scan/literal_sparse_direct_warm",
+                "baseline": 20670,
+                "candidate": 20859,
+                "percent": 0.9143686502177069
+              }
+            },
+            "Bcm": {
+              "min": {
+                "case": "scan/word_short_cold",
+                "baseline": 359,
+                "candidate": 331,
+                "percent": -7.7994428969359335
+              },
+              "max": {
+                "case": "scan/no_prefilter_direct_cold",
+                "baseline": 208,
+                "candidate": 241,
+                "percent": 15.865384615384615
+              }
+            }
+          }
+        },
+        "log": "/tmp/rethoc-pr24-empty-candidate-tier1_assertions_profile.log",
+        "log_sha256": "bf7c0f838a4de403f767f3e0c8476dc039fc70f4a399d61883886fdbc43bf41f"
+      },
+      "reengage_profile": {
+        "summary": "Gungraun result: Ok. 19 without regressions; 0 regressed; 0 filtered; 19 benchmarks finished in 8.32086s",
+        "categories": {
+          "scan": {
+            "cases": 19,
+            "Instructions": {
+              "min": {
+                "case": "scan/control_tier2_live_counter",
+                "baseline": 37932272,
+                "candidate": 37932398,
+                "percent": 0.0003321709809525778
+              },
+              "max": {
+                "case": "scan/tier3_gap_once",
+                "baseline": 164308,
+                "candidate": 164906,
+                "percent": 0.36395062930593763
+              }
+            },
+            "Bcm": {
+              "min": {
+                "case": "scan/tier2_gap_text",
+                "baseline": 10397,
+                "candidate": 10147,
+                "percent": -2.404539771087814
+              },
+              "max": {
+                "case": "scan/tier3_candidate_run",
+                "baseline": 284,
+                "candidate": 334,
+                "percent": 17.6056338028169
+              }
+            }
+          }
+        },
+        "log": "/tmp/rethoc-pr24-empty-candidate-reengage_profile.log",
+        "log_sha256": "f2bb90ca69d00dc35f8cf4f1da28b739fbd0604ef3b9eda84d25d5e8806f5fa6"
+      }
+    },
+    "memory": {
+      "sizes_bytes": {
+        "Regex": 760,
+        "DfaMatcher": 64,
+        "AnyMatcher": 608,
+        "MatcherMemory": 1640
+      },
+      "compiled_bytes": {
+        "abc": 904,
+        "\\babc\\b": 980,
+        "(?Rm)^abc$": 980
+      },
+      "unused_analysis_owner_bytes_added": 16,
+      "populated_analysis_bytes_change": 0,
+      "blessed_entries": 173,
+      "blessed_entry_delta_bytes": 16,
+      "all_memory_entries_checked": 506,
+      "notes": "The outer Box is retained unconditionally. Empty entries allocate no payload. Counts exclude allocator overhead. Regex and matcher object sizes remain unchanged."
+    },
+    "commands": [
+      {
+        "role": "baseline",
+        "bench": "tier1_assertions_profile",
+        "exit_code": 0,
+        "seconds": 41.38,
+        "command": [
+          "/home/elie/.cargo/bin/cargo",
+          "--config",
+          "build.build-dir=\"/home/elie/.cache/rethoc-pr24-empty-baseline-build\"",
+          "bench",
+          "--bench",
+          "tier1_assertions_profile",
+          "--",
+          "--save-baseline=pr24_empty"
+        ],
+        "target": "/home/elie/.cache/rethoc-pr24-empty-baseline-target",
+        "build": "/home/elie/.cache/rethoc-pr24-empty-baseline-build",
+        "log": "/tmp/rethoc-pr24-empty-baseline-tier1_assertions_profile.log",
+        "log_sha256": "a2fc9c39e625bfcfee8d4f6a477cae1f5bd14d6f6c5d9779914570d25290263d"
+      },
+      {
+        "role": "baseline",
+        "bench": "reengage_profile",
+        "exit_code": 0,
+        "seconds": 9.62,
+        "command": [
+          "/home/elie/.cargo/bin/cargo",
+          "--config",
+          "build.build-dir=\"/home/elie/.cache/rethoc-pr24-empty-baseline-build\"",
+          "bench",
+          "--bench",
+          "reengage_profile",
+          "--",
+          "--save-baseline=pr24_empty"
+        ],
+        "target": "/home/elie/.cache/rethoc-pr24-empty-baseline-target",
+        "build": "/home/elie/.cache/rethoc-pr24-empty-baseline-build",
+        "log": "/tmp/rethoc-pr24-empty-baseline-reengage_profile.log",
+        "log_sha256": "df995c3af48ca48ab0addd33c29be0ad4bd338d52f4d00953ab06fe535bec913"
+      },
+      {
+        "role": "candidate",
+        "bench": "tier1_assertions_profile",
+        "exit_code": 0,
+        "seconds": 55.38,
+        "command": [
+          "/home/elie/.cargo/bin/cargo",
+          "--config",
+          "build.build-dir=\"/home/elie/.cache/rethoc-pr24-empty-candidate-build\"",
+          "bench",
+          "--bench",
+          "tier1_assertions_profile",
+          "--",
+          "--baseline=pr24_empty"
+        ],
+        "target": "/home/elie/.cache/rethoc-pr24-empty-candidate-target",
+        "build": "/home/elie/.cache/rethoc-pr24-empty-candidate-build",
+        "log": "/tmp/rethoc-pr24-empty-candidate-tier1_assertions_profile.log",
+        "log_sha256": "bf7c0f838a4de403f767f3e0c8476dc039fc70f4a399d61883886fdbc43bf41f"
+      },
+      {
+        "role": "candidate",
+        "bench": "reengage_profile",
+        "exit_code": 0,
+        "seconds": 10.2,
+        "command": [
+          "/home/elie/.cargo/bin/cargo",
+          "--config",
+          "build.build-dir=\"/home/elie/.cache/rethoc-pr24-empty-candidate-build\"",
+          "bench",
+          "--bench",
+          "reengage_profile",
+          "--",
+          "--baseline=pr24_empty"
+        ],
+        "target": "/home/elie/.cache/rethoc-pr24-empty-candidate-target",
+        "build": "/home/elie/.cache/rethoc-pr24-empty-candidate-build",
+        "log": "/tmp/rethoc-pr24-empty-candidate-reengage_profile.log",
+        "log_sha256": "f2bb90ca69d00dc35f8cf4f1da28b739fbd0604ef3b9eda84d25d5e8806f5fa6"
+      }
+    ],
+    "baseline_sources_sha256": {
+      "Cargo.lock": "318562bec1327ce3684fde74c6b7d98ec0cb2a638e9e48da3953d69a0359bb53",
+      "rethoc-engine/src/lib.rs": "d3d0e7f277b715d9ad2904ad68d91ab706abafc56973ca77f843f0a06b85f87d",
+      "rethoc-engine/src/dfa/tier1.rs": "dc5ca68067ba35ac9ee90bdaab5ac0a2d618683ce92ffdb82fea5d23727f8f53",
+      "rethoc-engine/src/dfa/tier1/analysis.rs": "b6b8f16b507b9b5f80e96dead016094ea7840ff61106ba5e7a90926f70586034",
+      "rethoc-engine/src/dfa/tier1/assertion_tests.rs": "ea71c1adc829fe98c256fcad473c0ffbc9cfb485a3d74880b8ddd285f76c9497",
+      "rethoc-engine/src/dump.rs": "429228002c7642c7a6c1dcee77e0f0f83297df148f98fe5e98a552466fb6668d",
+      "rethoc-engine/benches/tier1_assertions_profile.rs": "4b004183a94638bddc7ea4f21f04dc5fa915dfc1b96ec39b360381c86b25cbe5",
+      "rethoc-engine/benches/reengage_profile.rs": "a95620cf588e5299ce3c48f73e8c903cfd3a5868dace7ee5f4b013ed9dc8197c",
+      "rethoc-engine/benches/common/tier1_assertion_cases.rs": "2e9e16b7ffc793b57676806d49d3e13e430a08c04d3412f10db0dcf74f21059f",
+      "rethoc-engine/benches/common/reengage_cases.rs": "579b387a1197b5c245248fee3eb5e522d6b9b2d5de333519054af513aa0d14f6"
+    },
+    "candidate_sources_sha256": {
+      "Cargo.lock": "318562bec1327ce3684fde74c6b7d98ec0cb2a638e9e48da3953d69a0359bb53",
+      "rethoc-engine/src/lib.rs": "12ee1ab53621e1442d13a47aae237eb767e2919da0c9a7086923759c956763e4",
+      "rethoc-engine/src/dfa/tier1.rs": "da01933b5212a0c2749fe60acdaeff1c9a53ae4f92fd5067c34901a3626acd15",
+      "rethoc-engine/src/dfa/tier1/analysis.rs": "74c390d398248982121384dcbedf851fde7c01700caecd6b102b3ba337ba2fbc",
+      "rethoc-engine/src/dfa/tier1/assertion_tests.rs": "842ebb758eb55033b9fc2b35d9cd32743ad4b34bfa07ebd3ac99e41016ee82aa",
+      "rethoc-engine/src/dump.rs": "70658be3a062dd6e577c36e2e8c56d2b3228ba1204562d601b589541f14dfc59",
+      "rethoc-engine/benches/tier1_assertions_profile.rs": "4b004183a94638bddc7ea4f21f04dc5fa915dfc1b96ec39b360381c86b25cbe5",
+      "rethoc-engine/benches/reengage_profile.rs": "a95620cf588e5299ce3c48f73e8c903cfd3a5868dace7ee5f4b013ed9dc8197c",
+      "rethoc-engine/benches/common/tier1_assertion_cases.rs": "2e9e16b7ffc793b57676806d49d3e13e430a08c04d3412f10db0dcf74f21059f",
+      "rethoc-engine/benches/common/reengage_cases.rs": "579b387a1197b5c245248fee3eb5e522d6b9b2d5de333519054af513aa0d14f6"
+    },
+    "binaries": {
+      "baseline": {
+        "tier1_assertions_profile": {
+          "path": "/home/elie/.cache/rethoc-pr24-empty-baseline-build/release/build/rethoc-engine/c49d524922decdf8/out/tier1_assertions_profile-c49d524922decdf8",
+          "sha256": "2591ab589d04ae7f2a76ae85ca6ed09bedbc5f7e3878b267f680faebb7570be0"
+        },
+        "reengage_profile": {
+          "path": "/home/elie/.cache/rethoc-pr24-empty-baseline-build/release/build/rethoc-engine/1e0bacb328a46a63/out/reengage_profile-1e0bacb328a46a63",
+          "sha256": "4123c3bd2f428f9525acc7e6fda3023bffc6147d15f8ce050d1bd0821cfc932b"
+        }
+      },
+      "candidate": {
+        "tier1_assertions_profile": {
+          "path": "/home/elie/.cache/rethoc-pr24-empty-candidate-build/release/build/rethoc-engine/c49d524922decdf8/out/tier1_assertions_profile-c49d524922decdf8",
+          "sha256": "72f244de59513b062bfc40030c30f26b0127f81790f6733f65b1731c1f13b436"
+        },
+        "reengage_profile": {
+          "path": "/home/elie/.cache/rethoc-pr24-empty-candidate-build/release/build/rethoc-engine/1e0bacb328a46a63/out/reengage_profile-1e0bacb328a46a63",
+          "sha256": "705317335899bb27a3a5cddeeb72ac25d431729d7767c2fe6bf188f55c4fa786"
+        }
+      }
+    },
+    "environment": {
+      "architecture": "aarch64",
+      "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+      "valgrind": "valgrind-3.25.1",
+      "runner": "/tmp/rethoc-tier1-tools/bin/gungraun-runner 0.20.0",
+      "isolation": "Separate build and target directories under /home/elie/.cache, identical Cargo.lock and fixtures; only measurement baselines copied."
+    },
+    "limitations": [
+      "Callgrind instruction and branch-miss counts, not wall-clock throughput.",
+      "Scan fixtures own and drop their Regex, so totals include teardown and extra empty-owner deallocation. These are not isolated per-byte costs."
+    ]
+  }
+}

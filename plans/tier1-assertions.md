@@ -1,8 +1,12 @@
 # Complete Tier 1 assertion support
 
-Status: implementation plan, not implemented. Source baseline:
-`97adc64e7e3f6ce720541498a79e4b8d476e5cc9` (2026-11-18).
-Verification evidence and its limits are recorded below and in
+Status: implemented and verified after rebasing onto `e654f78`; final full
+suites, blocking sweeps, batch fuzzing, and isolated runtime performance gates
+passed, including the cache-layout fix. See the
+[implementation record](verification/tier1-implementation.md) for completed
+checks and measured costs. The design below was written
+against `97adc64e7e3f6ce720541498a79e4b8d476e5cc9` (2026-11-18).
+Its original bounded verification remains in
 [the plan audit](verification/tier1-assertions.md).
 
 ## 1. Scope and acceptance contract
@@ -264,7 +268,7 @@ matcher regression per pattern. Add structural unit tests for mask fixed
 points, context equivalence, hashes/borrowed keys, eviction, and absence of
 unnecessary state splitting. Test both sides of the byte-class threshold.
 
-Add a targeted `tier1-assertions` sweep in `rethoc-cli/src/check/sweep.rs`
+Add a targeted `tier1-assert` sweep in `rethoc-cli/src/check/sweep.rs`
 (**new command family**), with counter-free graphs/patterns, all ten assertion
 kinds, and alphabet `a \r\n\xFF`. Include pair placement, alternation, cycles,
 and counted source patterns that unroll, with eligibility checks explicit.
@@ -285,10 +289,10 @@ cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D clippy::all
 python3 scripts/bless_memory.py --check
 
 # New family, after it is implemented; cargo uses the resource-cap runner.
-cargo run --release -- sweep --tier 1 tier1-assertions
+cargo run --release -- sweep --tier 1 tier1-assert
 RETHOC_DFA_STATES=8 RETHOC_BYTE_CLASS_MIN_STATES=0 \
-  cargo run --release -- sweep --tier 1 tier1-assertions
-cargo run -- sweep --tier 1 --max-len 4 tier1-assertions
+  cargo run --release -- sweep --tier 1 tier1-assert
+cargo run -- sweep --tier 1 --max-len 4 tier1-assert
 cargo run --release -- fuzz --batch 250 --allow-slow ci/known-slow-seeds.txt 0 9000
 RETHOC_DFA_STATES=8 RETHOC_BYTE_CLASS_MIN_STATES=0 \
   cargo run --release -- fuzz --batch 250 --allow-slow ci/known-slow-seeds.txt 0 9000
