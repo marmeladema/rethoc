@@ -13,7 +13,7 @@
 use libfuzzer_sys::fuzz_target;
 
 use rethoc_engine::fuzz_gen::{generate_inputs, generate_pattern, FuzzRng};
-use rethoc_engine::{GroupedScratch, MatcherMemory, RegexBuilder};
+use rethoc_engine::{GroupedNfaMode, GroupedScratch, MatcherMemory, RegexBuilder};
 
 use std::cell::RefCell;
 
@@ -92,7 +92,7 @@ fuzz_target!(|data: &[u8]| {
     // Compile with rethoc.
     set_phase("compilation (default unroll)");
     let mut builder = RegexBuilder::default();
-    builder.config_mut().grouped_nfa = true;
+    builder.config_mut().grouped_nfa = GroupedNfaMode::Always;
     let re = match builder.build(&hir) {
         Ok(r) => r,
         Err(_) => return,
@@ -177,7 +177,7 @@ fuzz_target!(|data: &[u8]| {
                 );
             }
         }
-        // The experimental grouped NFA, when it admits the pattern.
+        // The grouped NFA, when it admits the pattern.
         if let Some(grouped) = re.grouped_is_match(&mut grouped_scratch, input) {
             assert_eq!(
                 grouped,
@@ -237,7 +237,7 @@ fuzz_target!(|data: &[u8]| {
                 );
             }
         }
-        // The experimental grouped NFA, when it admits the pattern.
+        // The grouped NFA, when it admits the pattern.
         if let Some(grouped) = re_no_unroll.grouped_is_match(&mut grouped_scratch, input) {
             assert_eq!(
                 grouped,

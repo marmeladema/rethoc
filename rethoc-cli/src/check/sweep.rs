@@ -69,7 +69,7 @@ pub(crate) struct SweepArgs {
     /// unsound: `--skip-tier 3` checks the others)
     #[bpaf(long, argument("TIER"))]
     pub(crate) skip_tier: Option<u8>,
-    /// Check only the NFA and the experimental grouped NFA; patterns it
+    /// Check only the NFA and the grouped NFA; patterns it
     /// does not admit count as rejected
     #[bpaf(long)]
     pub(crate) grouped_nfa: bool,

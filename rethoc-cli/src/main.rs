@@ -10,7 +10,7 @@ use std::process;
 use std::str::FromStr;
 
 use bpaf::{Args, Bpaf};
-use rethoc_engine::{GroupedScratch, GroupedStream, Regex, RegexConfig};
+use rethoc_engine::{GroupedNfaMode, Regex, RegexConfig};
 
 mod check;
 
@@ -146,7 +146,7 @@ enum Opts {
         /// Output format: text, json or debug
         #[bpaf(long, argument("FORMAT"), fallback(Format::Text))]
         format: Format,
-        /// Also analyse the pattern for the experimental grouped NFA
+        /// Also analyse the grouped NFA when Tier 1 or 2 runs the pattern
         #[bpaf(long)]
         grouped_nfa: bool,
         #[bpaf(external(compile_args))]
@@ -171,8 +171,8 @@ enum Opts {
         /// Force an execution tier (0 = NFA, 1-4 = DFA tiers)
         #[bpaf(long, argument("TIER"))]
         tier: Option<u8>,
-        /// Run the experimental grouped NFA (not a tier; never chosen by
-        /// default)
+        /// Force the grouped NFA (automatic selection otherwise picks the
+        /// engine; `--tier` forces a numbered tier)
         #[bpaf(long)]
         grouped_nfa: bool,
         /// Print matcher state after each step
@@ -208,7 +208,7 @@ enum Opts {
         /// Include tier-specific DFA analysis
         #[bpaf(long)]
         dfa: bool,
-        /// Also analyse the pattern for the experimental grouped NFA
+        /// Also analyse the grouped NFA when Tier 1 or 2 runs the pattern
         #[bpaf(long)]
         grouped_nfa: bool,
         #[bpaf(external(compile_args))]
@@ -319,82 +319,40 @@ fn run_dump(pattern: &str, config: RegexConfig, format: Format, dfa: bool) {
     }
 }
 
-/// `match --grouped-nfa`: like [`run_match`], on a grouped NFA stream.
-fn run_match_grouped(
-    pattern: &str,
-    inputs: &[String],
-    chunk_size: Option<usize>,
-    mut config: RegexConfig,
-    debug: bool,
-) {
-    config.grouped_nfa = true;
-    let regex = parse_pattern(pattern, config);
-    if let Err(e) = regex.grouped_nfa_admission() {
-        eprintln!("error: {e}");
-        process::exit(1);
-    }
-    let info = regex.info();
-    let g = info.grouped_nfa.as_ref().expect("requested");
-    eprintln!("pattern: {pattern}");
-    eprintln!("grouped NFA: {g}");
-    if let Some(cs) = chunk_size {
-        eprintln!("chunk_size: {cs}");
-    }
-    eprintln!();
-
-    let mut scratch = GroupedScratch::new();
-    let mut any_failed = false;
-    for input in inputs {
-        let bytes = input.as_bytes();
-        let mut stream = GroupedStream::new(&regex, &mut scratch).expect("admitted");
-        if debug {
-            eprintln!("--- input: {:?} ---", input);
-            eprintln!("[init] {}", stream.display(&regex));
-        }
-        let cs = chunk_size.unwrap_or(bytes.len().max(1));
-        for (i, chunk) in bytes.chunks(cs).enumerate() {
-            stream.chunk(&regex, &mut scratch, chunk);
-            if debug {
-                eprintln!(
-                    "[after chunk #{} {:?} (bytes {}..{})] {}",
-                    i,
-                    String::from_utf8_lossy(chunk),
-                    i * cs,
-                    i * cs + chunk.len(),
-                    stream.display(&regex)
-                );
-            }
-        }
-        if stream.finish(&regex, &mut scratch) {
-            println!("  \x1b[32mMATCH\x1b[0m  {:?}", input);
-        } else {
-            println!("  \x1b[31mNO MATCH\x1b[0m  {:?}", input);
-            any_failed = true;
-        }
-    }
-    if any_failed {
-        process::exit(1);
-    }
-}
-
+/// `match`: automatic selection, or a forced tier or the grouped NFA.
 fn run_match(
     pattern: &str,
     inputs: &[String],
     chunk_size: Option<usize>,
     tier: Option<u8>,
-    config: RegexConfig,
+    grouped: bool,
+    mut config: RegexConfig,
     debug: bool,
 ) {
+    if grouped {
+        config.grouped_nfa = GroupedNfaMode::Always;
+    }
     let regex = parse_pattern(pattern, config);
-    let mut memory = check::new_memory().matcher;
+    let mut memory = check::new_memory();
 
     eprintln!("pattern: {pattern}");
     eprintln!("memory_size: {} bytes", regex.memory_size());
     if let Some(cs) = chunk_size {
         eprintln!("chunk_size: {cs}");
     }
-    if let Some(t) = tier {
-        eprintln!("tier: {t} (forced)");
+    match (tier, grouped) {
+        (Some(t), _) => eprintln!("tier: {t} (forced)"),
+        (None, true) => eprintln!("engine: grouped (forced)"),
+        (None, false) => eprintln!("engine: {} (automatic)", regex.engine()),
+    }
+    if grouped && let Err(e) = regex.grouped_nfa_admission() {
+        eprintln!("error: {e}");
+        process::exit(1);
+    }
+    // The plan summary whenever the grouped NFA was analysed (forced, or
+    // under automatic selection when neither Tier 1 nor Tier 2 applies).
+    if let Some(g) = &regex.info().grouped_nfa {
+        eprintln!("grouped NFA: {g}");
     }
     eprintln!();
 
@@ -406,6 +364,7 @@ fn run_match(
                 eprintln!("error: {e}");
                 process::exit(1);
             }),
+            None if grouped => memory.matcher_grouped(&regex).expect("admitted"),
             None => memory.matcher(&regex),
         };
 
@@ -458,7 +417,7 @@ fn run_match(
 
 fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig, quiet: bool) {
     let regex = parse_pattern(pattern, config);
-    let mut memory = check::new_memory().matcher;
+    let mut memory = check::new_memory();
 
     let reader: Box<dyn BufRead> = match file {
         Some(path) => {
@@ -512,7 +471,9 @@ fn main() {
             pattern,
         } => {
             let mut config = compile.config();
-            config.grouped_nfa = grouped_nfa;
+            if grouped_nfa {
+                config.grouped_nfa = GroupedNfaMode::Always;
+            }
             run_info(&pattern, config, format)
         }
         Opts::Dot { compile, pattern } => run_dot(&pattern, compile.config()),
@@ -531,11 +492,15 @@ fn main() {
                 eprintln!("error: --chunk-size must be > 0");
                 process::exit(check::EXIT_USAGE);
             }
-            if grouped_nfa {
-                run_match_grouped(&pattern, &inputs, chunk_size, compile.config(), debug)
-            } else {
-                run_match(&pattern, &inputs, chunk_size, tier, compile.config(), debug)
-            }
+            run_match(
+                &pattern,
+                &inputs,
+                chunk_size,
+                tier,
+                grouped_nfa,
+                compile.config(),
+                debug,
+            )
         }
         Opts::Grep {
             quiet,
@@ -551,7 +516,9 @@ fn main() {
             pattern,
         } => {
             let mut config = compile.config();
-            config.grouped_nfa = grouped_nfa;
+            if grouped_nfa {
+                config.grouped_nfa = GroupedNfaMode::Always;
+            }
             run_dump(&pattern, config, format, dfa)
         }
         Opts::Brute(args) => {

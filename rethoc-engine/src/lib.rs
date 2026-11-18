@@ -77,7 +77,7 @@ use dfa::{
 pub use dump::DumpRegex;
 #[doc(hidden)]
 pub use grouped_nfa::{
-    GroupedNfaError, GroupedScratch, GroupedStream, Rejection as GroupedRejection,
+    GroupedMatcher, GroupedNfaError, GroupedScratch, GroupedStream, Rejection as GroupedRejection,
     Sweep as GroupedSweep,
 };
 pub use info::{
@@ -1111,9 +1111,11 @@ pub struct Regex {
     /// state, returns to the prefilter).  Empty when the pattern has no
     /// counters or has nested counters.
     pub(crate) counter_body_states: Box<[bool]>,
-    /// Experimental grouped NFA plan or rejection; `None` unless
-    /// [`RegexConfig::grouped_nfa`] was set.  See [`grouped_nfa`].
+    /// Grouped NFA plan or rejection; `None` when it was not analysed (see
+    /// [`GroupedNfaMode`]).  See [`grouped_nfa`].
     pub(crate) grouped_nfa: Option<Box<grouped_nfa::GroupedNfa>>,
+    /// The engine automatic selection runs this regex on.
+    engine: Engine,
 }
 /// Parse a regex pattern string into an HIR using the engine's standard
 /// settings: `unicode(false)`, `utf8(false)`, `dot_matches_new_line(true)`.
@@ -1195,7 +1197,16 @@ impl Regex {
     pub fn counter_info(&self, counter_idx: usize) -> CounterInfo {
         self.counter_info[counter_idx]
     }
-    /// Return the minimum DFA tier that can handle this regex.
+    /// The engine [`MatcherMemory::matcher`] runs this regex on.
+    pub fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    /// Legacy numbered eligibility query: the lowest-numbered tier whose
+    /// eligibility analysis accepts this regex.  It is not the selected
+    /// engine ([`engine`](Self::engine)): Tier 3 is never selected
+    /// automatically, and the grouped NFA, which has no number, comes
+    /// before Tier 4.  Nor is it a speed ranking.
     ///
     /// - `0` = NFA only (e.g. CRLF assertions, zero-width counter bodies)
     /// - `1` = Tier 1+ (counter-free, deferred assertions supported)
@@ -1261,26 +1272,21 @@ impl Regex {
             .filter(|s| matches!(s, State::Assert { kind, .. } if kind.is_dfa_deferrable()))
             .count();
 
-        // -- Execution tier --
-        let execution_tier = if self.dfa_eligible {
-            "Tier 1: Lazy DFA (flat table, no counters, deferred assertions)"
-        } else if self.tier2_eligible {
-            "Tier 2: Differential-counter DFA (fixed-length bodies, O(1) counters)"
-        } else if self.tier3_eligible {
-            if self
-                .tier3_analysis
-                .as_ref()
-                .is_some_and(|a| a.all_counters_rangeable)
-            {
-                "Tier 3: Conditional DFA (non-nested counters, range-compressed)"
-            } else {
-                "Tier 3: Conditional DFA (non-nested counters, per-instance)"
+        // -- Execution --
+        let mut eligible = vec![Engine::Nfa.name().to_string()];
+        for (t, ok) in [
+            (1, self.dfa_eligible),
+            (2, self.tier2_eligible),
+            (3, self.tier3_eligible),
+            (4, self.tier4_eligible),
+        ] {
+            if ok {
+                eligible.push(format!("tier{t}"));
             }
-        } else if self.tier4_eligible {
-            "Tier 4: Counting DFA (flat table + counter programs)"
-        } else {
-            "NFA simulator (general case)"
-        };
+        }
+        if self.grouped_plan().is_ok() {
+            eligible.push(Engine::GroupedNfa.name().to_string());
+        }
 
         // -- Prefilter --
         let prefilter_desc = self.prefilter.to_string();
@@ -1315,8 +1321,10 @@ impl Regex {
             deferred_assertions: n_deferred,
             byte_classes: self.num_byte_classes,
             execution: ExecutionInfo {
-                tier: self.min_tier(),
-                tier_name: execution_tier.to_string(),
+                engine: self.engine.name().to_string(),
+                engine_name: self.engine.description().to_string(),
+                eligible,
+                min_tier: self.min_tier(),
             },
             start_closure: StartClosureInfo {
                 len: self.start_closure.len(),
@@ -1551,12 +1559,79 @@ pub struct RegexConfig {
     /// small patterns; `usize::MAX` never compresses.  Default: 128.
     #[doc(hidden)]
     pub byte_class_min_states: usize,
-    /// Experimental: analyse the compiled NFA for the exact grouped NFA
-    /// backend (`plans/grouped-nfa.md`) and keep its plan, or the reason
-    /// it was rejected, on the regex.  Never changes automatic dispatch;
-    /// the backend runs only through [`GroupedStream`].  Default: `false`.
-    #[doc(hidden)]
-    pub grouped_nfa: bool,
+    /// Whether the grouped NFA takes part in compilation and automatic
+    /// selection ([`Regex::engine`]).  Default: [`GroupedNfaMode::Auto`].
+    pub grouped_nfa: GroupedNfaMode,
+}
+
+/// Whether the grouped NFA (`plans/grouped-nfa.md`) takes part in
+/// compilation and automatic selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GroupedNfaMode {
+    /// Analyse the grouped NFA when neither Tier 1 nor Tier 2 applies, and
+    /// select it when it admits the pattern.  A regex that Tier 1 or 2
+    /// runs carries no grouped plan.
+    #[default]
+    Auto,
+    /// Never analyse it: automatic selection goes on to Tier 4 or the NFA,
+    /// and the grouped NFA cannot be forced.
+    Disabled,
+    /// Always analyse it, also when Tier 1 or Tier 2 is selected, so that
+    /// it can be forced ([`MatcherMemory::matcher_grouped`],
+    /// [`GroupedStream`]) or inspected.  Selection is as with `Auto`.
+    Always,
+}
+
+/// The engine automatic selection runs a regex on, decided once at
+/// compile time ([`Regex::engine`]).
+///
+/// The order: Tier 1, Tier 2, the grouped NFA when it admits the pattern,
+/// Tier 4, the NFA.  Tier 3 is never selected automatically (it is known
+/// to be unsound); [`MatcherMemory::matcher_for_tier`] still runs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Engine {
+    /// Tier 1: lazy DFA.
+    Tier1,
+    /// Tier 2: differential-counter DFA.
+    Tier2,
+    /// The grouped NFA.
+    GroupedNfa,
+    /// Tier 4: counting DFA.
+    Tier4,
+    /// Tier 0: the NFA simulator.
+    Nfa,
+}
+
+impl Engine {
+    /// Short name: `tier1`, `tier2`, `grouped`, `tier4` or `nfa`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Engine::Tier1 => "tier1",
+            Engine::Tier2 => "tier2",
+            Engine::GroupedNfa => "grouped",
+            Engine::Tier4 => "tier4",
+            Engine::Nfa => "nfa",
+        }
+    }
+
+    /// One-line description.
+    pub fn description(self) -> &'static str {
+        match self {
+            Engine::Tier1 => "Tier 1: Lazy DFA (flat table, no counters, deferred assertions)",
+            Engine::Tier2 => {
+                "Tier 2: Differential-counter DFA (fixed-length bodies, O(1) counters)"
+            }
+            Engine::GroupedNfa => "Grouped NFA (flat counters, one count set per state)",
+            Engine::Tier4 => "Tier 4: Counting DFA (flat table + counter programs)",
+            Engine::Nfa => "NFA simulator (general case)",
+        }
+    }
+}
+
+impl fmt::Display for Engine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 impl Default for RegexConfig {
@@ -1567,7 +1642,7 @@ impl Default for RegexConfig {
             merge_repetitions: true,
             max_estimated_states: DEFAULT_MAX_ESTIMATED_STATES,
             byte_class_min_states: DEFAULT_BYTE_CLASS_MIN_STATES,
-            grouped_nfa: false,
+            grouped_nfa: GroupedNfaMode::Auto,
         }
     }
 }
@@ -3069,9 +3144,15 @@ impl RegexBuilder {
             (false, None)
         };
 
-        // Experimental grouped NFA: analysed on the final graph, only on
-        // request.  A rejection leaves everything above usable.
-        let grouped_nfa = self.config.grouped_nfa.then(|| {
+        // Grouped NFA: analysed on the final graph when automatic selection
+        // can reach it (neither Tier 1 nor Tier 2 applies), or always on
+        // request.  A rejection selects the next engine.
+        let analyse_grouped = match self.config.grouped_nfa {
+            GroupedNfaMode::Disabled => false,
+            GroupedNfaMode::Auto => !dfa_eligible && !tier2_eligible,
+            GroupedNfaMode::Always => true,
+        };
+        let grouped_nfa = analyse_grouped.then(|| {
             Box::new(
                 match grouped_nfa::analyze(
                     &self.states,
@@ -3088,7 +3169,26 @@ impl RegexBuilder {
             )
         });
 
+        // The one place automatic selection is decided.  `Disabled` never
+        // analyses the grouped NFA, so it is never admitted then.
+        let grouped_admitted = matches!(
+            grouped_nfa.as_deref(),
+            Some(grouped_nfa::GroupedNfa::Admitted(_))
+        );
+        let engine = if dfa_eligible {
+            Engine::Tier1
+        } else if tier2_eligible {
+            Engine::Tier2
+        } else if grouped_admitted {
+            Engine::GroupedNfa
+        } else if tier4_eligible {
+            Engine::Tier4
+        } else {
+            Engine::Nfa
+        };
+
         Ok(Regex {
+            engine,
             id: NEXT_REGEX_ID.fetch_add(1, Ordering::Relaxed),
             states: StateList(self.states.to_vec().into_boxed_slice()),
             start,
@@ -3675,6 +3775,10 @@ pub struct MatcherMemory {
     /// ([`dfa::DFA_MAX_STATES`]).  See
     /// [`set_dfa_state_cap`](Self::set_dfa_state_cap).
     dfa_state_cap: Option<usize>,
+    /// Worker scratch of the grouped NFA.
+    grouped_scratch: GroupedScratch,
+    /// Stream storage of the grouped NFA, rebound to each regex it runs.
+    grouped_stream: Option<GroupedStream>,
 }
 
 impl MatcherMemory {
@@ -3695,56 +3799,48 @@ impl MatcherMemory {
         self.dfa_state_cap.unwrap_or(dfa::DFA_MAX_STATES)
     }
 
-    /// Create a matcher for the given regex.
-    ///
-    /// Returns an [`AnyMatcher`] that transparently dispatches to the
-    /// lazy DFA (for DFA-eligible patterns) or the NFA simulator.
+    /// Create a matcher for the given regex, on the engine selected when it
+    /// was compiled ([`Regex::engine`]).
     #[inline]
     pub fn matcher<'a>(&'a mut self, regex: &'a Regex) -> AnyMatcher<'a> {
-        if regex.dfa_eligible {
-            // Tier 1: pure DFA (no counters, simple assertions).
-            let cap = self.dfa_state_cap();
-            let cache = self.dfa_cache.get_or_insert_with(Tier1DfaCache::new);
-            cache.set_max_states(cap);
-            cache.prepare(&mut self.dfa_memory, regex);
-            let dfa = DfaMatcher::new(cache, &mut self.dfa_memory, regex);
-            AnyMatcher::Dfa(dfa)
-        } else if regex.tier2_eligible {
-            // Tier 2: DFA + differential counters (non-nested, fixed-length bodies).
-            let analysis = regex
-                .tier2_analysis
-                .as_ref()
-                .expect("tier2_analysis must be present for tier 2 patterns");
-            let cap = self.dfa_state_cap();
-            let cache = self.tier2_cache.get_or_insert_with(Tier2DfaCache::new);
-            cache.set_max_states(cap);
-            cache.prepare(&mut self.dfa_memory, regex, analysis);
-            let dfa = Tier2DfaMatcher::new(cache, &mut self.dfa_memory, regex, analysis);
-            AnyMatcher::Tier2Dfa(dfa)
-        } else if regex.tier3_eligible {
-            // Tier 3: DFA + conditional transitions (non-nested counters).
-            let analysis = regex
-                .tier3_analysis
-                .as_ref()
-                .expect("tier3_analysis must be present for tier 3 patterns");
-            let cap = self.dfa_state_cap();
-            let cache = self.tier3_cache.get_or_insert_with(Tier3DfaCache::new);
-            cache.set_max_states(cap);
-            cache.prepare(&mut self.dfa_memory, regex, analysis);
-            let dfa = Tier3DfaMatcher::new(cache, &mut self.dfa_memory, regex, analysis);
-            AnyMatcher::Tier3Dfa(dfa)
-        } else if regex.tier4_eligible {
-            // Tier 4: DFA + explicit counter contexts.
-            let cache = self
-                .tier4_cache
-                .get_or_insert_with(|| Tier4DfaCache::new(regex.states.len()));
-            cache.prepare(regex);
-            let dfa = Tier4DfaMatcher::new(cache, regex, &mut self.counting_pool);
-            AnyMatcher::Tier4Dfa(dfa)
+        let tier = match regex.engine {
+            Engine::Tier1 => 1,
+            Engine::Tier2 => 2,
+            Engine::Tier4 => 4,
+            Engine::Nfa => 0,
+            Engine::GroupedNfa => {
+                return self
+                    .matcher_grouped(regex)
+                    .expect("a regex that selects the grouped NFA has its plan");
+            }
+        };
+        self.matcher_for_tier(regex, tier)
+            .expect("the selected tier is eligible")
+    }
+
+    /// Create a matcher forced to the grouped NFA.  Fails (it never falls
+    /// back to another engine) when the regex has no grouped plan: it was
+    /// rejected, or not analysed (compile with [`GroupedNfaMode::Always`]
+    /// to force it on a regex that Tier 1 or 2 runs).
+    ///
+    /// The stream storage and scratch are kept in this memory and reused
+    /// from match to match, also across regexes.
+    pub fn matcher_grouped<'a>(
+        &'a mut self,
+        regex: &'a Regex,
+    ) -> Result<AnyMatcher<'a>, GroupedNfaError> {
+        let scratch = &mut self.grouped_scratch;
+        if let Some(stream) = self.grouped_stream.as_mut() {
+            stream.rebind(regex, scratch)?;
         } else {
-            let nfa = self.nfa_matcher(regex);
-            AnyMatcher::Nfa(nfa)
+            self.grouped_stream = Some(GroupedStream::new(regex, scratch)?);
         }
+        let stream = self.grouped_stream.as_mut().expect("bound above");
+        Ok(AnyMatcher::Grouped(GroupedMatcher {
+            regex,
+            stream,
+            scratch,
+        }))
     }
 
     /// Create a matcher forced to a specific execution tier.
@@ -3867,7 +3963,8 @@ impl MatcherMemory {
     }
 }
 
-/// A matcher that dispatches to either the lazy DFA or the NFA simulator.
+/// A matcher on one engine: a DFA tier, the NFA simulator or the grouped
+/// NFA.
 #[allow(clippy::large_enum_variant)]
 pub enum AnyMatcher<'a> {
     /// Lazy DFA (counter-free patterns).
@@ -3880,6 +3977,8 @@ pub enum AnyMatcher<'a> {
     Tier4Dfa(Tier4DfaMatcher<'a>),
     /// NFA simulator path (general case).
     Nfa(NfaMatcher<'a>),
+    /// The grouped NFA.
+    Grouped(GroupedMatcher<'a>),
 }
 
 impl<'a> AnyMatcher<'a> {
@@ -3892,6 +3991,7 @@ impl<'a> AnyMatcher<'a> {
             Self::Tier3Dfa(d) => d.chunk(input),
             Self::Tier4Dfa(d) => d.chunk(input),
             Self::Nfa(n) => n.chunk(input),
+            Self::Grouped(g) => g.chunk(input),
         }
     }
 
@@ -3904,6 +4004,7 @@ impl<'a> AnyMatcher<'a> {
             Self::Tier3Dfa(d) => d.finish(),
             Self::Tier4Dfa(d) => d.finish(),
             Self::Nfa(n) => n.finish(),
+            Self::Grouped(g) => g.finish(),
         }
     }
 
@@ -3916,6 +4017,7 @@ impl<'a> AnyMatcher<'a> {
             Self::Tier3Dfa(d) => d.ismatch(),
             Self::Tier4Dfa(d) => d.ismatch(),
             Self::Nfa(n) => n.ismatch(),
+            Self::Grouped(g) => g.ismatch(),
         }
     }
 }
@@ -3928,6 +4030,7 @@ impl<'a> fmt::Debug for AnyMatcher<'a> {
             Self::Tier3Dfa(d) => f.debug_tuple("AnyMatcher::Tier3Dfa").field(d).finish(),
             Self::Tier4Dfa(d) => f.debug_tuple("AnyMatcher::Tier4Dfa").field(d).finish(),
             Self::Nfa(n) => f.debug_tuple("AnyMatcher::Nfa").field(n).finish(),
+            Self::Grouped(g) => f.debug_tuple("AnyMatcher::Grouped").field(g).finish(),
         }
     }
 }
@@ -3940,6 +4043,7 @@ impl<'a> fmt::Display for AnyMatcher<'a> {
             Self::Tier3Dfa(d) => fmt::Display::fmt(d, f),
             Self::Tier4Dfa(d) => fmt::Display::fmt(d, f),
             Self::Nfa(n) => fmt::Display::fmt(n, f),
+            Self::Grouped(g) => fmt::Display::fmt(g, f),
         }
     }
 }
@@ -5204,6 +5308,59 @@ mod tests {
         );
     }
 
+    /// The automatic matcher ([`MatcherMemory::matcher`]) on one build:
+    /// never Tier 3; listed inputs whole and byte by byte with empty calls,
+    /// `ismatch` after every call against Tier 0's (the unfinished-stream
+    /// reference), and the final answer against the oracle; generated
+    /// inputs whole and byte by byte.  One memory for all of them, reused
+    /// from match to match.
+    fn test_auto(
+        pattern: &str,
+        re: &Regex,
+        oracle: &regex::bytes::Regex,
+        inputs: &[(&str, bool)],
+        generated: &[Vec<u8>],
+        config: &str,
+    ) {
+        let label = format!("`{pattern}` ({config}) automatic {}", re.engine());
+        let mut memory = MatcherMemory::default();
+        let mut reference = MatcherMemory::default();
+        assert!(
+            !matches!(memory.matcher(re), AnyMatcher::Tier3Dfa(_)),
+            "{label}: Tier 3 selected"
+        );
+        for &(input, _) in inputs {
+            let input = input.as_bytes();
+            let expected = oracle.is_match(input);
+            let mut m = memory.matcher(re);
+            m.chunk(input);
+            assert_eq!(m.finish(), expected, "{label} whole {input:?}");
+            let mut m = memory.matcher(re);
+            let mut nfa = reference.matcher_for_tier(re, 0).unwrap();
+            assert_eq!(m.ismatch(), nfa.ismatch(), "{label} {input:?} at start");
+            for (i, b) in input.iter().enumerate() {
+                for c in [&[][..], std::slice::from_ref(b)] {
+                    m.chunk(c);
+                    nfa.chunk(c);
+                    assert_eq!(m.ismatch(), nfa.ismatch(), "{label} {input:?} after {i}");
+                }
+            }
+            m.chunk(&[]);
+            assert_eq!(m.finish(), expected, "{label} bytewise {input:?}");
+        }
+        for input in generated {
+            let expected = oracle.is_match(input);
+            let mut m = memory.matcher(re);
+            m.chunk(input);
+            assert_eq!(m.finish(), expected, "{label} whole {input:?}");
+            let mut m = memory.matcher(re);
+            for b in input.chunks(1) {
+                m.chunk(b);
+            }
+            assert_eq!(m.finish(), expected, "{label} bytewise {input:?}");
+        }
+    }
+
     /// The DFA state caps the tier 1–3 helpers run at: the default, and
     /// the minimum, where the cache is emptied every few bytes.  A result
     /// must not depend on what is cached (Bug 64).
@@ -5518,7 +5675,10 @@ mod tests {
             let generated = generate_nfa_inputs(re, 1000);
             test_generated(pattern, re, &oracle, &generated, &label, !tier3_broken);
 
-            // The experimental grouped NFA, when it admits this build.
+            // Automatic selection, whatever engine it picked.
+            test_auto(pattern, re, &oracle, inputs, &generated, &label);
+
+            // The grouped NFA, when it admits this build.
             crate::grouped_nfa::tests::check_match_test_build(
                 pattern,
                 &config(*unroll, *merge),
@@ -6080,7 +6240,7 @@ mod tests {
         // to detect the nesting.
         test_nested_counters_behind_byte_table {
             pattern: "((ab{1,100}|cb{1,100}|db{1,100})){1,100}",
-            memory: 2341,
+            memory: 2437,
             min_tier: 4,
             max_states: 32_768, // estimated 30,599 states, over the default
             inputs: [
@@ -7517,7 +7677,7 @@ mod tests {
         }
         test_crlf_start_basic {
             pattern: "(?Rm)^abc",
-            memory: 917,
+            memory: 1513,
             min_tier: 0,
             inputs: [
                 ("abc", true),
@@ -7532,7 +7692,7 @@ mod tests {
         }
         test_crlf_end_basic {
             pattern: "(?Rm)abc$",
-            memory: 917,
+            memory: 3977,
             min_tier: 0,
             inputs: [
                 ("abc", true),
@@ -7547,7 +7707,7 @@ mod tests {
         }
         test_crlf_both_anchors {
             pattern: "(?Rm)^abc$",
-            memory: 950,
+            memory: 1646,
             min_tier: 0,
             inputs: [
                 ("abc", true),
@@ -7565,7 +7725,7 @@ mod tests {
         }
         test_crlf_empty_lines {
             pattern: "(?Rm)^$",
-            memory: 851,
+            memory: 1247,
             min_tier: 0,
             inputs: [
                 ("", true),
@@ -7579,7 +7739,7 @@ mod tests {
         }
         test_crlf_multiline_vs_lf_1 {
             pattern: "(?Rm)^abc$",
-            memory: 950,
+            memory: 1646,
             min_tier: 0,
             inputs: [("\r\nabc\r\n", true)],
         }
@@ -7591,7 +7751,7 @@ mod tests {
         }
         test_crlf_with_dot_plus {
             pattern: "(?Rm)^.+$",
-            memory: 884,
+            memory: 1380,
             min_tier: 0,
             inputs: [
                 ("abc", true),
@@ -7605,7 +7765,7 @@ mod tests {
         }
         test_crlf_with_counting {
             pattern: r#"(?Rm)^\d{2,4}$"#,
-            memory: 983,
+            memory: 1779,
             min_tier: 0,
             inputs: [
                 ("12", true),
@@ -7617,25 +7777,25 @@ mod tests {
         }
         test_crlf_bare_cr_as_line_terminator {
             pattern: "(?Rm)^abc$",
-            memory: 950,
+            memory: 1646,
             min_tier: 0,
             inputs: [("xxx\rabc\ryyy", true), ("xxx\rabc", true), ("abc\ryyy", true)],
         }
         test_crlf_end_before_cr {
             pattern: "(?Rm)abc$",
-            memory: 917,
+            memory: 3977,
             min_tier: 0,
             inputs: [("abc\r", true), ("abc\r\n", true), ("abc\rxxx", true)],
         }
         test_crlf_start_after_lf_not_crlf_middle {
             pattern: "(?Rm)^x",
-            memory: 851,
+            memory: 1247,
             min_tier: 0,
             inputs: [("\nx", true), ("\r\nx", true), ("\rx", true)],
         }
         test_crlf_mixed_terminators {
             pattern: "(?Rm)^abc$",
-            memory: 950,
+            memory: 1646,
             min_tier: 0,
             inputs: [
                 ("xxx\nabc\ryyy", true),
@@ -7647,7 +7807,7 @@ mod tests {
         }
         test_crlf_end_only {
             pattern: "(?Rm)$",
-            memory: 818,
+            memory: 1114,
             min_tier: 0,
             inputs: [
                 ("", true),
@@ -7659,7 +7819,7 @@ mod tests {
         }
         test_crlf_start_only {
             pattern: "(?Rm)^",
-            memory: 818,
+            memory: 1114,
             min_tier: 0,
             inputs: [
                 ("", true),
@@ -7904,7 +8064,7 @@ mod tests {
         // end-of-input after word chars should fail.
         test_tier3_b_neg_eoi_counter {
             pattern: r#"^(ab?){3,34}\B$"#,
-            memory: 1059,
+            memory: 2055,
             min_tier: 3,
             inputs: [
                 ("aaa", false),
@@ -8451,7 +8611,7 @@ mod tests {
         // The increment sits behind `\B`: not a tier 2 pattern (Bug 68).
         test_counter_body_non_word_boundary_3 {
             pattern: r"^(.\B){1,12}$",
-            memory: 991,
+            memory: 1787,
             min_tier: 0,
             inputs: [
                 (" ", true),
@@ -10390,7 +10550,7 @@ mod tests {
         // analysis is added.
         test_tier2_overlap_safe_word_digit {
             pattern: r"^\w{300}\d{200}$",
-            memory: 1060,
+            memory: 2056,
             min_tier: 3,
             inputs: [
                 ("aaa111", false),             // too short
@@ -10400,7 +10560,7 @@ mod tests {
 
         test_tier2_overlap_safe_hex_subset {
             pattern: r"^[0-9A-F]{400}[A-F]{200}$",
-            memory: 1092,
+            memory: 2088,
             min_tier: 3,
             inputs: [
                 ("AABB", false),               // too short
@@ -10409,7 +10569,7 @@ mod tests {
 
         test_tier2_overlap_safe_separator {
             pattern: r"^\w{300}-\d{200}$",
-            memory: 1094,
+            memory: 2190,
             min_tier: 3,
             inputs: [
                 ("aaa-111", false),            // too short
@@ -10421,7 +10581,7 @@ mod tests {
         // Variable split over overlapping alphabets.
         test_tier2_overlap_unsafe_variable {
             pattern: r"^\w{100,300}\d{100,200}$",
-            memory: 1060,
+            memory: 2056,
             min_tier: 3,
             inputs: [
                 ("aaa111", false),
@@ -10594,7 +10754,7 @@ mod tests {
         // The motivating pattern from the rebar benchmarks.
         test_inner_unroll_ip_pattern {
             pattern: r"(?i)(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}|(?:[0-9a-f]{1,4}::?){2,7}[0-9a-f]{1,4}):$",
-            memory: 1841,
+            memory: 7817,
             min_tier: 3,
             inputs: [
                 ("192.168.1.1:", true),
@@ -10684,7 +10844,7 @@ mod tests {
         // where the 'a' origin dies on non-'a' bytes.
         test_tier3_varlen_alternation_body {
             pattern: "(ab|a){1,100}c",
-            memory: 1025,
+            memory: 4409,
             min_tier: 3,
             inputs: [
                 ("ac", true),
@@ -10701,7 +10861,7 @@ mod tests {
         // All bytes match at every origin, so ranges grow uniformly.
         test_tier3_varlen_dot_range_body {
             pattern: "(.{1,5}){1,100}z",
-            memory: 1059,
+            memory: 4551,
             min_tier: 3,
             inputs: [
                 ("az", true),
@@ -10716,7 +10876,7 @@ mod tests {
         // any byte.  The 'b' branch bypasses origin 1 entirely.
         test_tier3_varlen_mixed_selectivity {
             pattern: "(a.|b){1,50}c",
-            memory: 1025,
+            memory: 4409,
             min_tier: 3,
             inputs: [
                 ("axc", true),
@@ -10731,7 +10891,7 @@ mod tests {
         // range merge at 10 origins, 1000 max iterations.
         test_tier3_varlen_large_body_high_count {
             pattern: ".{0,1000}(.{1,10}){0,1000}c",
-            memory: 1400,
+            memory: 5972,
             min_tier: 3,
             max_states: 16_384, // estimated 12,002 states, over the default
             inputs: [
@@ -10763,7 +10923,7 @@ mod tests {
         // independently with its own set of origin ranges.
         test_tier3_varlen_two_counters {
             pattern: "(ab|a){1,50}(xy|x){1,50}z",
-            memory: 1230,
+            memory: 5262,
             min_tier: 3,
             inputs: [
                 ("axz", true),
@@ -10784,7 +10944,7 @@ mod tests {
         // lacked dedup, causing the counter to never reach its minimum.)
         test_tier3_varlen_plus_body_dedup {
             pattern: ".a+{9,28}",
-            memory: 923,
+            memory: 3983,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaaa", true),      // 10 a's: . + a+{9} (each a+ = 1 a)
@@ -11136,7 +11296,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_varlen_body {
             pattern: r"^...\Be{6,16}{6,40}$",
-            memory: 1603,
+            memory: 4199,
             min_tier: 3,
             inputs: [
                 ("aaaeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", true), // 3+36=39
@@ -11147,7 +11307,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_two_counters {
             pattern: r"^.{3,5}\Be{6,16}{6,40}c{6,33}$",
-            memory: 1774,
+            memory: 4870,
             min_tier: 3,
             inputs: [
                 // 3 a's + 36 e's + 6 c's = 45: min scenario (3 prefix, 6*6 e body, 6 c's)
@@ -11241,7 +11401,7 @@ mod tests {
         // counters to complete).
         test_tier3_with_break_counter_free_mae_false_positive {
             pattern: r"^(.{10,40}{2,2})?a?$",
-            memory: 1117,
+            memory: 1213,
             min_tier: 4,
             inputs: [
                 ("", true),             // optional group skips, a? skips, $ matches
@@ -11258,7 +11418,7 @@ mod tests {
         // original fuzz artifact).
         test_tier3_with_break_counter_free_mae_8_counters {
             pattern: r"^(.{7,40}{8,8})?a?$",
-            memory: 1117,
+            memory: 1213,
             min_tier: 4,
             inputs: [
                 ("", true),
@@ -11505,7 +11665,7 @@ mod tests {
         // — producing false negatives on long inputs.
         test_tier3_instance_dedup_self_loop {
             pattern: r".a+{9,28}",
-            memory: 923,
+            memory: 3983,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaa", false),
@@ -11524,7 +11684,7 @@ mod tests {
         // The `?` makes every input match via the empty-to-`$` path.
         test_tier3_counter_free_mae_optional_group {
             pattern: r"([b-e].+{4,43})?$",
-            memory: 1023,
+            memory: 1819,
             min_tier: 3,
             inputs: [
                 ("zzz", true),
@@ -11565,7 +11725,7 @@ mod tests {
         // flag must be replaced by the clean chain's flag.
         test_tier3_contaminated_no_break_is_match {
             pattern: r"^.{0,46}x{10,35}f",
-            memory: 1094,
+            memory: 2190,
             min_tier: 3,
             inputs: [
                 ("xxxxxxxxxf", false),          // 9 x's — c1 max count 9 < min 10
@@ -12093,7 +12253,7 @@ mod tests {
         // emitted as PendingEffect Match atoms via origin_effects.
         test_tier3_contaminated_deferred_assert {
             pattern: r"^.{0,44}1{3,38}f\ba?$",
-            memory: 1230,
+            memory: 2726,
             min_tier: 3,
             inputs: [
                 ("111f", true),                 // c1=3 ≥ min, break, 'f' consumed, \b passes at EOI
@@ -12345,7 +12505,7 @@ mod tests {
         // target reached Match directly were never detected.
         test_tier3_byte_table_tail_direct_match {
             pattern: r"c{0,32}.{6,36}a?c?x",
-            memory: 2220,
+            memory: 6040,
             min_tier: 3,
             inputs: [
                 ("aaaaaax", true),      // Bug 47: ByteTable tail 'x' → Match
@@ -12425,7 +12585,7 @@ mod tests {
         // Fix: only remap when the target is a consuming state.
         test_tier3_resolved_seed_nonconsume_remap {
             pattern: r"^(\b(0*a{2,8}){7,7})?$",
-            memory: 1331,
+            memory: 3127,
             min_tier: 3,
             inputs: [
                 ("00aa00aa00aa00aa00aa00aa00aa", true),  // Bug 50: 7 groups of "00aa"
@@ -12734,7 +12894,7 @@ mod tests {
         // {1,10} uses a single counter → Tier 3 (not Tier 4).
         test_dense_unroll_motivating_path_pattern {
             pattern: "(?i)file[^/]{1,20}(/[^/]{1,20}){1,10}",
-            memory: 2417,
+            memory: 10121,
             min_tier: 3,
             inputs: [
                 ("fileA/B", true),
@@ -12749,7 +12909,7 @@ mod tests {
         // body with out_exit feeds CInc correctly.
         test_dense_unroll_inside_counter {
             pattern: "(.{1,5}){1,100}z",
-            memory: 1059,
+            memory: 4551,
             min_tier: 3,
             inputs: [
                 ("az", true),
@@ -12819,7 +12979,7 @@ mod tests {
         // candidate or a completed first anchor in between.
         test_reengage_two_gaps {
             pattern: "foo.{0,40}bar.{0,40}baz",
-            memory: 1366,
+            memory: 5830,
             min_tier: 3,
             inputs: [
                 ("foobarbaz", true),
@@ -13009,7 +13169,7 @@ mod tests {
         // must never return to it mid-stream.
         test_reengage_start_assert_alt {
             pattern: "^foo.{0,40}bar|baz.{0,40}qux",
-            memory: 1536,
+            memory: 3932,
             min_tier: 3,
             inputs: [
                 ("foobar", true),
@@ -13030,7 +13190,7 @@ mod tests {
         // prefilter stays one-shot and must still be exact.
         test_reengage_counter_at_start {
             pattern: "(ab|c){2,40}x",
-            memory: 1025,
+            memory: 4409,
             min_tier: 3,
             inputs: [
                 ("abcx", true),
@@ -13177,7 +13337,7 @@ mod tests {
         // that step, not sit at the body's first state.
         test_tier3_resolved_seed_split_target {
             pattern: "^\\b(1c?e){2,40}$",
-            memory: 1093,
+            memory: 2189,
             min_tier: 3,
             inputs: [
                 ("1e1e", true),
@@ -13199,7 +13359,7 @@ mod tests {
         // Bug 55: same, with a self-looping first body state (`b+`).
         test_tier3_resolved_seed_loop_target {
             pattern: " \\b(b+ad?a{3,14}1?){9,43}d$",
-            memory: 1671,
+            memory: 7107,
             min_tier: 3,
             inputs: [
                 (" baaaabaaaabaaaabaaaabaaaabaaaabaaaabaaaabaaaad", true),
@@ -13235,7 +13395,7 @@ mod tests {
         // byte, at exactly the minimum count.
         test_tier3_resolved_seed_optional_prefix {
             pattern: "^(\\b(f?y*1c?e{6,12}){7,40}(e\\b.?[aa]?a?)?)?$",
-            memory: 2967,
+            memory: 6467,
             min_tier: 3,
             inputs: [
                 ("1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee1eeeeee", true),
@@ -13430,7 +13590,7 @@ mod tests {
         // and the pattern runs on the NFA.
         test_nfa_nullable_counter_body_kept_counter {
             pattern: "(e?){40}d",
-            memory: 951,
+            memory: 1047,
             min_tier: 0,
             inputs: [
                 ("d", true),
@@ -13444,7 +13604,7 @@ mod tests {
         }
         test_nfa_nullable_counter_body_then_counter {
             pattern: "((e*|[y])){9,41}d{4,47}",
-            memory: 1084,
+            memory: 1180,
             min_tier: 0,
             inputs: [
                 ("dddd", true),
@@ -13457,7 +13617,7 @@ mod tests {
         }
         test_nfa_nullable_nested_counter_body {
             pattern: "a*{10,10}{1,47}.+ *",
-            memory: 1611,
+            memory: 1707,
             min_tier: 0,
             inputs: [
                 ("b", true),
@@ -13484,7 +13644,7 @@ mod tests {
         }
         test_nfa_unbounded_nullable_counter_body_kept_counter {
             pattern: "(e*|y){40,}d",
-            memory: 1017,
+            memory: 1113,
             min_tier: 0,
             inputs: [
                 ("d", true),
@@ -13497,7 +13657,7 @@ mod tests {
         }
         test_nfa_unbounded_nested_nullable_counter_bodies {
             pattern: "^((e*){30,}f?){30,}d$",
-            memory: 1150,
+            memory: 1246,
             min_tier: 0,
             inputs: [
                 ("d", true),
@@ -13527,7 +13687,7 @@ mod tests {
         // inner counter select tier 4 with the default settings.
         test_tier4_unbounded_inner_counter_saturates {
             pattern: "(?:a{40,}b){2,5}c",
-            memory: 1018,
+            memory: 1114,
             min_tier: 4,
             inputs: [
                 ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabc", true),
@@ -13765,7 +13925,7 @@ mod tests {
         }
         test_counter_body_dollar_variable_length_kept_counter {
             pattern: "(?:a$|bb){40,60}",
-            memory: 1025,
+            memory: 4409,
             min_tier: 4,
             inputs: [
                 ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false),
@@ -13805,7 +13965,7 @@ mod tests {
         }
         test_counter_body_branch_ends_in_assertion_kept_counter {
             pattern: r"^(?:a\B|b){40,60}c",
-            memory: 1059,
+            memory: 2055,
             min_tier: 0,
             inputs: [
                 ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbac", true),
@@ -13816,7 +13976,7 @@ mod tests {
         }
         test_counter_body_branch_ends_in_assertion_max {
             pattern: r"^(?:a\B|b){1,40}c",
-            memory: 1059,
+            memory: 2055,
             min_tier: 0,
             inputs: [
                 ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbac", false),
@@ -13826,7 +13986,7 @@ mod tests {
         }
         test_counter_body_assertion_after_byte_entered_by_body_byte {
             pattern: r"b(?:[ab]\B){40}c",
-            memory: 1023,
+            memory: 4299,
             min_tier: 0,
             inputs: [
                 ("babaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac", false),
@@ -13837,7 +13997,7 @@ mod tests {
         }
         test_counter_body_assertion_after_byte_range {
             pattern: r"a(?:[ab]\B){1,40}c",
-            memory: 1023,
+            memory: 4299,
             min_tier: 0,
             inputs: [
                 ("aabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc", true),
@@ -13848,7 +14008,7 @@ mod tests {
         }
         test_counter_body_assertion_then_assertion_on_break {
             pattern: r"(?:a\B){1,40}\bc",
-            memory: 991,
+            memory: 4267,
             min_tier: 0,
             inputs: [
                 ("ac", false),
@@ -13858,7 +14018,7 @@ mod tests {
         }
         test_counter_body_assertion_then_multiline_end {
             pattern: r"(?:a\b){1,40}(?m:$)",
-            memory: 957,
+            memory: 4125,
             min_tier: 0,
             inputs: [
                 ("a\n", true),
@@ -13869,7 +14029,7 @@ mod tests {
         }
         test_counter_body_dollar_one_byte {
             pattern: "x(?:a$){1,40}",
-            memory: 957,
+            memory: 4125,
             min_tier: 4,
             inputs: [
                 ("xa", true),
@@ -13880,7 +14040,7 @@ mod tests {
         }
         test_counter_body_dollar_branch {
             pattern: "(?:a$|b){40,60}",
-            memory: 991,
+            memory: 4267,
             min_tier: 4,
             inputs: [
                 ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba", true),
@@ -13908,7 +14068,7 @@ mod tests {
         }
         test_tier3_broken_line_start_before_increment_kept_counter {
             pattern: r"(?:a(?m:^)|\n\n){20,30}c",
-            memory: 1059,
+            memory: 4551,
             min_tier: 3,
             tier3_broken: true,
             inputs: [
@@ -13924,7 +14084,7 @@ mod tests {
         // for bodies where it is not.
         test_counter_body_line_start_before_byte_stays_tier3 {
             pattern: r"(?:(?m:^)a+\n){20,30}c",
-            memory: 991,
+            memory: 1787,
             min_tier: 3,
             inputs: [
                 ("a\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\nc", true),
@@ -13938,7 +14098,7 @@ mod tests {
         // entries below.
         test_counter_body_line_start_between_bytes_stays_tier3 {
             pattern: r"(?:\n(?m:^)a|b){20,30}c",
-            memory: 1059,
+            memory: 4551,
             min_tier: 3,
             inputs: [
                 ("\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\nac", true),
@@ -13968,7 +14128,7 @@ mod tests {
         // word byte.  Here the match itself, below a second counter.
         test_line_start_after_counter_break {
             pattern: r"(?:ab|\n){20,30}(?m:^)",
-            memory: 1025,
+            memory: 4409,
             min_tier: 3,
             inputs: [
                 ("ababababababababababababababababababab\nx", true),
@@ -13983,7 +14143,7 @@ mod tests {
         }
         test_line_start_between_counters {
             pattern: r"(?:a|\n){40,60}(?m:^)(?:c|bb){20,30}",
-            memory: 1160,
+            memory: 4868,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ncccccccccccccccccccc", true),
@@ -14000,7 +14160,7 @@ mod tests {
         // a tier 3 pattern panicked when the pattern was compiled.
         test_line_start_behind_byte_before_counter {
             pattern: r"\n(?m:^)(?:a|bb){20,30}c",
-            memory: 1093,
+            memory: 4693,
             min_tier: 3,
             inputs: [
                 ("\naaaaaaaaaaaaaaaaaaaac", true),
@@ -14014,7 +14174,7 @@ mod tests {
         }
         test_line_start_behind_byte_after_counter {
             pattern: r"(?:a|bb){20,30}\n(?m:^)c",
-            memory: 1093,
+            memory: 4693,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaaaaaaaaaaaaa\nc", true),
@@ -14028,7 +14188,7 @@ mod tests {
         }
         test_line_start_never_holds_after_counter {
             pattern: r"(?:a|bb){20,30}a(?m:^)c",
-            memory: 1093,
+            memory: 4693,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaaaaaaaaaaaaaac", false),
@@ -14038,7 +14198,7 @@ mod tests {
         }
         test_text_start_never_holds_after_counter {
             pattern: r"(?:a|bb){20,30}a^c",
-            memory: 1093,
+            memory: 4693,
             min_tier: 3,
             inputs: [
                 ("aaaaaaaaaaaaaaaaaaaaac", false),
@@ -14087,7 +14247,7 @@ mod tests {
         // not an iteration; tier 3 counts 20 of them.
         test_tier3_broken_line_start_between_body_bytes {
             pattern: r"(?:(?:px(?m:^)|x)a){20,30}c",
-            memory: 1093,
+            memory: 4693,
             min_tier: 3,
             tier3_broken: true,
             inputs: [
@@ -14103,7 +14263,7 @@ mod tests {
         // after `b` as well.
         test_tier3_broken_line_start_in_front_of_body {
             pattern: r"(?:(?m:^)[ab]+[b\n]){20,30}c",
-            memory: 1055,
+            memory: 1851,
             min_tier: 3,
             tier3_broken: true,
             inputs: [
@@ -14208,8 +14368,10 @@ mod tests {
             long.extend_from_slice(tail);
 
             let mut memory = MatcherMemory::default();
+            // Forced: automatic selection runs the Tier 3 pattern on the
+            // grouped NFA.
             let run = |memory: &mut MatcherMemory, input: &[u8], bytewise: bool| {
-                let mut m = memory.matcher(&re);
+                let mut m = memory.matcher_for_tier(&re, tier).unwrap();
                 if bytewise {
                     for b in input {
                         m.chunk(std::slice::from_ref(b));
@@ -15234,7 +15396,7 @@ mod tests {
             Err(_) => return,
         };
         let mut builder = RegexBuilder::default();
-        builder.config_mut().grouped_nfa = true;
+        builder.config_mut().grouped_nfa = GroupedNfaMode::Always;
         let re = match builder.build(&hir) {
             Ok(r) => r,
             Err(_) => return,
@@ -15305,7 +15467,7 @@ mod tests {
                     );
                 }
             }
-            // The experimental grouped NFA, when it admits the pattern.
+            // The grouped NFA, when it admits the pattern.
             if let Some(grouped) = re.grouped_is_match(&mut grouped_scratch, input) {
                 assert_eq!(
                     grouped,
@@ -15359,7 +15521,7 @@ mod tests {
                         );
                     }
                 }
-                // The experimental grouped NFA, when it admits the pattern.
+                // The grouped NFA, when it admits the pattern.
                 if let Some(grouped) = re_no_unroll.grouped_is_match(&mut grouped_scratch, input) {
                     assert_eq!(
                         grouped,
@@ -15428,7 +15590,7 @@ mod tests {
                 None => return Ok(()),
             };
             let mut builder = RegexBuilder::default();
-            builder.config_mut().grouped_nfa = true;
+            builder.config_mut().grouped_nfa = GroupedNfaMode::Always;
             let re = match builder.build(&hir) {
                 Ok(r) => r,
                 Err(_) => return Ok(()),
@@ -15455,7 +15617,7 @@ mod tests {
                         );
                     }
                 }
-                // The experimental grouped NFA, when it admits the pattern.
+                // The grouped NFA, when it admits the pattern.
                 if let Some(grouped) = re.grouped_is_match(&mut grouped_scratch, input) {
                     assert_eq!(
                         grouped, nfa_result,

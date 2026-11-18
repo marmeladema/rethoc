@@ -705,6 +705,9 @@ cases.
 
 ### P5: automatic selection — proposed implementation contract
 
+Status: implemented as specified (see "P5 implementation notes" at the end
+of this section). The contract below is kept as written.
+
 This is the implementor handoff for the next change, not a claim that dispatch
 has already changed. It supersedes the earlier opt-in-only requirement for
 P0–P4. The initial policy is deliberately structural: no timing-derived count
@@ -804,6 +807,61 @@ must continue running the original NFA as an independent reference.
 Deliver selection, configuration/API integration, diagnostics and regression
 coverage together. Sparse count sets, changing Tier 1/2 precedence, and runtime
 adaptation remain separate follow-ups requiring their own evidence.
+
+#### P5 implementation notes
+
+- `RegexConfig::grouped_nfa` is a `GroupedNfaMode`: `Auto` (default),
+  `Disabled`, `Always`. Under `Auto` the plan is built only when neither
+  Tier 1 nor Tier 2 is eligible; a rejection is kept on the regex (96
+  bytes) so that diagnostics can say why.
+- `RegexBuilder::build` computes `Engine` (`Tier1`, `Tier2`, `GroupedNfa`,
+  `Tier4`, `Nfa`) once; `Regex::engine()` reads it; `MatcherMemory::matcher`
+  dispatches on it (numbered tiers through `matcher_for_tier`), so there is
+  no second copy of the order. `min_tier()` is unchanged and documented as
+  the legacy eligibility query.
+- `MatcherMemory` owns a grouped scratch and one stream, rebound to each
+  regex it runs (`GroupedStream::rebind` reuses the allocation when its
+  capacity suffices, and for the same regex only clears the active rows,
+  like `reset`); `AnyMatcher::Grouped` wraps them.
+  `MatcherMemory::matcher_grouped` forces the grouped NFA and fails rather
+  than falling back. `GroupedStream` with a separate `GroupedScratch` stays
+  available for independently managed streams.
+- Diagnostics: `info` reports the selected engine, every eligible engine
+  and the legacy `min_tier`; `dump` reports the selected engine; checker
+  backend lists add `auto=<engine>`; `match` reports the engine it ran.
+- Tests: every selection branch on actual compiled eligibility, Tier 3
+  never selected nor its matcher returned, the three modes, forced
+  selection without fallback, explicit Tier 0 as the reference,
+  diagnostics, one memory reused across regexes of several engines
+  (grouped storage kept across a smaller plan), and in every `match_tests!`
+  build the automatic matcher whole, bytewise with empty calls (`ismatch`
+  against Tier 0 after each call) and on the generated inputs. One test
+  that measured the Tier 3 cache through `matcher()` now forces Tier 3.
+- Memory: 71 `memory:` values changed, each by its regex's grouped bytes:
+  62 entries now select the grouped NFA and carry its plan (count-free
+  tables included), 9 carry a rejection record.
+- The `reengage_profile` gate (Callgrind, against `main`) regresses on 4
+  of its 19 cases, as accepted when P5 was decided: the two
+  dense-candidate cases (+43% and +80% instructions) and rule and gap text
+  (+14-17%). Seven `tier3_*` cases improve, the no-prefilter ones by more
+  than 12x in instructions; the Tier 1 and Tier 2 cases and controls are
+  unchanged. The case names still say `tier3`: they keep their
+  `min_tier()` assertions and now measure automatic selection.
+  After the review fixes (count-free runs that write the rows once), the
+  same gate against `main`: `tier3_dense_candidates` +3.2% instructions,
+  rule and gap text +0.9% and +1.2%, `tier3_candidate_run` -32%; every
+  case is within the 5% instruction limit. `tier3_dense_candidates` still
+  mispredicts 17x more conditional branches than Tier 3 (66K against
+  3.9K, halved from 132K), over the gate's 100% limit: its frontier
+  follows random input, as Tier 2's dense case does (66K). The counting
+  probe: count-free families 5-35% faster than before the fixes; the
+  counter-heavy ones at bound 1000 3-11% slower in time with the same
+  instruction count (code layout, as above).
+- Not established: a global throughput optimum, readiness for hundreds of
+  interleaved rules or streams, allocation counts, or successful-scan and
+  reset costs beyond the probe's unsuccessful scans. A `MatcherMemory`
+  shared between regexes on two tiers among 1-3 still panics (issue #5,
+  open), independently of this change.
 
 ## 8. Test and measurement matrix
 

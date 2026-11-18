@@ -29,9 +29,16 @@ Check every change against these.
 
 ## Tiers
 
-Eligibility is decided per tier at compile time from pattern analysis.
-`Regex::min_tier()` is the fastest eligible tier, and
-`MatcherMemory::matcher_for_tier()` refuses an ineligible one.
+Eligibility is decided per tier at compile time from pattern analysis,
+and so is the engine automatic selection runs (`Regex::engine()`,
+`MatcherMemory::matcher()`): Tier 1, Tier 2, the grouped NFA when it
+admits the pattern, Tier 4, the NFA, in that order. **Tier 3 is never
+selected automatically** (it is unsound, see below); it stays eligible and
+`MatcherMemory::matcher_for_tier()` still runs it, for research and
+differential testing. `Regex::min_tier()` is the legacy numbered
+eligibility query: the lowest-numbered eligible tier, not the selected
+engine and not a speed ranking. `matcher_for_tier()` refuses an
+ineligible tier.
 
 - **0** — NFA simulation. Always available; the reference.
 - **1** — lazy DFA, counter-free patterns.
@@ -46,14 +53,17 @@ Eligibility is decided per tier at compile time from pattern analysis.
   defect; record it (see below).
 - **4** — counter programs, nested repetitions.
 
-**Grouped NFA** (experimental, `rethoc-engine/src/grouped_nfa/`,
-`plans/grouped-nfa.md`): not a tier and never chosen by dispatch. It
-runs only when a regex is compiled with `RegexConfig::grouped_nfa` and
-driven through `GroupedStream`. It keeps one bitset of counts per NFA
-state instead of one thread per count, and admits flat counters (no
-nesting, no zero-width cycle, frontier within 8,192 words). It must
-agree with the NFA exactly. The tests, the checking commands, the
-proptests and the cargo-fuzz targets run it on everything it admits.
+**Grouped NFA** (`rethoc-engine/src/grouped_nfa/`, `plans/grouped-nfa.md`):
+not a numbered tier. It keeps one bitset of counts per NFA state instead
+of one thread per count, and admits flat counters (no nesting, no
+zero-width cycle, frontier within 8,192 words). `RegexConfig::grouped_nfa`
+(`GroupedNfaMode`): `Auto` (default) analyses it when neither Tier 1 nor
+Tier 2 applies and selects it when admitted; `Disabled` never does;
+`Always` also analyses it for Tier 1/2 regexes so that it can be forced
+(`MatcherMemory::matcher_grouped()`, `GroupedStream`). It must agree with
+the NFA exactly. The tests, the checking commands, the proptests and the
+cargo-fuzz targets run it on everything it admits. `MatcherMemory` shared
+between regexes on two different tiers among 1–3 panics (issue #5, open).
 
 Repetitions are unrolled up to `max_unroll_states` and same-body
 repetitions merged, so a pattern may need counters only with unrolling or
@@ -103,7 +113,7 @@ cargo run --release -- match --debug --chunk-size 1 '<pattern>' '<input>'
 cargo run --release -- match --tier 3 --unroll-limit 0 --no-merge '<pattern>' '<input>'
 cargo run --release -- dump --dfa '<pattern>'  # NFA, classes, tier analysis
 cargo run --release -- match --grouped-nfa --debug --chunk-size 1 '<pattern>' '<input>'  # grouped rows per step
-cargo run --release -- info --grouped-nfa '<pattern>'  # grouped admission, plan and stream sizes
+cargo run --release -- info --grouped-nfa '<pattern>'  # selected engine, grouped admission, plan and stream sizes
 ```
 
 `--debug` prints matcher state after every chunk. Run the same input with

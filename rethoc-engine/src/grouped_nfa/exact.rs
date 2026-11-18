@@ -644,8 +644,10 @@ impl GroupedScratch {
 #[derive(Debug)]
 pub struct GroupedStream {
     regex_id: u64,
-    raw: Box<[u64]>,
-    raw_active: Box<[u64]>,
+    /// Exactly the plan's words long.  A `Vec` so that
+    /// [`rebind`](Self::rebind) can reuse the allocation for another regex.
+    raw: Vec<u64>,
+    raw_active: Vec<u64>,
     /// Active raw rows: none means idle.
     live: u32,
     /// Every active raw row holds exactly bit 0 (kept exactly by every
@@ -658,15 +660,18 @@ pub struct GroupedStream {
 }
 
 impl GroupedStream {
-    /// A fresh stream for `regex`, which must have been compiled with
-    /// [`RegexConfig::grouped_nfa`](crate::RegexConfig::grouped_nfa) and
-    /// admitted.
+    /// A fresh stream for `regex`, whose grouped NFA must have been analysed
+    /// and admitted.  Automatic selection analyses it only for regexes that
+    /// Tier 1 and Tier 2 cannot run; compile with
+    /// [`GroupedNfaMode::Always`](crate::GroupedNfaMode::Always) to have it
+    /// for every regex.  Otherwise this returns
+    /// [`GroupedNfaError::NotRequested`] (or `Rejected`).
     pub fn new(regex: &Regex, scratch: &mut GroupedScratch) -> Result<Self, GroupedNfaError> {
         let plan = regex.grouped_plan()?;
         let mut stream = Self {
             regex_id: regex.id,
-            raw: vec![0; plan.words()].into_boxed_slice(),
-            raw_active: vec![0; plan.active_words()].into_boxed_slice(),
+            raw: vec![0; plan.words()],
+            raw_active: vec![0; plan.active_words()],
             live: 0,
             unit: true,
             prev: None,
@@ -691,6 +696,36 @@ impl GroupedStream {
         self.finished = false;
         scratch.prepare(plan);
         self.provisional(plan, scratch, Boundary::UnknownNext);
+    }
+
+    /// Make this a fresh stream for `regex`, which may be another regex
+    /// than the one it was made for, reusing the allocation when its
+    /// capacity suffices.
+    pub fn rebind(
+        &mut self,
+        regex: &Regex,
+        scratch: &mut GroupedScratch,
+    ) -> Result<(), GroupedNfaError> {
+        let plan = regex.grouped_plan()?;
+        if regex.id == self.regex_id {
+            // Clears only the active rows.
+            self.reset(regex, scratch);
+            return Ok(());
+        }
+        self.regex_id = regex.id;
+        self.raw.clear();
+        self.raw.resize(plan.words(), 0);
+        self.raw_active.clear();
+        self.raw_active.resize(plan.active_words(), 0);
+        self.live = 0;
+        self.unit = true;
+        self.prev = None;
+        self.at_start = true;
+        self.matched = false;
+        self.finished = false;
+        scratch.prepare(plan);
+        self.provisional(plan, scratch, Boundary::UnknownNext);
+        Ok(())
     }
 
     /// Feed the next bytes of the input.
@@ -940,9 +975,10 @@ impl GroupedStream {
         self.matched
     }
 
-    /// Bytes owned by this stream ([`GroupedNfaPlan::stream_bytes`]).
+    /// Bytes owned by this stream: [`GroupedNfaPlan::stream_bytes`] for a
+    /// new stream, more after [`rebind`](Self::rebind) to a smaller plan.
     pub fn memory_bytes(&self) -> usize {
-        size_of::<Self>() + (self.raw.len() + self.raw_active.len()) * size_of::<u64>()
+        size_of::<Self>() + (self.raw.capacity() + self.raw_active.capacity()) * size_of::<u64>()
     }
 
     /// A displayable view of the raw rows.
@@ -1081,6 +1117,47 @@ impl GroupedNfaPlan {
     /// ([`GroupedScratch::memory_bytes`]).
     pub(crate) fn scratch_bytes(&self) -> usize {
         (self.words() + self.active_words()) * size_of::<u64>()
+    }
+}
+
+/// A grouped NFA stream with the regex and the scratch it runs with: what
+/// [`AnyMatcher`](crate::AnyMatcher) holds for the grouped NFA.  Made by
+/// [`MatcherMemory::matcher`](crate::MatcherMemory::matcher) and
+/// [`matcher_grouped`](crate::MatcherMemory::matcher_grouped), which keep
+/// the stream storage and scratch.
+pub struct GroupedMatcher<'a> {
+    pub(crate) regex: &'a Regex,
+    pub(crate) stream: &'a mut GroupedStream,
+    pub(crate) scratch: &'a mut GroupedScratch,
+}
+
+impl GroupedMatcher<'_> {
+    /// Feed the next bytes of the input.
+    #[inline]
+    pub fn chunk(&mut self, input: &[u8]) {
+        self.stream.chunk(self.regex, self.scratch, input);
+    }
+
+    /// Signal end of input and return the final result.
+    pub fn finish(self) -> bool {
+        self.stream.finish(self.regex, self.scratch)
+    }
+
+    /// Whether a match has been found so far.
+    pub fn ismatch(&self) -> bool {
+        self.stream.ismatch()
+    }
+}
+
+impl fmt::Display for GroupedMatcher<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.stream.display(self.regex))
+    }
+}
+
+impl fmt::Debug for GroupedMatcher<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GroupedMatcher({})", self.stream.display(self.regex))
     }
 }
 

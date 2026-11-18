@@ -6,7 +6,7 @@
 import subprocess
 import sys
 
-print("family,bound,bytes,tier,chunk,config,min_tier,compiled_bytes,compile_us,cold_us,runs,warm_ns_per_byte,warm_us", flush=True)
+print("family,bound,bytes,tier,chunk,config,min_tier,compiled_bytes,compile_us,cold_us,runs,warm_ns_per_byte,warm_us,engine", flush=True)
 
 # `--grouped`: the grouped NFA comparison (plans/grouped-nfa.md, §8): every
 # family and bound under forced counters and default compilation, on every
@@ -14,7 +14,8 @@ print("family,bound,bytes,tier,chunk,config,min_tier,compiled_bytes,compile_us,c
 cases = []
 if "--grouped" in sys.argv:
     # `grouped-full` / `grouped-active` force one of its two passes.
-    paths = ["0", "1", "2", "3", "4", "grouped", "grouped-full", "grouped-active"]
+    # `auto`: automatic selection.
+    paths = ["auto", "0", "1", "2", "3", "4", "grouped", "grouped-full", "grouped-active"]
     for family in ["prefix", "variable", "exact", "flat", "phase", "mixed", "sparse", "wide"]:
         for bound in [8, 64, 256, 1000]:
             for config in ["counters", "default"]:

@@ -3,7 +3,7 @@
 //! Every command judges a pattern the same way ([`Subject::check`]): the
 //! `regex` crate (compiled with `(?s-u)`, as in the test suite) is the
 //! reference, and the NFA, every eligible DFA tier and, when it admits the
-//! pattern, the experimental grouped NFA, each fed the whole input and fed
+//! pattern, the grouped NFA, each fed the whole input and fed
 //! one byte at a time, must agree with it.
 //!
 //! Inputs are read and printed with Rust byte escapes ([`escape`],
@@ -16,13 +16,10 @@ pub(crate) mod fuzz;
 pub(crate) mod shrink;
 pub(crate) mod sweep;
 
-use std::cell::RefCell;
 use std::fmt;
 use std::sync::OnceLock;
 
-use rethoc_engine::{
-    GroupedNfaError, GroupedScratch, GroupedStream, MatcherMemory, Regex, RegexConfig,
-};
+use rethoc_engine::{GroupedNfaError, GroupedNfaMode, MatcherMemory, Regex, RegexConfig};
 
 use crate::CompileArgs;
 
@@ -75,8 +72,10 @@ impl fmt::Display for Feed {
     }
 }
 
-/// An execution backend: a tier (0 = NFA), or the experimental grouped
-/// NFA, which is not a tier and is never selected by default dispatch.
+/// An execution backend: a tier (0 = NFA), or the grouped NFA, which is
+/// not a tier.  Automatic selection runs it when Tier 1 and Tier 2 cannot
+/// and it is admitted; as a backend here it is forced
+/// ([`GroupedNfaMode::Always`](rethoc_engine::GroupedNfaMode::Always)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Backend {
     Tier(u8),
@@ -180,8 +179,8 @@ impl TierChoice {
 
 /// A pattern compiled in one configuration, with the backends to check.
 pub(crate) struct Subject {
-    /// Configuration the pattern was compiled with (without the grouped
-    /// option, which never changes the NFA the tiers run on).
+    /// Configuration the pattern was compiled with (with the default
+    /// grouped mode: the analysis never changes the NFA the tiers run on).
     pub(crate) config: RegexConfig,
     /// The compiled pattern.
     pub(crate) regex: Regex,
@@ -190,9 +189,6 @@ pub(crate) struct Subject {
     pub(crate) backends: Vec<Backend>,
     /// Why the grouped NFA is not among the backends, when it was wanted.
     pub(crate) grouped_rejection: Option<GroupedNfaError>,
-    /// The grouped NFA stream, created on first use and reset for every
-    /// run after that, as a user reuses a stream.
-    stream: RefCell<Option<GroupedStream>>,
 }
 
 impl Subject {
@@ -203,10 +199,14 @@ impl Subject {
         pattern: &str,
         config: &RegexConfig,
         choice: TierChoice,
-        memory: &mut Memory,
+        memory: &mut MatcherMemory,
     ) -> Result<Self, Rejection> {
         let mut compiled = config.clone();
-        compiled.grouped_nfa = choice.wants_grouped();
+        compiled.grouped_nfa = if choice.wants_grouped() {
+            GroupedNfaMode::Always
+        } else {
+            GroupedNfaMode::Auto
+        };
         let regex = Regex::with_config(pattern, compiled).map_err(Rejection::Compile)?;
         let candidates: Vec<u8> = match choice {
             TierChoice::All => (0..=4).collect(),
@@ -216,7 +216,7 @@ impl Subject {
         };
         let mut backends: Vec<Backend> = candidates
             .into_iter()
-            .filter(|&t| memory.matcher.matcher_for_tier(&regex, t).is_ok())
+            .filter(|&t| memory.matcher_for_tier(&regex, t).is_ok())
             .map(Backend::Tier)
             .collect();
         if let TierChoice::Only(t) = choice
@@ -238,20 +238,24 @@ impl Subject {
             }
         }
         let mut config = config.clone();
-        config.grouped_nfa = false;
+        config.grouped_nfa = GroupedNfaMode::Auto;
         Ok(Self {
             config,
             regex,
             backends,
             grouped_rejection,
-            stream: RefCell::new(None),
         })
     }
 
-    /// The backends, and why the grouped NFA is missing if it was wanted:
-    /// `[0, 3, grouped]` or `[0, 4] grouped: <reason>`.
+    /// The engine automatic selection picks, the backends, and why the
+    /// grouped NFA is missing if it was wanted: `[0, 3, grouped] auto=grouped`
+    /// or `[0, 4] auto=tier4 (<reason>)`.
     pub(crate) fn describe_backends(&self) -> String {
-        let mut s = backend_list(&self.backends);
+        let mut s = format!(
+            "{} auto={}",
+            backend_list(&self.backends),
+            self.regex.engine()
+        );
         if let Some(e) = &self.grouped_rejection {
             s.push_str(&format!(" ({e})"));
         }
@@ -262,7 +266,7 @@ impl Subject {
     /// `expected` into `failures` (which is cleared first).
     pub(crate) fn check(
         &self,
-        memory: &mut Memory,
+        memory: &mut MatcherMemory,
         input: &[u8],
         expected: bool,
         failures: &mut Vec<Failure>,
@@ -281,7 +285,7 @@ impl Subject {
     /// Run `input` on one backend.
     pub(crate) fn run(
         &self,
-        memory: &mut Memory,
+        memory: &mut MatcherMemory,
         backend: Backend,
         feed: Feed,
         input: &[u8],
@@ -289,31 +293,21 @@ impl Subject {
         let tier = match backend {
             Backend::Tier(t) => t,
             Backend::Grouped => {
-                let scratch = &mut memory.grouped;
-                let mut slot = self.stream.borrow_mut();
-                let s = match slot.as_mut() {
-                    Some(s) => {
-                        s.reset(&self.regex, scratch);
-                        s
-                    }
-                    None => slot.insert(
-                        GroupedStream::new(&self.regex, scratch)
-                            .expect("the grouped NFA was checked for admission"),
-                    ),
-                };
+                let mut m = memory
+                    .matcher_grouped(&self.regex)
+                    .expect("the grouped NFA was checked for admission");
                 match feed {
-                    Feed::Whole => s.chunk(&self.regex, scratch, input),
+                    Feed::Whole => m.chunk(input),
                     Feed::Bytewise => {
                         for b in input {
-                            s.chunk(&self.regex, scratch, std::slice::from_ref(b));
+                            m.chunk(std::slice::from_ref(b));
                         }
                     }
                 }
-                return s.finish(&self.regex, scratch);
+                return m.finish();
             }
         };
         let mut m = memory
-            .matcher
             .matcher_for_tier(&self.regex, tier)
             .expect("tier was checked for eligibility");
         match feed {
@@ -408,22 +402,13 @@ pub(crate) fn regime() -> Regime {
     *REGIME.get_or_init(|| read_regime().unwrap_or_default())
 }
 
-/// A fresh [`Memory`], with the DFA state cap of the [`Regime`].
-pub(crate) fn new_memory() -> Memory {
-    let mut matcher = MatcherMemory::default();
-    matcher.set_dfa_state_cap(regime().dfa_states);
-    Memory {
-        matcher,
-        grouped: GroupedScratch::new(),
-    }
-}
-
-/// What the checks reuse across inputs, as a user does across streams:
-/// the tiers' [`MatcherMemory`] and the grouped NFA's scratch.  Shared
-/// between regexes too with `fuzz --shared-memory`.
-pub(crate) struct Memory {
-    pub(crate) matcher: MatcherMemory,
-    pub(crate) grouped: GroupedScratch,
+/// A fresh [`MatcherMemory`], with the DFA state cap of the [`Regime`].  It
+/// also holds the grouped NFA's scratch and stream storage, so that
+/// `--shared-memory` shares those across regexes too.
+pub(crate) fn new_memory() -> MatcherMemory {
+    let mut memory = MatcherMemory::default();
+    memory.set_dfa_state_cap(regime().dfa_states);
+    memory
 }
 
 /// The regime as it appears in summary and result lines, e.g.

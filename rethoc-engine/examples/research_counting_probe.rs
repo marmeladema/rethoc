@@ -1,15 +1,17 @@
 //! Process-isolated counting probe. See docs/research/counting-benchmark-method.md.
 //!
-//! `tier` is 0-4, or `grouped` for the experimental grouped NFA (compiled
-//! with `RegexConfig::grouped_nfa`; `ineligible` when it does not admit the
+//! `tier` is `auto` for automatic selection (`MatcherMemory::matcher`), 0-4
+//! for a forced tier, or `grouped` for the grouped NFA forced (compiled with
+//! `GroupedNfaMode::Always`; `ineligible` when it does not admit the
 //! pattern), or `grouped-full` / `grouped-active` for the grouped NFA with
-//! one of its two passes forced.
+//! one of its two passes forced.  The last column is the engine automatic
+//! selection picks.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use rethoc_engine::{
-    GroupedScratch, GroupedStream, GroupedSweep, MatcherMemory, Regex, RegexConfig,
+    GroupedNfaMode, GroupedScratch, GroupedStream, GroupedSweep, MatcherMemory, Regex, RegexConfig,
 };
 
 fn main() {
@@ -33,10 +35,11 @@ fn main() {
         }
         _ => GroupedSweep::Auto,
     };
-    let tier: u8 = if grouped {
+    let auto = tier_arg == "auto";
+    let tier: u8 = if grouped || auto {
         0
     } else {
-        tier_arg.parse().expect("tier: 0-4 or grouped")
+        tier_arg.parse().expect("tier: auto, 0-4 or grouped")
     };
     let chunk: usize = args[5].parse().expect("chunk");
     let counters = args[6] == "counters";
@@ -66,7 +69,11 @@ fn main() {
         max_estimated_states: 65536,
         max_unroll_states: if counters { 0 } else { 32 },
         merge_repetitions: !counters,
-        grouped_nfa: grouped,
+        grouped_nfa: if grouped {
+            GroupedNfaMode::Always
+        } else {
+            GroupedNfaMode::Auto
+        },
         ..RegexConfig::default()
     };
     let start = Instant::now();
@@ -112,6 +119,8 @@ fn main() {
     let mut memory = MatcherMemory::default();
     let eligible = if grouped {
         re.grouped_nfa_admission().is_ok()
+    } else if auto {
+        true
     } else {
         memory.matcher_for_tier(&re, tier).is_ok()
     };
@@ -136,7 +145,11 @@ fn main() {
             assert_eq!(black_box(stream.finish(&re, &mut scratch)), expected);
             return;
         }
-        let mut matcher = memory.matcher_for_tier(&re, tier).expect("eligible");
+        let mut matcher = if auto {
+            memory.matcher(&re)
+        } else {
+            memory.matcher_for_tier(&re, tier).expect("eligible")
+        };
         for part in black_box(&hay).chunks(chunk) {
             matcher.chunk(part);
         }
@@ -156,11 +169,12 @@ fn main() {
     }
     let elapsed = start.elapsed().as_secs_f64();
     println!(
-        "{family},{bound},{bytes},{tier_arg},{chunk},{},{},{},{compile_us:.3},{cold_us:.3},{runs},{:.3},{:.3}",
+        "{family},{bound},{bytes},{tier_arg},{chunk},{},{},{},{compile_us:.3},{cold_us:.3},{runs},{:.3},{:.3},{}",
         args[6],
         re.min_tier(),
         re.memory_size(),
         elapsed * 1e9 / (runs as f64 * bytes as f64),
-        elapsed * 1e6 / runs as f64
+        elapsed * 1e6 / runs as f64,
+        re.engine()
     );
 }
