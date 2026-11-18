@@ -5,6 +5,13 @@ Research baseline: `b0bb981e8c6cba7b23df176d79f741c3b61089a7` (main),
 No engine implementation changes or existing Tier 1/2/3 bug investigations.
 Proposals below are not validated implementations.
 
+Status update at `c84282e` (2026-11-18): exact grouped execution, count-free
+stepping and automatic selection have landed; the remaining research directions
+below are proposals. The next concrete experiment is
+[sparse counting sets on the grouped NFA](../../plans/sparse-counting-sets.md),
+with deployment measurements alongside it. Historical costs refer to the
+research baseline unless stated otherwise.
+
 ## Recommendation
 
 The objective is a best-in-class production engine for internet-scale traffic:
@@ -14,18 +21,20 @@ novelty is not a selection criterion. Reuse established techniques where they
 work, and invent where measured gaps remain. A general theory of compression
 must not block practical improvements.
 
-Start with **one grouped nondeterministic execution core**, using exact count
-sets first. Evaluate sparse compression separately once exact costs and admission
-coverage are measured. Build the deployment-scale
-benchmark and complete memory accounting alongside it. Then evaluate rotating
+The **grouped nondeterministic execution core with exact count sets** is now
+available. Next, evaluate finite sparse count sets as a separately forceable
+variant, with explicit observation invariants and assertion gates. Build the
+deployment-scale benchmark and complete memory accounting alongside it.
+Then evaluate rotating
 BVA, delimiter-based execution, and shared literal scanning where they address
 remaining gaps. Do not implement every outlined approach before measuring the
 first. Keep competitive existing paths; select among eligible representations
 using work and stream-state costs, not tier number.
 
 The architectural direction is a compiler selecting a counting representation
-for each compatible region. Initially keep the experimental grouped NFA separate
-from production dispatch and retain today's NFA as an independent oracle.
+for each compatible region. Grouped execution now participates in dispatch;
+keep the sparse experiment explicit-only and retain the original NFA as an
+independent oracle.
 Establish each representation's semantics and performance before mixing execution.
 Mixing counter representations without a joint invariant can lose correlations.
 For nesting, investigate unique iteration boundaries and shared correlated
@@ -46,13 +55,13 @@ It is independently complete without sparse compression.
 
 ### Prioritized engineering plan
 
-1. **Grouped NFA and deployment measurements.** Aggregate configurations by
-   control position, add exact count sets, and compare performance on
-   prefix-gated variable-body workloads. Account separately for immutable programs,
-   worker scratch, and persistent stream state from the first prototype.
-2. **Reduce baseline execution overhead.** Compile structural transfers and
-   reduce context-copy/hash work. Measure startup, reuse, and adversarial costs
-   independently of the counting representation.
+1. **Instrument the landed engine and deployment costs.** Measure active-count
+   work, allocations, startup, reuse and interleaved streams. Account separately
+   for immutable programs, worker scratch and persistent stream state.
+2. **Finite sparse counting experiment.** Follow the linked plan's direct
+   Thompson mapping, finite-list audit, assertion milestone and comparison with
+   fully optimized exact grouped execution. Keep automatic selection unchanged
+   until a separate adoption decision.
 3. **Add specializations where they earn their cost.** Compare rotating BVA
    against Tier 2, and evaluate shared scanning and repeat kernels using
    Hyperscan as architectural prior art. Retain default unrolling as a competitor.
@@ -624,4 +633,5 @@ startup or memory costs. Evidence does not yet support a universal numeric
 speedup threshold. Exhaust small patterns/inputs against NFA and `regex`, then
 fuzz whole/chunked execution, reset/reuse, empty chunks, and cache eviction.
 Those are requirements for future backends, not validation claimed by this
-research. No new execution backend has been implemented here.
+research. Exact grouped execution has since landed; these gates still apply
+to the proposed sparse variant and other future representations.

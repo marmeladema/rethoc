@@ -1,5 +1,8 @@
 # Grouped NFA assertion audit
 
+For the finite sparse-counting follow-up, see
+[the sparse algebra and replay audit](sparse-counting-sets.md).
+
 For the separate Tier 1 design and cache audit, see
 [Tier 1 assertion plan audit](tier1-assertions.md).
 
