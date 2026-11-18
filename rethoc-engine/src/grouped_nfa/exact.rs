@@ -612,6 +612,8 @@ macro_rules! by_width {
 /// little more than the active-row bookkeeping would.
 const SMALL_PLAN_ROWS: usize = 32;
 
+pub(crate) use by_width;
+
 /// Which pass a byte runs (see the module documentation).  Both give the
 /// same rows; tests and the counting probe force each.  Forcing a pass also
 /// turns off the count-free step, so that the general step can be tested

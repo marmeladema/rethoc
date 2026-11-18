@@ -119,5 +119,13 @@ obligations this record left open; they are evidence by testing, not a proof.
   runtime, were applied to the Rust source by hand and each failed the tests;
   they are not kept as automated mutation tests.
 
-Still open: unbounded saturation and a count-free step are not implemented
-(the idle skip is); nothing here is a performance claim.
+- The count-free step reuses the exact grouped NFA's tables (the nodes are
+  numbered alike) with "exactly `{1}`" as the unit row. The three-mode tests
+  compare it with the general step after every chunk and check the unit flag
+  against the rows; a dropped exit edge, a missing reseed, an assertion taken
+  as count-free, a skipped or loose unit check, wrong end-of-run row writes, a
+  run past a counting node, a missing match test at a chunk end and a stale
+  previous byte each failed the suite when applied by hand.
+
+Still open: unbounded saturation is not implemented; nothing here is a
+performance claim.

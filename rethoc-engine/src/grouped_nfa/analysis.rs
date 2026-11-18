@@ -670,7 +670,15 @@ pub(crate) fn layout(
         .partition(|n| matches!(n.op, Op::Edge { .. } | Op::Table(_)));
     let count_free = count_free.map(|a| {
         Box::new(count_free_tables(
-            &nodes,
+            nodes.len(),
+            |n| match nodes[n].op {
+                Op::Assert { .. } | Op::CounterIncrement { .. } => CountFreeNode::Blocked,
+                Op::Split { out, out1 } => CountFreeNode::ZeroWidth([out.node, out1.node]),
+                Op::CounterInstance { out } => CountFreeNode::ZeroWidth([out.node, NO_NODE]),
+                Op::Match => CountFreeNode::Match,
+                Op::Edge { .. } => CountFreeNode::Edge(nodes[n].state),
+                Op::Table(t) => CountFreeNode::Table(t),
+            },
             node(start),
             a,
             states,
@@ -695,11 +703,11 @@ pub(crate) fn layout(
 
 /// Most bitmap words for which count-free tables are built: 512 rows.
 /// Their size grows with rows times words.
-const MAX_COUNT_FREE_WORDS: usize = 8;
+pub(crate) const MAX_COUNT_FREE_WORDS: usize = 8;
 
 /// Whether the zero-width closure of `start` reaches neither an assertion
 /// nor a `CounterIncrement`.
-fn closure_is_count_free(states: &[State], start: StateIdx) -> bool {
+pub(crate) fn closure_is_count_free(states: &[State], start: StateIdx) -> bool {
     let mut seen = vec![false; states.len()];
     let mut stack = vec![start];
     while let Some(idx) = stack.pop() {
@@ -714,36 +722,55 @@ fn closure_is_count_free(states: &[State], start: StateIdx) -> bool {
     true
 }
 
-/// Build the count-free tables (see [`CountFreeTables`]); the start node
-/// must be count-free.
-fn count_free_tables(
-    nodes: &[Node],
+/// What the count-free tables need to know of a node, whatever the
+/// representation of its row.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CountFreeNode {
+    /// An assertion or a `CounterIncrement`: never count-free.
+    Blocked,
+    /// A `Split` or a `CounterInstance`, with its one or two successors
+    /// (the second is [`NO_NODE`] when there is one).
+    ZeroWidth([NodeIdx; 2]),
+    Match,
+    /// Consumes with the one-byte predicate of its state.
+    Edge(StateIdx),
+    /// Consumes through a byte dispatch table.
+    Table(crate::ByteTableIdx),
+}
+
+/// Build the count-free tables (see [`CountFreeTables`]) of the `r` nodes
+/// that `node` describes, in node order; the start node must be
+/// count-free.  The exact rows and the sparse ones number their nodes
+/// alike and share these tables' meaning: a unit row holds the count of a
+/// counter that has not counted yet.
+pub(crate) fn count_free_tables(
+    r: usize,
+    node: impl Fn(usize) -> CountFreeNode,
     start: NodeIdx,
     a: usize,
     states: &[State],
     classes: &[ByteClassBits],
     byte_tables: &[ByteMap],
 ) -> CountFreeTables {
-    let r = nodes.len();
     let bit = |n: usize| (n / 64, 1u64 << (n % 64));
     let mut count_free = vec![false; r];
     let mut closure = vec![0u64; r * a];
     // Successors come later in node order: fill backwards.
     for n in (0..r).rev() {
-        let succs: &[Succ] = match &nodes[n].op {
-            Op::Assert { .. } | Op::CounterIncrement { .. } => continue,
-            Op::Split { out, out1 } => &[*out, *out1],
-            Op::CounterInstance { out } => std::slice::from_ref(out),
-            Op::Match | Op::Edge { .. } | Op::Table(_) => &[],
+        let succs = match node(n) {
+            CountFreeNode::Blocked => continue,
+            CountFreeNode::ZeroWidth(succs) => succs,
+            CountFreeNode::Match | CountFreeNode::Edge(_) | CountFreeNode::Table(_) => [NO_NODE; 2],
         };
-        if !succs.iter().all(|s| count_free[s.node as usize]) {
+        let succs = succs.iter().filter(|&&s| s != NO_NODE);
+        if !succs.clone().all(|&s| count_free[s as usize]) {
             continue;
         }
         count_free[n] = true;
         let (w, m) = bit(n);
         closure[n * a + w] |= m;
-        for s in succs {
-            let src = s.node as usize * a;
+        for &s in succs {
+            let src = s as usize * a;
             for i in 0..a {
                 closure[n * a + i] |= closure[src + i];
             }
@@ -753,18 +780,22 @@ fn count_free_tables(
     assert!(count_free[start], "the start node is count-free");
     let mut accept = vec![0u64; 256 * a];
     let (mut statics, mut matches) = (vec![0u64; a], vec![0u64; a]);
-    for (n, node) in nodes.iter().enumerate() {
+    for (n, &free) in count_free.iter().enumerate() {
         let (w, m) = bit(n);
-        if count_free[n] {
+        if free {
             statics[w] |= m;
         }
-        match node.op {
-            Op::Match => matches[w] |= m,
-            Op::Edge { .. } | Op::Table(_) => {
+        let kind = node(n);
+        match kind {
+            CountFreeNode::Match => matches[w] |= m,
+            CountFreeNode::Edge(_) | CountFreeNode::Table(_) => {
                 for b in 0..=255u8 {
-                    let accepted = match node.op {
-                        Op::Table(t) => byte_tables[t][b] != StateIdx::NONE,
-                        _ => super::exact::accepts(classes, &states[node.state.idx()], b),
+                    let accepted = match kind {
+                        CountFreeNode::Table(t) => byte_tables[t][b] != StateIdx::NONE,
+                        CountFreeNode::Edge(state) => {
+                            super::exact::accepts(classes, &states[state.idx()], b)
+                        }
+                        _ => unreachable!(),
                     };
                     if accepted {
                         accept[b as usize * a + w] |= m;

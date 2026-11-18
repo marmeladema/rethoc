@@ -38,7 +38,8 @@ bytes), `sustained` and `sustainedx` (new entries do not kill the older
 ones), `mixed` (short-lived entries), `seq`, `holey`, `loop`, `phase`,
 `control`, and the exclusions `nested`, `nullable` and `unbounded`. Path
 `sparse` is the sparse counting variant forced (`ineligible` where it does
-not admit the pattern). The set also times four chunk sizes at bound 1000
+not admit the pattern); `sparse-full` and `sparse-active` force one of its
+two passes, which also turns off its idle skip and count-free step. The set also times four chunk sizes at bound 1000
 and default compilation as the end-to-end competitor; `--reps 3 --seed 7`
 runs every case three times in a shuffled, reproducible order.
 
