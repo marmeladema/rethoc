@@ -676,8 +676,7 @@ pub(crate) fn layout(
                 Op::Split { out, out1 } => CountFreeNode::ZeroWidth([out.node, out1.node]),
                 Op::CounterInstance { out } => CountFreeNode::ZeroWidth([out.node, NO_NODE]),
                 Op::Match => CountFreeNode::Match,
-                Op::Edge { .. } => CountFreeNode::Edge(nodes[n].state),
-                Op::Table(t) => CountFreeNode::Table(t),
+                Op::Edge { .. } | Op::Table(_) => CountFreeNode::Consumer(nodes[n].state),
             },
             node(start),
             a,
@@ -705,21 +704,83 @@ pub(crate) fn layout(
 /// Their size grows with rows times words.
 pub(crate) const MAX_COUNT_FREE_WORDS: usize = 8;
 
-/// Whether the zero-width closure of `start` reaches neither an assertion
-/// nor a `CounterIncrement`.
-pub(crate) fn closure_is_count_free(states: &[State], start: StateIdx) -> bool {
+/// Walk the zero-width closure of `start`, calling `visit` once for every
+/// state of it, until `visit` returns `false`.  Returns whether it never
+/// did.  This is the one walk behind every question asked of a start
+/// closure: its edges are those of [`for_each_zero_width_successor`], so
+/// a new zero-width state kind is handled in one place.
+fn walk_closure(states: &[State], start: StateIdx, mut visit: impl FnMut(&State) -> bool) -> bool {
     let mut seen = vec![false; states.len()];
     let mut stack = vec![start];
     while let Some(idx) = stack.pop() {
         if std::mem::replace(&mut seen[idx.idx()], true) {
             continue;
         }
-        match states[idx] {
-            State::Assert { .. } | State::CounterIncrement { .. } => return false,
-            ref s => for_each_zero_width_successor(s, |t| stack.push(t)),
+        let state = &states[idx];
+        if !visit(state) {
+            return false;
         }
+        for_each_zero_width_successor(state, |t| stack.push(t));
     }
     true
+}
+
+/// Whether the zero-width closure of `start` reaches neither an assertion
+/// nor a `CounterIncrement`.
+pub(crate) fn closure_is_count_free(states: &[State], start: StateIdx) -> bool {
+    walk_closure(states, start, |s| {
+        !matches!(s, State::Assert { .. } | State::CounterIncrement { .. })
+    })
+}
+
+/// A state of a closure that depends on the boundary (an assertion) or
+/// matches: with one in the start closure, an empty frontier cannot be
+/// skipped over.
+fn is_static(state: &State) -> bool {
+    !matches!(state, State::Assert { .. } | State::Match)
+}
+
+/// Whether the consuming `state` accepts `b`.
+pub(crate) fn consumer_accepts(
+    state: &State,
+    classes: &[ByteClassBits],
+    byte_tables: &[ByteMap],
+    b: u8,
+) -> bool {
+    match *state {
+        State::ByteTable { table } => byte_tables[table][b] != StateIdx::NONE,
+        _ => super::exact::accepts(classes, state, b),
+    }
+}
+
+/// When the zero-width closure of `start` is static
+/// ([`start_closure_is_static`]): the bytes that some consuming state of
+/// it accepts.  From an empty frontier, any other byte leaves the frontier
+/// empty.
+pub(crate) fn start_bytes(
+    states: &[State],
+    classes: &[ByteClassBits],
+    byte_tables: &[ByteMap],
+    start: StateIdx,
+) -> Option<Box<[bool; 256]>> {
+    let mut starts = Box::new([false; 256]);
+    walk_closure(states, start, |state| {
+        let consumes = !matches!(
+            state,
+            State::Split { .. }
+                | State::Assert { .. }
+                | State::CounterInstance { .. }
+                | State::CounterIncrement { .. }
+                | State::Match
+        );
+        if consumes {
+            for b in 0..=255u8 {
+                starts[b as usize] |= consumer_accepts(state, classes, byte_tables, b);
+            }
+        }
+        is_static(state)
+    })
+    .then_some(starts)
 }
 
 /// What the count-free tables need to know of a node, whatever the
@@ -732,10 +793,8 @@ pub(crate) enum CountFreeNode {
     /// (the second is [`NO_NODE`] when there is one).
     ZeroWidth([NodeIdx; 2]),
     Match,
-    /// Consumes with the one-byte predicate of its state.
-    Edge(StateIdx),
-    /// Consumes through a byte dispatch table.
-    Table(crate::ByteTableIdx),
+    /// Consumes a byte, as its state says.
+    Consumer(StateIdx),
 }
 
 /// Build the count-free tables (see [`CountFreeTables`]) of the `r` nodes
@@ -760,7 +819,7 @@ pub(crate) fn count_free_tables(
         let succs = match node(n) {
             CountFreeNode::Blocked => continue,
             CountFreeNode::ZeroWidth(succs) => succs,
-            CountFreeNode::Match | CountFreeNode::Edge(_) | CountFreeNode::Table(_) => [NO_NODE; 2],
+            CountFreeNode::Match | CountFreeNode::Consumer(_) => [NO_NODE; 2],
         };
         let succs = succs.iter().filter(|&&s| s != NO_NODE);
         if !succs.clone().all(|&s| count_free[s as usize]) {
@@ -788,16 +847,9 @@ pub(crate) fn count_free_tables(
         let kind = node(n);
         match kind {
             CountFreeNode::Match => matches[w] |= m,
-            CountFreeNode::Edge(_) | CountFreeNode::Table(_) => {
+            CountFreeNode::Consumer(state) => {
                 for b in 0..=255u8 {
-                    let accepted = match kind {
-                        CountFreeNode::Table(t) => byte_tables[t][b] != StateIdx::NONE,
-                        CountFreeNode::Edge(state) => {
-                            super::exact::accepts(classes, &states[state.idx()], b)
-                        }
-                        _ => unreachable!(),
-                    };
-                    if accepted {
+                    if consumer_accepts(&states[state.idx()], classes, byte_tables, b) {
                         accept[b as usize * a + w] |= m;
                     }
                 }
@@ -875,16 +927,5 @@ fn debug_check_successors(nodes: &[Node]) {
 /// Whether the zero-width closure of `start` reaches neither an assertion
 /// nor `Match`: then it is the same at every boundary and never matches.
 fn start_closure_is_static(states: &[State], start: StateIdx) -> bool {
-    let mut seen = vec![false; states.len()];
-    let mut stack = vec![start];
-    while let Some(idx) = stack.pop() {
-        if std::mem::replace(&mut seen[idx.idx()], true) {
-            continue;
-        }
-        match states[idx] {
-            State::Assert { .. } | State::Match => return false,
-            ref s => for_each_zero_width_successor(s, |t| stack.push(t)),
-        }
-    }
-    true
+    walk_closure(states, start, is_static)
 }

@@ -163,6 +163,7 @@ fn main() {
     let num_streams: usize = args[3].parse().expect("streams");
     let bytes: usize = args[4].parse().expect("bytes");
     let chunk: usize = args[5].parse().expect("chunk");
+    assert!(chunk > 0, "chunk must be at least one byte");
     let counters = match args[6].as_str() {
         "counters" => true,
         "default" => false,
@@ -250,25 +251,29 @@ fn main() {
     }
     assert!(e > 0, "no pattern left");
     let regex_bytes: usize = regexes.iter().map(Regex::memory_size).sum();
-    let plan_bytes: usize = regexes
-        .iter()
-        .map(|re| {
-            let info = re.info();
-            match (info.grouped_nfa, info.sparse_counting) {
-                (_, Some(SparseCountingInfo::Admitted { plan_bytes, .. })) if sparse => plan_bytes,
-                (Some(GroupedNfaInfo::Admitted { plan_bytes, .. }), _) if !sparse => plan_bytes,
-                _ => 0,
-            }
-        })
-        .sum();
-    println!("memory programs_bytes={regex_bytes} of_which_{engine}_plans={plan_bytes}");
+    // Both kinds of plan are reported under their own name, whatever
+    // engine runs: `common` compiles both for every engine.
+    let (mut grouped_plans, mut sparse_plans) = (0usize, 0usize);
+    for re in &regexes {
+        let info = re.info();
+        if let Some(GroupedNfaInfo::Admitted { plan_bytes, .. }) = info.grouped_nfa {
+            grouped_plans += plan_bytes;
+        }
+        if let Some(SparseCountingInfo::Admitted { plan_bytes, .. }) = info.sparse_counting {
+            sparse_plans += plan_bytes;
+        }
+    }
+    println!(
+        "memory programs_bytes={regex_bytes} of_which_grouped_plans={grouped_plans} \
+         of_which_sparse_plans={sparse_plans}"
+    );
 
     let inputs: Vec<Vec<u8>> = (0..num_streams).map(|s| input(s, bytes)).collect();
     println!("memory input_bytes={}", num_streams * bytes);
 
     // Stream state, built before any scanning.
     let pairs = num_streams * e;
-    let rounds = bytes.div_ceil(chunk.max(1));
+    let rounds = bytes.div_ceil(chunk);
     let mut latencies = Vec::with_capacity(rounds * num_streams);
     let before = counting_alloc::snapshot();
     let start = Instant::now();

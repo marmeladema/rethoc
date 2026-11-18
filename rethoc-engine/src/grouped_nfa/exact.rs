@@ -35,6 +35,7 @@
 
 use std::fmt;
 
+use super::bitmap::{self, activate, for_each_active};
 use super::stats::stat;
 use super::{GroupedNfaError, GroupedNfaPlan, Increment, NodeIdx, Op, Row, Succ};
 use crate::{AssertEval, Regex, State, StateIdx, byte_match_ci};
@@ -125,23 +126,6 @@ fn copy_row(from: &[u64], to: &mut [u64], r: Row) {
         to[r.off as usize] = from[r.off as usize];
     } else {
         to[r.range()].copy_from_slice(&from[r.range()]);
-    }
-}
-
-#[inline]
-fn activate(active: &mut [u64], n: NodeIdx) {
-    active[n as usize / 64] |= 1 << (n % 64);
-}
-
-/// Call `f` for every active node, in increasing order.
-#[inline]
-fn for_each_active(active: &[u64], mut f: impl FnMut(NodeIdx)) {
-    for (w, &word) in active.iter().enumerate() {
-        let mut bits = word;
-        while bits != 0 {
-            f((w * 64) as NodeIdx + bits.trailing_zeros());
-            bits &= bits - 1;
-        }
     }
 }
 
@@ -608,10 +592,6 @@ macro_rules! by_width {
     };
 }
 
-/// Plans of at most this many rows always take the full sweep: it costs
-/// little more than the active-row bookkeeping would.
-const SMALL_PLAN_ROWS: usize = 32;
-
 pub(crate) use by_width;
 
 /// Which pass a byte runs (see the module documentation).  Both give the
@@ -794,34 +774,19 @@ impl GroupedStream {
                 if self.live == 0 {
                     // Find the next byte that starts something: the others
                     // leave an empty frontier empty.
-                    #[cfg(feature = "op-stats")]
-                    let start = i;
-                    let found = loop {
-                        let rest = &input[i..];
-                        let off = if has_prefilter {
-                            prefilter.find(rest)
-                        } else {
-                            rest.iter().position(|&b| tables.starts[b as usize])
-                        };
-                        match off {
-                            Some(off) if tables.starts[rest[off] as usize] => break Some(i + off),
-                            Some(off) => i += off + 1,
-                            None => break None,
-                        }
-                        if i >= input.len() {
-                            break None;
-                        }
-                    };
-                    let Some(j) = found else {
-                        stat!(bytes_skipped += input.len() - start);
-                        self.prev = input.last().copied();
+                    let found = bitmap::next_start(prefilter, &tables.starts, input, i);
+                    let next = found.unwrap_or(input.len());
+                    stat!(bytes_skipped += next - i);
+                    if next > i {
+                        self.prev = Some(input[next - 1]);
                         self.at_start = false;
+                    }
+                    if found.is_none() {
                         return;
-                    };
-                    stat!(bytes_skipped += j - start);
-                    i = j;
+                    }
+                    i = next;
                 }
-                if self.unit && self.all_count_free(tables) {
+                if self.unit && bitmap::all_count_free(&self.raw_active, tables) {
                     let (next, found) = by_width!(tables.a, |A| self
                         .count_free_run::<A>(plan, tables, regex, input, i));
                     #[cfg(test)]
@@ -862,63 +827,19 @@ impl GroupedStream {
         }
         if let Some(tables) = tables
             && self.unit
-            && self.all_count_free(tables)
+            && bitmap::all_count_free(&self.raw_active, tables)
         {
-            self.matched |= by_width!(tables.a, |A| self.count_free_matches::<A>(tables));
+            self.matched |= by_width!(tables.a, |A| bitmap::matches::<A>(&self.raw_active, tables));
             return;
         }
         self.provisional(plan, scratch, Boundary::UnknownNext);
     }
 
-    /// Whether every active raw node is count-free.
-    #[inline(always)]
-    fn all_count_free(&self, fast: &super::CountFreeTables) -> bool {
-        self.raw_active
-            .iter()
-            .zip(fast.statics.iter())
-            .all(|(r, s)| r & !s == 0)
-    }
-
-    /// The closure bitmap of the unit, count-free frontier `active`, of
-    /// `A` words.
-    /// (`closure` and `start` from the tables, passed as locals so that
-    /// they stay in registers.)
-    #[inline(always)]
-    fn count_free_closure<const A: usize>(
-        closure: &[u64],
-        start: [u64; A],
-        active: &[u64; A],
-    ) -> [u64; A] {
-        let mut clos = start;
-        for (i, &word) in active.iter().enumerate() {
-            let mut bits = word;
-            while bits != 0 {
-                let n = i * 64 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let c = &closure[n * A..][..A];
-                for j in 0..A {
-                    clos[j] |= c[j];
-                }
-            }
-        }
-        clos
-    }
-
-    /// Whether the closure of a unit, count-free frontier reaches `Match`.
-    fn count_free_matches<const A: usize>(&self, fast: &super::CountFreeTables) -> bool {
-        let active: [u64; A] = self.raw_active[..A].try_into().unwrap();
-        let start = fast.start_closure[..A].try_into().unwrap();
-        let clos = Self::count_free_closure::<A>(&fast.closure, start, &active);
-        (0..A).any(|i| clos[i] & fast.matches[i] != 0)
-    }
-
     /// [`step`](Self::step) on a unit, count-free frontier, by bitmaps of
-    /// `A` words ([`CountFreeTables`](super::CountFreeTables)), from
-    /// `input[i]` while the frontier stays nonempty and count-free (it
-    /// stays unit).  The frontier is only its active bitmap, kept in
-    /// registers: the raw rows are written once, when the run ends.
-    /// Returns the next byte's index and whether a match was found (before
-    /// the byte at that index).
+    /// `A` words ([`bitmap::run`]), from `input[i]` while the frontier
+    /// stays nonempty and count-free (it stays unit).  The raw rows are
+    /// written once, when the run ends.  Returns the next byte's index and
+    /// whether a match was found (before the byte at that index).
     #[inline(always)]
     fn count_free_run<const A: usize>(
         &mut self,
@@ -926,83 +847,39 @@ impl GroupedStream {
         fast: &super::CountFreeTables,
         regex: &Regex,
         input: &[u8],
-        mut i: usize,
+        i: usize,
     ) -> (usize, bool) {
-        debug_assert!(self.unit && self.all_count_free(fast));
-        let first = i;
-        // Everything the loop reads, as locals, so that it stays in
-        // registers.
+        debug_assert!(self.unit && bitmap::all_count_free(&self.raw_active, fast));
         let nodes: &[super::Node] = &plan.nodes;
         let node_of: &[NodeIdx] = &plan.node_of;
         let byte_tables = &regex.byte_tables;
-        let (closure, accepts): (&[u64], &[u64]) = (&fast.closure, &fast.accept);
-        let start: [u64; A] = fast.start_closure[..A].try_into().unwrap();
-        let matches: [u64; A] = fast.matches[..A].try_into().unwrap();
-        let statics: [u64; A] = fast.statics[..A].try_into().unwrap();
-        let entry: [u64; A] = self.raw_active[..A].try_into().unwrap();
-        let mut active = entry;
-        let found = loop {
-            let b = input[i];
-            let clos = Self::count_free_closure::<A>(closure, start, &active);
-            if (0..A).any(|k| clos[k] & matches[k] != 0) {
-                break true;
-            }
-            let mut next = [0u64; A];
-            let mut set = |n: NodeIdx| {
-                // `min` folds to 0 at one word.
-                next[(n as usize / 64).min(A - 1)] |= 1 << (n % 64);
-            };
-            let accept = &accepts[b as usize * A..][..A];
-            for k in 0..A {
-                let mut fire = clos[k] & accept[k];
-                while fire != 0 {
-                    let c = k * 64 + fire.trailing_zeros() as usize;
-                    fire &= fire - 1;
-                    match nodes[c].op {
-                        Op::Edge { out, out_exit } => {
-                            set(out.node);
-                            if out_exit != Succ::NONE {
-                                set(out_exit.node);
-                            }
-                        }
-                        Op::Table(t) => set(node_of[byte_tables[t][b].idx()]),
-                        _ => unreachable!("only consumers accept bytes"),
+        let run = bitmap::run::<A>(fast, &self.raw_active, input, i, |c, b, next| {
+            match nodes[c].op {
+                Op::Edge { out, out_exit } => {
+                    bitmap::set(next, out.node);
+                    if out_exit != Succ::NONE {
+                        bitmap::set(next, out_exit.node);
                     }
                 }
+                Op::Table(t) => bitmap::set(next, node_of[byte_tables[t][b].idx()]),
+                _ => unreachable!("only consumers accept bytes"),
             }
-
-            active = next;
-            i += 1;
-            if i == input.len()
-                || active.iter().all(|&w| w == 0)
-                || (0..A).any(|k| active[k] & !statics[k] != 0)
-            {
-                break false;
-            }
-        };
-        // The rows are written once per run: a row of a unit frontier is
-        // its first word, 1 or 0, so only rows that changed are stored.
+        });
+        // A row of a unit frontier is its first word, 1 or 0, so only the
+        // rows that changed are stored.
         let raw = &mut *self.raw;
-        for k in 0..A {
-            for (mut bits, value) in [(entry[k] & !active[k], 0), (active[k] & !entry[k], 1)] {
-                while bits != 0 {
-                    let n = k * 64 + bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    raw[nodes[n].row.off as usize] = value;
-                }
-            }
-        }
-        self.raw_active[..A].copy_from_slice(&active);
-        self.live = active.iter().map(|w| w.count_ones()).sum();
+        run.for_each_change(|n, on| raw[nodes[n].row.off as usize] = u64::from(on));
+        self.raw_active[..A].copy_from_slice(&run.active);
+        self.live = run.live();
         self.unit = true;
-        if i > first {
-            self.prev = Some(input[i - 1]);
+        if run.next > i {
+            self.prev = Some(input[run.next - 1]);
             self.at_start = false;
         }
-        if found {
+        if run.found {
             self.matched = true;
         }
-        (i, found)
+        (run.next, run.found)
     }
 
     /// Signal end of input and return the final result.
@@ -1084,11 +961,7 @@ impl GroupedStream {
     /// Whether this byte runs the full sweep.
     #[inline]
     fn full_sweep(&self, plan: &GroupedNfaPlan, sweep: Sweep) -> bool {
-        match sweep {
-            Sweep::Full => true,
-            Sweep::Active => false,
-            Sweep::Auto => plan.rows() <= SMALL_PLAN_ROWS || self.live as usize * 8 >= plan.rows(),
-        }
+        bitmap::full_sweep(sweep, plan.rows(), self.live)
     }
 
     /// Close before `b`, then consume it: the raw rows are replaced by the

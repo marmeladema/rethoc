@@ -49,6 +49,13 @@ jobs:
           scripts/capped --time 1800
           target/release/rethoc fuzz --batch 250
           --allow-slow ci/known-slow-seeds.txt 0 9000
+      # The experimental sparse counting variant of the grouped NFA is
+      # checked only on request: the runs above do not compile it.
+      - name: Fuzz seeds 0..9000, sparse counting
+        if: ${{ !cancelled() }}
+        run: >-
+          scripts/capped --time 1800
+          target/release/rethoc fuzz --batch 250 --sparse-counting 0 9000
       # Disabled until #5 is fixed: one MatcherMemory reused across regexes
       # panics (from seed 6).  Enable it in the PR that fixes #5.
       # - name: Fuzz seeds 0..9000, one MatcherMemory per run

@@ -3221,7 +3221,17 @@ impl RegexBuilder {
         // The structure is proven once and laid out by each variant that
         // was asked for.
         let analyse_sparse = self.config.sparse_counting;
-        let structure = (analyse_grouped || analyse_sparse).then(|| {
+        // The sparse analysis budget covers the structure: it is checked
+        // before the structure is built on the sparse variant's account.
+        let sparse_limits = grouped_nfa::sparse::SparseLimits::DEFAULT;
+        let sparse_budget = analyse_sparse.then(|| {
+            grouped_nfa::sparse::analysis_budget(
+                self.states.len(),
+                self.counters.len(),
+                &sparse_limits,
+            )
+        });
+        let structure = (analyse_grouped || sparse_budget == Some(Ok(()))).then(|| {
             grouped_nfa::structure(
                 &self.states,
                 &byte_tables_slice,
@@ -3254,25 +3264,26 @@ impl RegexBuilder {
         });
         // Sparse counting: experimental and only on request.  It takes no
         // part in the selection below.
-        let sparse_counting = analyse_sparse.then(|| {
-            let structure = structure
-                .as_ref()
-                .expect("proven for sparse counting")
-                .as_ref()
-                .map_err(|rejection| *rejection);
-            Box::new(
-                match grouped_nfa::sparse::analyze(
+        let sparse_counting = sparse_budget.map(|budget| {
+            let plan = budget.and_then(|()| {
+                let structure = structure
+                    .as_ref()
+                    .expect("proven for sparse counting")
+                    .as_ref()
+                    .map_err(|rejection| *rejection);
+                grouped_nfa::sparse::analyze(
                     &self.states,
                     &classes_slice,
                     &byte_tables_slice,
                     start,
                     structure,
-                    &grouped_nfa::sparse::SparseLimits::DEFAULT,
-                ) {
-                    Ok(plan) => grouped_nfa::SparseCounting::Admitted(plan),
-                    Err(rejection) => grouped_nfa::SparseCounting::Rejected(rejection),
-                },
-            )
+                    &sparse_limits,
+                )
+            });
+            Box::new(match plan {
+                Ok(plan) => grouped_nfa::SparseCounting::Admitted(plan),
+                Err(rejection) => grouped_nfa::SparseCounting::Rejected(rejection),
+            })
         });
         drop(structure);
 
