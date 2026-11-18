@@ -149,6 +149,10 @@ enum Opts {
         /// Also analyse the grouped NFA when Tier 1 or 2 runs the pattern
         #[bpaf(long)]
         grouped_nfa: bool,
+        /// Also analyse the experimental sparse counting variant of the
+        /// grouped NFA and report its admission (selection is unchanged)
+        #[bpaf(long)]
+        sparse_counting: bool,
         #[bpaf(external(compile_args))]
         compile: CompileArgs,
         #[bpaf(positional("PATTERN"))]
@@ -175,6 +179,10 @@ enum Opts {
         /// engine; `--tier` forces a numbered tier)
         #[bpaf(long)]
         grouped_nfa: bool,
+        /// Force the experimental sparse counting variant of the grouped
+        /// NFA; fails if it does not admit the pattern
+        #[bpaf(long)]
+        sparse_counting: bool,
         /// Print matcher state after each step
         #[bpaf(long)]
         debug: bool,
@@ -195,6 +203,10 @@ enum Opts {
         /// Force the grouped NFA
         #[bpaf(long)]
         grouped_nfa: bool,
+        /// Force the experimental sparse counting variant of the grouped
+        /// NFA; fails if it does not admit the pattern
+        #[bpaf(long)]
+        sparse_counting: bool,
         /// Print nothing; stop at the first matching line
         #[bpaf(short, long)]
         quiet: bool,
@@ -217,6 +229,10 @@ enum Opts {
         /// Also analyse the grouped NFA when Tier 1 or 2 runs the pattern
         #[bpaf(long)]
         grouped_nfa: bool,
+        /// Also analyse the experimental sparse counting variant of the
+        /// grouped NFA and report its admission (selection is unchanged)
+        #[bpaf(long)]
+        sparse_counting: bool,
         #[bpaf(external(compile_args))]
         compile: CompileArgs,
         #[bpaf(positional("PATTERN"))]
@@ -257,12 +273,67 @@ fn validate_tier(tier: Option<u8>) {
     }
 }
 
-/// Exit with a usage error if `--grouped-nfa` is combined with a tier
-/// selection: it selects a backend that is not a tier.
-fn validate_grouped(grouped: bool, tier: Option<u8>, skip_tier: Option<u8>) {
-    if grouped && (tier.is_some() || skip_tier.is_some()) {
-        eprintln!("error: --grouped-nfa cannot be combined with --tier or --skip-tier");
+/// Exit with a usage error if `--grouped-nfa` or `--sparse-counting` is
+/// combined with a tier selection, or with each other: each selects one
+/// backend that is not a tier.
+fn validate_grouped(grouped: bool, sparse: bool, tier: Option<u8>, skip_tier: Option<u8>) {
+    for (flag, set) in [("--grouped-nfa", grouped), ("--sparse-counting", sparse)] {
+        if set && (tier.is_some() || skip_tier.is_some()) {
+            eprintln!("error: {flag} cannot be combined with --tier or --skip-tier");
+            process::exit(check::EXIT_USAGE);
+        }
+    }
+    if grouped && sparse {
+        eprintln!("error: --grouped-nfa cannot be combined with --sparse-counting");
         process::exit(check::EXIT_USAGE);
+    }
+}
+
+/// The engine a `match` or `grep` runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Forced {
+    /// Automatic selection.
+    Auto,
+    Tier(u8),
+    Grouped,
+    /// The experimental sparse counting variant of the grouped NFA.
+    Sparse,
+}
+
+impl Forced {
+    /// From `--tier`, `--grouped-nfa` and `--sparse-counting`, already
+    /// checked for combining them.
+    fn new(tier: Option<u8>, grouped: bool, sparse: bool) -> Self {
+        match (tier, grouped, sparse) {
+            (Some(t), _, _) => Self::Tier(t),
+            (None, true, _) => Self::Grouped,
+            (None, false, true) => Self::Sparse,
+            (None, false, false) => Self::Auto,
+        }
+    }
+
+    /// Have the compiler analyse what this choice needs.
+    fn configure(self, config: &mut RegexConfig) {
+        match self {
+            Self::Grouped => config.grouped_nfa = GroupedNfaMode::Always,
+            Self::Sparse => config.sparse_counting = true,
+            Self::Auto | Self::Tier(_) => {}
+        }
+    }
+
+    /// A matcher on this engine, or why the regex cannot run on it: a
+    /// forced engine is never replaced by another.
+    fn matcher<'a>(
+        self,
+        memory: &'a mut MatcherMemory,
+        regex: &'a Regex,
+    ) -> Result<AnyMatcher<'a>, String> {
+        match self {
+            Self::Auto => Ok(memory.matcher(regex)),
+            Self::Tier(tier) => memory.matcher_for_tier(regex, tier),
+            Self::Grouped => memory.matcher_grouped(regex).map_err(|e| e.to_string()),
+            Self::Sparse => memory.matcher_sparse(regex).map_err(|e| e.to_string()),
+        }
     }
 }
 
@@ -325,19 +396,17 @@ fn run_dump(pattern: &str, config: RegexConfig, format: Format, dfa: bool) {
     }
 }
 
-/// `match`: automatic selection, or a forced tier or the grouped NFA.
+/// `match`: automatic selection, or a forced tier, the grouped NFA or
+/// its sparse counting variant.
 fn run_match(
     pattern: &str,
     inputs: &[String],
     chunk_size: Option<usize>,
-    tier: Option<u8>,
-    grouped: bool,
+    forced: Forced,
     mut config: RegexConfig,
     debug: bool,
 ) {
-    if grouped {
-        config.grouped_nfa = GroupedNfaMode::Always;
-    }
+    forced.configure(&mut config);
     let regex = parse_pattern(pattern, config);
     let mut memory = check::new_memory();
 
@@ -346,33 +415,35 @@ fn run_match(
     if let Some(cs) = chunk_size {
         eprintln!("chunk_size: {cs}");
     }
-    match (tier, grouped) {
-        (Some(t), _) => eprintln!("tier: {t} (forced)"),
-        (None, true) => eprintln!("engine: grouped (forced)"),
-        (None, false) => eprintln!("engine: {} (automatic)", regex.engine()),
+    match forced {
+        Forced::Tier(t) => eprintln!("tier: {t} (forced)"),
+        Forced::Grouped => eprintln!("engine: grouped (forced)"),
+        Forced::Sparse => eprintln!("engine: sparse (forced, experimental)"),
+        Forced::Auto => eprintln!("engine: {} (automatic)", regex.engine()),
     }
-    if grouped && let Err(e) = regex.grouped_nfa_admission() {
+    // A forced engine that cannot run the pattern is an error, before any
+    // input: never a fallback.
+    if let Err(e) = forced.matcher(&mut memory, &regex) {
         eprintln!("error: {e}");
         process::exit(1);
     }
     // The plan summary whenever the grouped NFA was analysed (forced, or
     // under automatic selection when neither Tier 1 nor Tier 2 applies).
-    if let Some(g) = &regex.info().grouped_nfa {
+    let info = regex.info();
+    if let Some(g) = &info.grouped_nfa {
         eprintln!("grouped NFA: {g}");
+    }
+    if let Some(s) = &info.sparse_counting {
+        eprintln!("sparse counting: {s}");
     }
     eprintln!();
 
     let mut any_failed = false;
     for input in inputs {
         let bytes = input.as_bytes();
-        let mut matcher = match tier {
-            Some(t) => memory.matcher_for_tier(&regex, t).unwrap_or_else(|e| {
-                eprintln!("error: {e}");
-                process::exit(1);
-            }),
-            None if grouped => memory.matcher_grouped(&regex).expect("admitted"),
-            None => memory.matcher(&regex),
-        };
+        let mut matcher = forced
+            .matcher(&mut memory, &regex)
+            .expect("the engine was checked before the first input");
 
         if debug {
             eprintln!("--- input: {:?} ---", input);
@@ -424,15 +495,9 @@ fn run_match(
 fn grep_matcher<'a>(
     memory: &'a mut MatcherMemory,
     regex: &'a Regex,
-    tier: Option<u8>,
-    grouped: bool,
+    forced: Forced,
 ) -> AnyMatcher<'a> {
-    let result = match tier {
-        Some(tier) => memory.matcher_for_tier(regex, tier),
-        None if grouped => memory.matcher_grouped(regex).map_err(|e| e.to_string()),
-        None => return memory.matcher(regex),
-    };
-    result.unwrap_or_else(|e| {
+    forced.matcher(memory, regex).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         process::exit(1);
     })
@@ -443,16 +508,15 @@ fn run_grep(
     file: Option<&str>,
     mut config: RegexConfig,
     quiet: bool,
-    tier: Option<u8>,
-    grouped: bool,
+    forced: Forced,
 ) {
-    if grouped {
-        config.grouped_nfa = GroupedNfaMode::Always;
-    }
+    forced.configure(&mut config);
     let regex = parse_pattern(pattern, config);
     let mut memory = check::new_memory();
-    if tier.is_some() || grouped {
-        grep_matcher(&mut memory, &regex, tier, grouped);
+    // A forced engine is validated before any line is read, also for an
+    // empty file.
+    if forced != Forced::Auto {
+        grep_matcher(&mut memory, &regex, forced);
     }
 
     let reader: Box<dyn BufRead> = match file {
@@ -475,7 +539,7 @@ fn run_grep(
             eprintln!("error: reading input: {e}");
             process::exit(1);
         });
-        let mut matcher = grep_matcher(&mut memory, &regex, tier, grouped);
+        let mut matcher = grep_matcher(&mut memory, &regex, forced);
         matcher.chunk(line.as_bytes());
         if matcher.finish() {
             if !quiet {
@@ -503,6 +567,7 @@ fn main() {
         Opts::Info {
             format,
             grouped_nfa,
+            sparse_counting,
             compile,
             pattern,
         } => {
@@ -510,6 +575,7 @@ fn main() {
             if grouped_nfa {
                 config.grouped_nfa = GroupedNfaMode::Always;
             }
+            config.sparse_counting = sparse_counting;
             run_info(&pattern, config, format)
         }
         Opts::Dot { compile, pattern } => run_dot(&pattern, compile.config()),
@@ -517,13 +583,14 @@ fn main() {
             chunk_size,
             tier,
             grouped_nfa,
+            sparse_counting,
             debug,
             compile,
             pattern,
             inputs,
         } => {
             validate_tier(tier);
-            validate_grouped(grouped_nfa, tier, None);
+            validate_grouped(grouped_nfa, sparse_counting, tier, None);
             if chunk_size == Some(0) {
                 eprintln!("error: --chunk-size must be > 0");
                 process::exit(check::EXIT_USAGE);
@@ -532,8 +599,7 @@ fn main() {
                 &pattern,
                 &inputs,
                 chunk_size,
-                tier,
-                grouped_nfa,
+                Forced::new(tier, grouped_nfa, sparse_counting),
                 compile.config(),
                 debug,
             )
@@ -541,26 +607,27 @@ fn main() {
         Opts::Grep {
             tier,
             grouped_nfa,
+            sparse_counting,
             quiet,
             compile,
             pattern,
             file,
         } => {
             validate_tier(tier);
-            validate_grouped(grouped_nfa, tier, None);
+            validate_grouped(grouped_nfa, sparse_counting, tier, None);
             run_grep(
                 &pattern,
                 file.as_deref(),
                 compile.config(),
                 quiet,
-                tier,
-                grouped_nfa,
+                Forced::new(tier, grouped_nfa, sparse_counting),
             )
         }
         Opts::Dump {
             format,
             dfa,
             grouped_nfa,
+            sparse_counting,
             compile,
             pattern,
         } => {
@@ -568,28 +635,39 @@ fn main() {
             if grouped_nfa {
                 config.grouped_nfa = GroupedNfaMode::Always;
             }
+            config.sparse_counting = sparse_counting;
             run_dump(&pattern, config, format, dfa)
         }
         Opts::Brute(args) => {
             validate_tier(args.tier);
             validate_skip_tier(args.tier, args.skip_tier);
-            validate_grouped(args.grouped_nfa, args.tier, args.skip_tier);
+            validate_grouped(
+                args.grouped_nfa,
+                args.sparse_counting,
+                args.tier,
+                args.skip_tier,
+            );
             process::exit(check::brute::run(&args))
         }
         Opts::Fuzz(args) => {
             validate_tier(args.tier);
-            validate_grouped(args.grouped_nfa, args.tier, None);
+            validate_grouped(args.grouped_nfa, args.sparse_counting, args.tier, None);
             process::exit(check::fuzz::run(&args))
         }
         Opts::Shrink(args) => {
             validate_tier(args.tier);
-            validate_grouped(args.grouped_nfa, args.tier, None);
+            validate_grouped(args.grouped_nfa, args.sparse_counting, args.tier, None);
             process::exit(check::shrink::run(&args))
         }
         Opts::Sweep(args) => {
             validate_tier(args.tier);
             validate_skip_tier(args.tier, args.skip_tier);
-            validate_grouped(args.grouped_nfa, args.tier, args.skip_tier);
+            validate_grouped(
+                args.grouped_nfa,
+                args.sparse_counting,
+                args.tier,
+                args.skip_tier,
+            );
             process::exit(check::sweep::run(&args))
         }
     }

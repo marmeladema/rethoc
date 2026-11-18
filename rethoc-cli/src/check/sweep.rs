@@ -83,6 +83,10 @@ pub(crate) struct SweepArgs {
     /// does not admit count as rejected
     #[bpaf(long)]
     pub(crate) grouped_nfa: bool,
+    /// Check only the NFA and the experimental sparse counting variant
+    /// of the grouped NFA; patterns it does not admit are rejected
+    #[bpaf(long)]
+    pub(crate) sparse_counting: bool,
     /// Longest input to try, instead of the family's own length (a
     /// shorter one for a quick pass, e.g. with a debug build)
     #[bpaf(long, argument("N"))]
@@ -102,10 +106,16 @@ impl SweepArgs {
             && self.tier.is_none()
             && self.skip_tier.is_none()
             && !self.grouped_nfa
+            && !self.sparse_counting
         {
             TierChoice::Only(1)
         } else {
-            TierChoice::new(self.tier, self.skip_tier, self.grouped_nfa)
+            TierChoice::new(
+                self.tier,
+                self.skip_tier,
+                self.grouped_nfa,
+                self.sparse_counting,
+            )
         }
     }
 }
@@ -159,6 +169,7 @@ impl SweepRun {
                     .splice(1..1, ["--skip-tier".into(), tier.to_string()]);
             }
             TierChoice::Grouped => self.args.insert(1, "--grouped-nfa".into()),
+            TierChoice::Sparse => self.args.insert(1, "--sparse-counting".into()),
         }
     }
 }
@@ -593,6 +604,7 @@ mod tests {
             (&["--skip-tier", "1"], TierChoice::Except(1)),
             (&["--skip-tier", "3"], TierChoice::Except(3)),
             (&["--grouped-nfa"], TierChoice::Grouped),
+            (&["--sparse-counting"], TierChoice::Sparse),
         ];
         for &(selectors, expected) in cases {
             let args = parse_sweep(selectors, "tier1-assert");
@@ -600,7 +612,12 @@ mod tests {
             run.configure(args.max_len, args.choice());
             let child = parse_child(&run);
             assert_eq!(
-                TierChoice::new(child.tier, child.skip_tier, child.grouped_nfa),
+                TierChoice::new(
+                    child.tier,
+                    child.skip_tier,
+                    child.grouped_nfa,
+                    child.sparse_counting
+                ),
                 expected,
                 "selectors={selectors:?}",
             );

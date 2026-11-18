@@ -61,6 +61,9 @@ pub struct MemoryInfo {
     /// Bytes of the grouped NFA plan or rejection; 0 when its analysis did
     /// not run.
     pub grouped_nfa: usize,
+    /// Bytes of the sparse counting plan or rejection; 0 when it was not
+    /// requested.
+    pub sparse_counting: usize,
 }
 
 /// Breakdown of NFA states by kind.
@@ -139,6 +142,54 @@ pub enum GroupedNfaInfo {
     },
 }
 
+/// Sparse counting diagnostics (experimental), present when the regex was
+/// compiled with `RegexConfig::sparse_counting`.  The variant is never
+/// selected automatically.
+///
+/// Persistent bytes (the plan, on the regex), per-stream bytes and
+/// per-worker scratch bytes are reported separately.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum SparseCountingInfo {
+    /// The analysis admitted the graph.
+    Admitted {
+        /// Heap bytes of the plan arrays.
+        plan_bytes: usize,
+        /// Rows: reachable NFA states.
+        rows: usize,
+        /// Rows inside a counted scope.
+        counted_rows: usize,
+        /// Count slots reserved in one frontier: the capacities of the
+        /// counted rows.
+        slots: usize,
+        /// The counted scopes.
+        scopes: Vec<SparseScopeInfo>,
+        /// Bytes of one stream (`SparseStream::memory_bytes`).
+        stream_bytes: usize,
+        /// Bytes of a worker's scratch prepared for this plan
+        /// (`SparseScratch::memory_bytes`).
+        scratch_bytes: usize,
+    },
+    /// The analysis rejected the graph.
+    Rejected {
+        /// Why.
+        reason: String,
+    },
+}
+
+/// A counted scope of a sparse counting plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SparseScopeInfo {
+    /// Counter slot index.
+    pub counter: usize,
+    /// Minimum number of iterations.
+    pub min: usize,
+    /// Maximum number of iterations.
+    pub max: usize,
+    /// Most count values one row of the scope keeps (its reserved slots).
+    pub capacity: usize,
+}
+
 /// Start-closure diagnostics.
 ///
 /// The start closure is the set of byte-consuming states reachable
@@ -199,6 +250,9 @@ pub struct RegexInfo {
     /// Grouped NFA analysis, when it ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grouped_nfa: Option<GroupedNfaInfo>,
+    /// Sparse counting analysis (experimental), when it was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse_counting: Option<SparseCountingInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +273,38 @@ impl fmt::Display for GroupedNfaInfo {
                 "admitted, {rows} rows, {row_words} words; plan {plan_bytes} bytes, \
                  stream {stream_bytes} bytes, scratch {scratch_bytes} bytes"
             ),
+            Self::Rejected { reason } => write!(f, "rejected: {reason}"),
+        }
+    }
+}
+
+impl fmt::Display for SparseCountingInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Admitted {
+                plan_bytes,
+                rows,
+                counted_rows,
+                slots,
+                scopes,
+                stream_bytes,
+                scratch_bytes,
+            } => {
+                write!(
+                    f,
+                    "admitted, {rows} rows ({counted_rows} counted), {slots} count slots; \
+                     plan {plan_bytes} bytes, stream {stream_bytes} bytes, \
+                     scratch {scratch_bytes} bytes"
+                )?;
+                for s in scopes {
+                    write!(
+                        f,
+                        "\n  counter {}: {{{},{}}}, at most {} values per row",
+                        s.counter, s.min, s.max, s.capacity
+                    )?;
+                }
+                Ok(())
+            }
             Self::Rejected { reason } => write!(f, "rejected: {reason}"),
         }
     }
@@ -353,6 +439,11 @@ impl fmt::Display for RegexInfo {
             writeln!(f)?;
             writeln!(f)?;
             write!(f, "Grouped NFA: {g}")?;
+        }
+        if let Some(s) = &self.sparse_counting {
+            writeln!(f)?;
+            writeln!(f)?;
+            write!(f, "Sparse counting (experimental, forced only): {s}")?;
         }
         Ok(())
     }

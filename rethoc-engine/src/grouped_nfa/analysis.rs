@@ -5,6 +5,14 @@
 //! immutable [`GroupedNfaPlan`] or a [`Rejection`] naming the first reason
 //! the graph is outside the admitted class (`plans/grouped-nfa.md`, §2–3).
 //!
+//! It has two parts.  [`structure`] proves what does not depend on how
+//! count sets are stored: one scope per reachable state, an acyclic
+//! zero-width graph, reviewed assertions and consistent counter bounds
+//! ([`Structure`]).  [`layout`] then sizes the exact rows and builds the
+//! plan.  The sparse variant ([`super::sparse`]) lays out the same
+//! [`Structure`] its own way, so a graph rejected here only for its row
+//! words can still be admitted there.
+//!
 //! Every budget is checked before the array it bounds is allocated.
 
 use std::fmt;
@@ -457,7 +465,24 @@ pub(crate) fn analysis_bytes(states: usize, num_counters: usize) -> usize {
         + num_counters * size_of::<Option<(usize, usize)>>()
 }
 
-/// Analyse the final state array and build a plan, or say why not.
+/// What [`structure`] proves of a graph, whatever the representation of
+/// its count sets.
+#[derive(Debug)]
+pub(crate) struct Structure {
+    /// The scope of each state; `None` if unreachable.
+    pub(crate) label: Vec<Option<Scope>>,
+    /// The reachable states in a topological order of the zero-width
+    /// graph.
+    pub(crate) order: Vec<StateIdx>,
+    /// The bounds of each counter with a reachable increment; unbounded is
+    /// `max == usize::MAX`.  Finite bounds satisfy `1 <= max` and
+    /// `min <= max`.
+    pub(crate) bounds: Vec<Option<(usize, usize)>>,
+}
+
+/// Analyse the final state array and build a plan, or say why not:
+/// [`structure`], then [`layout`].
+#[cfg(test)]
 pub(crate) fn analyze(
     states: &[State],
     classes: &[ByteClassBits],
@@ -467,6 +492,28 @@ pub(crate) fn analyze(
     counter_info: &[CounterInfo],
     limits: &Limits,
 ) -> Result<GroupedNfaPlan, Rejection> {
+    let structure = structure(
+        states,
+        byte_tables,
+        start,
+        num_counters,
+        counter_info,
+        limits,
+    )?;
+    layout(states, classes, byte_tables, start, &structure, limits)
+}
+
+/// Prove the structure of the final state array: the part of the
+/// admission that does not depend on the representation of count sets.
+/// Reads `max_states`, `max_edges` and `max_analysis_bytes` of `limits`.
+pub(crate) fn structure(
+    states: &[State],
+    byte_tables: &[ByteMap],
+    start: StateIdx,
+    num_counters: usize,
+    counter_info: &[CounterInfo],
+    limits: &Limits,
+) -> Result<Structure, Rejection> {
     if states.len() > limits.max_states {
         return Err(Rejection::TooManyStates {
             states: states.len(),
@@ -490,13 +537,35 @@ pub(crate) fn analyze(
         return Err(Rejection::UnreviewedAssertion { state: idx.0 });
     }
     let bounds = counter_bounds(states, &reachable, counter_info, num_counters)?;
+    Ok(Structure {
+        label,
+        order,
+        bounds,
+    })
+}
+
+/// Lay out the exact rows of a proven [`Structure`] and build the plan.
+/// Reads `max_row_words` and `max_plan_bytes` of `limits`.
+pub(crate) fn layout(
+    states: &[State],
+    classes: &[ByteClassBits],
+    byte_tables: &[ByteMap],
+    start: StateIdx,
+    structure: &Structure,
+    limits: &Limits,
+) -> Result<GroupedNfaPlan, Rejection> {
+    let Structure {
+        label,
+        order,
+        bounds,
+    } = structure;
 
     // Row layout, in topological order so a closure pass walks the arena
     // roughly front to back.
     let mut words = 0usize;
-    for &idx in &order {
+    for &idx in order {
         let scope = label[idx.idx()].expect("reachable");
-        words = words.saturating_add(row_words(scope, &bounds));
+        words = words.saturating_add(row_words(scope, bounds));
     }
     if words > limits.max_row_words {
         return Err(Rejection::TooManyRowWords {
@@ -535,8 +604,8 @@ pub(crate) fn analyze(
     // Rows in node order.
     let mut rows = Vec::with_capacity(order.len());
     let mut off = 0u32;
-    for &idx in &order {
-        let words = row_words(label[idx.idx()].expect("reachable"), &bounds) as u32;
+    for &idx in order {
+        let words = row_words(label[idx.idx()].expect("reachable"), bounds) as u32;
         rows.push(Row { off, words });
         off += words;
     }

@@ -38,6 +38,10 @@ pub(crate) struct FuzzArgs {
     /// does not admit are rejected
     #[bpaf(long)]
     pub(crate) grouped_nfa: bool,
+    /// Check only the NFA and the experimental sparse counting variant
+    /// of the grouped NFA; patterns it does not admit are rejected
+    #[bpaf(long)]
+    pub(crate) sparse_counting: bool,
     /// Use one MatcherMemory for every pattern of the run
     #[bpaf(long)]
     pub(crate) shared_memory: bool,
@@ -174,6 +178,8 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
     // Checks on the grouped NFA, and compiled configurations it did not
     // admit (it is not a tier: counted apart, never silently).
     let (mut grouped_checks, mut grouped_rejected) = (0u64, 0u64);
+    // The same for its sparse counting variant.
+    let (mut sparse_checks, mut sparse_rejected) = (0u64, 0u64);
     for seed in args.first..end {
         if skip.contains(&seed) {
             continue;
@@ -211,7 +217,7 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
             match Subject::compile(
                 &pattern,
                 config,
-                super::TierChoice::new(args.tier, None, args.grouped_nfa),
+                super::TierChoice::new(args.tier, None, args.grouped_nfa, args.sparse_counting),
                 memory,
             ) {
                 Ok(subject) => {
@@ -224,9 +230,11 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
                         );
                     }
                     grouped_rejected += u64::from(subject.grouped_rejection.is_some());
+                    sparse_rejected += u64::from(subject.sparse_rejection.is_some());
                     subjects.push((subject, own));
                 }
                 Err(super::Rejection::NotAdmitted(_)) => grouped_rejected += 1,
+                Err(super::Rejection::SparseNotAdmitted(_)) => sparse_rejected += 1,
                 Err(_) => {}
             }
         }
@@ -244,6 +252,7 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
                     match b {
                         Backend::Tier(t) => per_tier[t as usize] += 2,
                         Backend::Grouped => grouped_checks += 2,
+                        Backend::Sparse => sparse_checks += 2,
                     }
                 }
                 if failures.is_empty() {
@@ -280,7 +289,7 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
         }
     }
     println!(
-        "seeds {}..{end}{} cases={cases} reference-rejected={skipped} compiled={compiled} checks={checks} per-tier={per_tier:?} grouped={grouped_checks} grouped-rejected={grouped_rejected} mismatches={mismatches}",
+        "seeds {}..{end}{} cases={cases} reference-rejected={skipped} compiled={compiled} checks={checks} per-tier={per_tier:?} grouped={grouped_checks} grouped-rejected={grouped_rejected} sparse={sparse_checks} sparse-rejected={sparse_rejected} mismatches={mismatches}",
         args.first,
         regime_note()
     );
@@ -379,6 +388,9 @@ fn supervise(args: &FuzzArgs) -> i32 {
     }
     if args.grouped_nfa {
         common.push("--grouped-nfa".into());
+    }
+    if args.sparse_counting {
+        common.push("--sparse-counting".into());
     }
     if args.shared_memory {
         common.push("--shared-memory".into());

@@ -64,7 +64,7 @@ pub(crate) struct BoundaryCtx {
 }
 
 impl BoundaryCtx {
-    fn eval(self, kind: crate::AssertKind) -> AssertEval {
+    pub(crate) fn eval(self, kind: crate::AssertKind) -> AssertEval {
         let (at_end, next) = match self.boundary {
             Boundary::UnknownNext => (false, None),
             Boundary::BeforeByte(b) => (false, Some(b)),
