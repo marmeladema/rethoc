@@ -36,7 +36,11 @@ the plan's §10 under forced counters, 64 KiB per scan: `range`, `rangemid`,
 `rangenarrow` and `rangeexact` (`x(a|aa|b){l,N}z`, a new `x` every `N`
 bytes), `sustained` and `sustainedx` (new entries do not kill the older
 ones), `mixed` (short-lived entries), `seq`, `holey`, `loop`, `phase`,
-`control`, and the exclusions `nested`, `nullable` and `unbounded`.
+`control`, and the exclusions `nested`, `nullable` and `unbounded`. Path
+`sparse` is the sparse counting variant forced (`ineligible` where it does
+not admit the pattern). The set also times four chunk sizes at bound 1000
+and default compilation as the end-to-end competitor; `--reps 3 --seed 7`
+runs every case three times in a shuffled, reproducible order.
 
 Timings say how long a scan takes, not what it does. For that, build the
 probe a second time with the engine's `op-stats` feature and add `--stats`:
@@ -80,8 +84,8 @@ and the latency of one chunk of one stream over all patterns. `check`
 compares every result with `regex` on the whole input after the
 measurements, so the oracle is in neither the time nor the memory.
 
-The grouped NFA shares the compiled plans and one worker scratch between
-all streams. The other engines have no stream type apart from
+The grouped NFA and its sparse variant (engine `sparse`) share the
+compiled plans and one worker scratch between all streams. The other engines have no stream type apart from
 `MatcherMemory`, so the harness gives every (stream, pattern) pair its
 own: their memory figures measure that API, not the least an engine needs.
 

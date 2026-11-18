@@ -65,6 +65,20 @@ the NFA exactly. The tests, the checking commands, the proptests and the
 cargo-fuzz targets run it on everything it admits. `MatcherMemory` shared
 between regexes on two different tiers among 1–3 panics (issue #5, open).
 
+**Sparse counting** (`rethoc-engine/src/grouped_nfa/sparse.rs`,
+`plans/sparse-counting-sets.md`): an experimental variant of the grouped
+NFA, **never selected automatically**.  A counted row holds a short sorted
+list of representative counts instead of a bitset of all of them; it
+shares the grouped NFA's structural analysis (`analysis::structure`) and
+admits finite flat counters whose rows need at most 32 values (so not
+exact counts like `{1000}`, nor `{n,}`).  `RegexConfig::sparse_counting`
+requests the analysis; `MatcherMemory::matcher_sparse()` and
+`SparseStream` force it, and never fall back.  It must agree with the NFA
+exactly; its rows are not the NFA's configurations but stand for them
+(same answers to every future exit), which the tests check against the
+exact rows.  The tests, the checking commands, the proptests and the
+cargo-fuzz targets run it on everything it admits.
+
 Repetitions are unrolled up to `max_unroll_states` and same-body
 repetitions merged, so a pattern may need counters only with unrolling or
 merging disabled. Many counter-tier bugs only show up that way.
@@ -114,6 +128,8 @@ cargo run --release -- match --tier 3 --unroll-limit 0 --no-merge '<pattern>' '<
 cargo run --release -- dump --dfa '<pattern>'  # NFA, classes, tier analysis
 cargo run --release -- match --grouped-nfa --debug --chunk-size 1 '<pattern>' '<input>'  # grouped rows per step
 cargo run --release -- info --grouped-nfa '<pattern>'  # selected engine, grouped admission, plan and stream sizes
+cargo run --release -- match --sparse-counting --debug --chunk-size 1 '<pattern>' '<input>'  # sparse rows per step
+cargo run --release -- info --sparse-counting '<pattern>'  # sparse admission, row capacities, sizes
 ```
 
 `--debug` prints matcher state after every chunk. Run the same input with
@@ -126,8 +142,9 @@ Options go after the command name; `rethoc <command> --help` lists them.
 `brute`, `fuzz`, `shrink` and `sweep` check rethoc against the `regex`
 crate: the NFA, every eligible tier and the grouped NFA when it admits
 the pattern (`grouped` in the backend lists, with the rejection reason
-when it does not), each fed whole and byte by byte. `--grouped-nfa`
-checks only the NFA and the grouped NFA.
+when it does not) and its sparse counting variant likewise (`sparse`),
+each fed whole and byte by byte. `--grouped-nfa` checks only the NFA and
+the grouped NFA; `--sparse-counting` only the NFA and the sparse variant.
 Unless given `--unroll-limit` or `--no-merge`, they compile each pattern
 three ways: default, unrolling off, unrolling and merging off. Inputs are
 read and printed with byte escapes (`\n`, `\xNN`), and every mismatch

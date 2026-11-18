@@ -5,8 +5,10 @@
 `--sparse` runs the families of plans/sparse-counting-sets.md, section 10;
 with `--stats` it prints what one scan does (admission, sizes, allocations
 and operation counters) instead of timings, which needs a probe built with
-`--features op-stats`.
+`--features op-stats`.  `--reps N` runs every timed case N times, in an
+order shuffled with the fixed seed `--seed S` (default 1).
 """
+import random
 import subprocess
 import sys
 
@@ -34,10 +36,13 @@ if "--grouped" in sys.argv:
         for path in ["4", "grouped"]:
             cases.append(("nested", bound, 1024, path, 1024, "counters"))
 elif "--sparse" in sys.argv:
-    # Forced counters only: under default compilation small bounds unroll
-    # and the comparison is no longer one of representations.  With
-    # `--stats` only the grouped NFA has counters to report.
-    paths = ["grouped"] if stats else ["auto", "0", "2", "4", "grouped", "grouped-full", "grouped-active"]
+    # Forced counters: under default compilation small bounds unroll and
+    # the comparison is no longer one of representations.  Default
+    # compilation is run apart, below, as the end-to-end competitor.
+    # With `--stats` only the grouped NFA and its sparse variant have
+    # counters to report.
+    paths = (["grouped", "sparse"] if stats
+             else ["auto", "0", "2", "4", "grouped", "grouped-full", "grouped-active", "sparse"])
     for family in ["range", "rangemid", "rangenarrow", "rangeexact", "sustained", "sustainedx",
                    "mixed", "seq", "phase", "unbounded"]:
         for bound in [8, 64, 256, 1000]:
@@ -48,6 +53,15 @@ elif "--sparse" in sys.argv:
             cases.append((family, 8, 65536, path, 4096, "counters"))
     for path in paths:
         cases.append(("nested", 8, 65536, path, 4096, "counters"))
+    if not stats:
+        for family in ["range", "rangenarrow", "sustained", "mixed"]:
+            # Chunk sizes: one byte, 16, a packet, 16 KiB.
+            for chunk in [1, 16, 1500, 16384]:
+                for path in ["grouped", "sparse"]:
+                    cases.append((family, 1000, 65536, path, chunk, "counters"))
+            for bound in [8, 64, 256, 1000]:
+                for path in ["auto", "grouped", "sparse"]:
+                    cases.append((family, bound, 65536, path, 4096, "default"))
 else:
     for family in ["flat", "phase", "variable", "prefix"]:
         for bound in [8, 64, 256]:
@@ -66,6 +80,14 @@ else:
     for bound in [4, 8, 16]:
         for size in [256, 1024]:
             cases.append(("nested", bound, size, 4, size, "counters"))
+def option(name, default):
+    return int(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else default
+
+
+if not stats:
+    cases = cases * option("--reps", 1)
+    if "--reps" in sys.argv:
+        random.Random(option("--seed", 1)).shuffle(cases)
 header_printed = not stats
 for case in cases:
     args = list(map(str, case)) + (["stats"] if stats else [])

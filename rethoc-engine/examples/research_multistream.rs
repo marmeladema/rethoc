@@ -10,7 +10,7 @@
 //! `MatcherMemory`.
 //!
 //! ```text
-//! research_multistream ENGINE PATTERNS STREAMS BYTES CHUNK default|counters LIMIT [check]
+//! research_multistream ENGINE PATTERNS STREAMS BYTES CHUNK default|counters LIMIT [check] [common]
 //! ```
 //!
 //! `ENGINE` is `auto`, `grouped`, `sparse` (the experimental sparse
@@ -19,6 +19,8 @@
 //! Patterns the compiler or the engine rejects are left out and reported.
 //! `check` compares every result with `regex` on the whole input, after
 //! the measurements, so the oracle is in neither the time nor the memory.
+//! `common` keeps only the patterns that both the grouped NFA and its
+//! sparse variant admit, so that the two engines scan the same set.
 //!
 //! Allocator figures need a build with `--features op-stats`; take times
 //! from a build without it.
@@ -143,10 +145,12 @@ enum Fleet<'a> {
 
 fn main() {
     let args: Vec<_> = std::env::args().collect();
+    let flags = &args[8.min(args.len())..];
     assert!(
-        args.len() == 8 || (args.len() == 9 && args[8] == "check"),
-        "engine patterns streams bytes chunk default|counters limit [check]"
+        args.len() >= 8 && flags.iter().all(|f| f == "check" || f == "common"),
+        "engine patterns streams bytes chunk default|counters limit [check] [common]"
     );
+    let common = flags.iter().any(|f| f == "common");
     let engine = args[1].as_str();
     let grouped = engine == "grouped";
     let sparse = engine == "sparse";
@@ -165,7 +169,7 @@ fn main() {
         other => panic!("config `{other}`: default or counters"),
     };
     let limit: usize = args[7].parse().expect("limit");
-    let check = args.len() == 9;
+    let check = flags.iter().any(|f| f == "check");
     println!(
         "config engine={engine} patterns={num_patterns} streams={num_streams} bytes={bytes} \
          chunk={chunk} compile={} max_estimated_states={limit} instrumented={}",
@@ -184,12 +188,12 @@ fn main() {
             defaults.max_unroll_states
         },
         merge_repetitions: !counters,
-        grouped_nfa: if grouped {
+        grouped_nfa: if grouped || common {
             GroupedNfaMode::Always
         } else {
             GroupedNfaMode::Auto
         },
-        sparse_counting: sparse,
+        sparse_counting: sparse || common,
         ..defaults
     };
     let mut excluded: BTreeMap<(&str, String), usize> = BTreeMap::new();
@@ -227,6 +231,12 @@ fn main() {
             exclude(family, "engine", e);
             continue;
         }
+        if common
+            && (re.grouped_nfa_admission().is_err() || re.sparse_counting_admission().is_err())
+        {
+            exclude(family, "common", "not admitted by both".to_string());
+            continue;
+        }
         *selected.entry(re.engine().to_string()).or_default() += 1;
         regexes.push(re);
         sources.push(source);
@@ -245,8 +255,8 @@ fn main() {
         .map(|re| {
             let info = re.info();
             match (info.grouped_nfa, info.sparse_counting) {
-                (_, Some(SparseCountingInfo::Admitted { plan_bytes, .. })) => plan_bytes,
-                (Some(GroupedNfaInfo::Admitted { plan_bytes, .. }), _) => plan_bytes,
+                (_, Some(SparseCountingInfo::Admitted { plan_bytes, .. })) if sparse => plan_bytes,
+                (Some(GroupedNfaInfo::Admitted { plan_bytes, .. }), _) if !sparse => plan_bytes,
                 _ => 0,
             }
         })

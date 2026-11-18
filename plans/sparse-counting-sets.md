@@ -1,7 +1,11 @@
 # Sparse counting sets on the grouped NFA
 
-Status: experiment plan, not an implemented engine or an automatic-selection
-change. Verified source baseline: `730eebd5abd4d176bf22a0a0eee491522e154264`,
+Status: milestones S0–S4 are implemented (`grouped_nfa/sparse.rs`, forced
+only: `RegexConfig::sparse_counting`, `--sparse-counting`); automatic selection
+is unchanged. The measurements of S5 are taken with the probes of
+[the benchmark method](../docs/research/counting-benchmark-method.md) and kept
+out of the tree. What follows is the plan as written before implementation:
+an experiment plan, not an automatic-selection change. Verified source baseline: `730eebd5abd4d176bf22a0a0eee491522e154264`,
 latest `origin/main` when fetched on 2026-11-18. The branch is rebased onto it.
 Since the original audit at `c84282e`, only CLI `grep` engine selection changed;
 the counting runtime and assertion evaluator are unchanged.

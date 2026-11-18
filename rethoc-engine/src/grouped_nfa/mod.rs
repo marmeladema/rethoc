@@ -28,6 +28,10 @@
 //! or run on a [`GroupedStream`] with a separately owned
 //! [`GroupedScratch`].
 //!
+//! [`sparse`] is an experimental variant on the same structural analysis:
+//! its rows hold a few representative counts instead of all of them.  It
+//! is only ever forced ([`SparseStream`]).
+//!
 //! Admitted graphs ([`analysis`]): every reachable state has one incoming
 //! scope (outside, or inside exactly one counter), the zero-width graph is
 //! acyclic, the frontier fits the word budget, and every assertion is of a
