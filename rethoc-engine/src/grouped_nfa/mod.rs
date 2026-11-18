@@ -275,7 +275,7 @@ pub(crate) struct CountFreeTables {
 impl CountFreeTables {
     /// Heap bytes of the tables of a plan of `nodes` nodes and `a` bitmap
     /// words, the boxed struct included.
-    fn bytes_for(nodes: usize, a: usize) -> usize {
+    pub(crate) fn bytes_for(nodes: usize, a: usize) -> usize {
         size_of::<Self>() + (nodes + 256 + 3) * a * size_of::<u64>() + size_of::<[bool; 256]>()
     }
 }

@@ -642,23 +642,31 @@ fn limits_below_at_and_above() {
             limit: full.slots - 1
         })
     );
-    // The plan budget drops the optional idle table first.
+    // The plan budget drops the optional tables first: the count-free
+    // tables, then the idle table.
     let bytes = full.heap_bytes();
-    assert!(full.idle.is_some());
+    assert!(full.count_free.is_some() && full.idle.is_some());
     assert_eq!(with(&|l| l.max_plan_bytes = bytes), Ok(()));
-    let without = run(SparseLimits {
-        max_plan_bytes: bytes - 1,
-        ..SparseLimits::DEFAULT
-    })
-    .unwrap();
-    assert!(without.idle.is_none());
-    assert_eq!(without.heap_bytes(), bytes - 256);
-    assert_eq!(with(&|l| l.max_plan_bytes = bytes - 256), Ok(()));
+    let plan_with = |max_plan_bytes| {
+        run(SparseLimits {
+            max_plan_bytes,
+            ..SparseLimits::DEFAULT
+        })
+        .unwrap()
+    };
+    let no_tables = plan_with(bytes - 1);
+    assert!(no_tables.count_free.is_none() && no_tables.idle.is_some());
+    let bare = no_tables.heap_bytes() - 256;
+    assert_eq!(plan_with(no_tables.heap_bytes()).heap_bytes(), bare + 256);
+    let no_idle = plan_with(bare + 255);
+    assert!(no_idle.count_free.is_none() && no_idle.idle.is_none());
+    assert_eq!(no_idle.heap_bytes(), bare);
+    assert_eq!(with(&|l| l.max_plan_bytes = bare), Ok(()));
     assert_eq!(
-        with(&|l| l.max_plan_bytes = bytes - 257),
+        with(&|l| l.max_plan_bytes = bare - 1),
         Err(SparseRejection::PlanTooLarge {
-            bytes: bytes - 256,
-            limit: bytes - 257
+            bytes: bare,
+            limit: bare - 1
         })
     );
     let analysis = sparse_analysis_bytes(re.states.len(), re.num_counters);
@@ -1671,18 +1679,22 @@ fn passes_and_idle_skipping() {
                 s.check_invariants(&re, pattern);
             }
             rows.push(format!("{}", s.display(&re)));
-            let [full, active, skipped] = scratch.passes;
+            let [full, active, skipped, count_free] = scratch.passes;
             match sweep {
                 Sweep::Auto => {
                     assert_eq!(active, 0, "a small plan takes the full sweep");
                     assert!(skipped > 0, "round {round}: nothing skipped");
-                    assert!(full + skipped <= input.len());
+                    assert!(count_free > 0, "round {round}: no count-free step");
                 }
-                Sweep::Full => assert_eq!((active, skipped), (0, 0)),
-                Sweep::Active => assert_eq!((full, skipped), (0, 0)),
+                Sweep::Full => assert_eq!((active, skipped, count_free), (0, 0, 0)),
+                Sweep::Active => assert_eq!((full, skipped, count_free), (0, 0, 0)),
             }
             if !s.ismatch() {
-                assert_eq!(full + active + skipped, input.len(), "{sweep:?}");
+                assert_eq!(
+                    full + active + skipped + count_free,
+                    input.len(),
+                    "{sweep:?}"
+                );
             }
             assert_eq!(s.finish(&re, &mut scratch), expected, "{sweep:?} {input:?}");
         }
@@ -1715,9 +1727,14 @@ fn automatic_choice_follows_the_active_rows() {
     let mut input = b"qqqqA".to_vec();
     input.extend(std::iter::repeat_n(b'a', 50));
     s.chunk(&re, &mut scratch, &input);
-    let [full, active, skipped] = scratch.passes;
+    let [full, active, skipped, count_free] = scratch.passes;
     assert_eq!(skipped, 4);
-    assert!(active >= 50 && full == 0, "full={full} active={active}");
+    // `A` and the first `a` are stepped before any count is incremented.
+    assert!(
+        active >= 48 && full == 0 && count_free >= 1,
+        "full={full} active={active} count_free={count_free}"
+    );
+    assert_eq!(full + active + skipped + count_free, input.len());
     assert!(!s.ismatch());
     s.chunk(&re, &mut scratch, b"!");
     assert!(s.finish(&re, &mut scratch));
@@ -1766,4 +1783,161 @@ fn skipping_tracks_the_boundary() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The count-free step
+// ---------------------------------------------------------------------------
+
+/// The tables exist when the start node is count-free and the bitmaps are
+/// at most eight words; the idle table is independent of them.
+#[test]
+fn count_free_tables_where_the_start_is_count_free() {
+    for (pattern, tables, idle) in [
+        ("x(a|aa){2,5}z", true, true),
+        ("ab.{0,40}cd", true, true),
+        // A match in the start closure: tables, but nothing to skip to.
+        ("a{0,3}", true, false),
+        // An assertion in the start closure.
+        (r"\bx(a|aa){2,5}", false, false),
+        (r"(?m:^)x(a|aa){2,5}", false, false),
+        // An assertion further on.
+        (r"x(a|aa){2,5}\bz", true, true),
+    ] {
+        let re = sparse_forced(pattern);
+        let plan = sparse_plan(&re);
+        assert_eq!(plan.count_free.is_some(), tables, "`{pattern}`");
+        assert_eq!(plan.idle.is_some(), idle, "`{pattern}`");
+    }
+    // Over 512 rows: no tables, the idle table remains.
+    let body: Vec<String> = (0..8u8)
+        .map(|i| ((b'a' + i) as char).to_string().repeat(80))
+        .collect();
+    let re = sparse_forced(&format!("x({}){{2,9}}!", body.join("|")));
+    let plan = sparse_plan(&re);
+    assert!(plan.rows() > 512, "{} rows", plan.rows());
+    assert!(plan.count_free.is_none() && plan.idle.is_some());
+    // The tables are the exact grouped NFA's: the nodes are numbered alike.
+    for pattern in [
+        "x(a|aa){2,5}z",
+        r"x(a|aa){2,5}\bz",
+        "(ab|cd){1,8}e",
+        "a{0,3}",
+    ] {
+        let re = sparse_forced(pattern);
+        let (sparse, exact) = (
+            sparse_plan(&re).count_free.as_deref().unwrap(),
+            re.grouped_plan().unwrap().count_free.as_deref().unwrap(),
+        );
+        assert_eq!(format!("{sparse:?}"), format!("{exact:?}"), "`{pattern}`");
+    }
+}
+
+/// Patterns whose counters are rarely in progress, on inputs that enter
+/// and leave them all the time, in chunks that cut the runs anywhere: the
+/// automatic choice alternates the count-free step, the general step and
+/// the skip, and reaches the same rows, flags and answers as the general
+/// step alone.
+#[test]
+fn count_free_and_general_steps_alternate() {
+    let mut rng = Rng(0xc0f3);
+    let pieces: &[&[u8]] = &[
+        b"ab", b"a", b"b", b"cd", b"c", b"d", b"x", b"xa", b"xaa", b"z", b"qqqq", b"q", b"aaaa",
+    ];
+    for pattern in [
+        "ab.{0,6}cd",
+        "ab.{2,9}cd",
+        "x(a|aa){2,5}z",
+        "(ab|cd){2,4}x",
+        "a(b|cd){0,3}x",
+        r"ab.{0,6}\Bcd",
+        "xa{0,3}",
+        "(a{2,5}b)*c",
+    ] {
+        let re = sparse_forced(pattern);
+        assert!(sparse_plan(&re).count_free.is_some(), "`{pattern}`");
+        let oracle = oracle(pattern);
+        let (mut free, mut general, mut matches) = (0, 0, 0);
+        for round in 0..60 {
+            let mut input = random_input(&mut rng, pieces, 30 + round);
+            if round % 3 == 0 {
+                // Without the bytes that end a match: longer runs.
+                input.retain(|&b| !b"dzxc".contains(&b));
+            }
+            let expected = oracle.is_match(&input);
+            matches += usize::from(expected);
+            let mut shown = Vec::new();
+            for sweep in SWEEPS {
+                let mut scratch = SparseScratch::new();
+                scratch.set_sweep(sweep);
+                let mut s = SparseStream::new(&re, &mut scratch).unwrap();
+                let mut states = Vec::new();
+                for part in input.chunks(1 + round % 7) {
+                    s.chunk(&re, &mut scratch, part);
+                    s.check_invariants(&re, pattern);
+                    states.push((s.ismatch(), format!("{}", s.display(&re))));
+                }
+                if sweep == Sweep::Auto {
+                    free += scratch.passes[3];
+                    general += scratch.passes[0] + scratch.passes[1];
+                }
+                assert_eq!(
+                    s.finish(&re, &mut scratch),
+                    expected,
+                    "`{pattern}` {sweep:?}"
+                );
+                shown.push(states);
+            }
+            // After every chunk: the same match flag and, until a match
+            // stops the stream, the same raw rows and boundary.
+            for (i, auto) in shown[0].iter().enumerate() {
+                for other in &shown[1..] {
+                    assert_eq!(auto.0, other[i].0, "`{pattern}` {input:?} chunk {i}");
+                    if !auto.0 {
+                        assert_eq!(auto.1, other[i].1, "`{pattern}` {input:?} chunk {i}");
+                    }
+                }
+            }
+            run_chunks(&re, &[&input], expected, pattern);
+            check_profiles(&re, &input, pattern);
+        }
+        assert!(free > 0, "`{pattern}`: no count-free step");
+        // (`xa{0,3}` matches before its counter can count.)
+        assert!(
+            general > 0 || pattern == "xa{0,3}",
+            "`{pattern}`: no general step"
+        );
+        assert!(
+            matches > 0 && matches < 60,
+            "`{pattern}`: {matches} matches"
+        );
+    }
+}
+
+/// A match found on the count-free path: during a run, at the end of a
+/// chunk, and only at `finish`.
+#[test]
+fn count_free_step_finds_matches() {
+    let re = sparse_forced("ab(c|cc){0,3}");
+    assert!(sparse_plan(&re).count_free.is_some());
+    let mut scratch = SparseScratch::new();
+    // At the end of a chunk, without a provisional closure.
+    let mut s = SparseStream::new(&re, &mut scratch).unwrap();
+    s.chunk(&re, &mut scratch, b"qqa");
+    assert!(!s.ismatch());
+    s.chunk(&re, &mut scratch, b"b");
+    assert!(s.ismatch());
+    assert!(s.finish(&re, &mut scratch));
+    // During a run: the stream stops before the byte after the match.
+    s.reset(&re, &mut scratch);
+    s.chunk(&re, &mut scratch, b"qabqqqq");
+    assert!(s.ismatch());
+    assert_eq!(s.boundary_state(), (Some(b'b'), false));
+    assert!(scratch.passes[3] > 0 && scratch.passes[0] + scratch.passes[1] == 0);
+    // Only the end of input decides.
+    let re = sparse_forced(r"ab(c|cc){0,3}\z");
+    let mut s = SparseStream::new(&re, &mut scratch).unwrap();
+    s.chunk(&re, &mut scratch, b"ab");
+    assert!(!s.ismatch());
+    assert!(s.finish(&re, &mut scratch));
 }

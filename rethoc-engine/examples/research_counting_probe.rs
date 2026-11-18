@@ -5,7 +5,8 @@
 //! `GroupedNfaMode::Always`; `ineligible` when it does not admit the
 //! pattern), or `grouped-full` / `grouped-active` for the grouped NFA with
 //! one of its two passes forced, or `sparse` for its experimental sparse
-//! counting variant (`plans/sparse-counting-sets.md`).  The last column is
+//! counting variant (`plans/sparse-counting-sets.md`), likewise
+//! `sparse-full` / `sparse-active`.  The last column is
 //! the engine automatic selection picks.
 //!
 //! A seventh argument `stats` prints, instead of timings, what one warm
@@ -52,7 +53,15 @@ fn main() {
         _ => GroupedSweep::Auto,
     };
     let auto = tier_arg == "auto";
-    let sparse = tier_arg == "sparse";
+    let sparse = tier_arg.starts_with("sparse");
+    let sweep = match tier_arg {
+        "sparse-full" => GroupedSweep::Full,
+        "sparse-active" => GroupedSweep::Active,
+        other if sparse && other != "sparse" => {
+            panic!("unknown path `{other}`: sparse, sparse-full or sparse-active")
+        }
+        _ => sweep,
+    };
     let tier: u8 = if grouped || auto || sparse {
         0
     } else {
@@ -225,6 +234,7 @@ fn main() {
     let mut stream = grouped.then(|| GroupedStream::new(&re, &mut scratch).expect("admitted"));
     // The sparse variant, likewise.
     let mut sparse_scratch = SparseScratch::new();
+    sparse_scratch.set_sweep(sweep);
     let mut sparse_stream =
         sparse.then(|| SparseStream::new(&re, &mut sparse_scratch).expect("admitted"));
     let mut run = || {
