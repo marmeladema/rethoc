@@ -336,10 +336,7 @@ fn run_match_grouped(
     let info = regex.info();
     let g = info.grouped_nfa.as_ref().expect("requested");
     eprintln!("pattern: {pattern}");
-    eprintln!(
-        "grouped NFA: {} rows, {} words; plan {} bytes, stream {} bytes, scratch {} bytes",
-        g.rows, g.row_words, g.plan_bytes, g.stream_bytes, g.scratch_bytes
-    );
+    eprintln!("grouped NFA: {g}");
     if let Some(cs) = chunk_size {
         eprintln!("chunk_size: {cs}");
     }
@@ -389,7 +386,7 @@ fn run_match(
     debug: bool,
 ) {
     let regex = parse_pattern(pattern, config);
-    let mut memory = check::new_memory();
+    let mut memory = check::new_memory().matcher;
 
     eprintln!("pattern: {pattern}");
     eprintln!("memory_size: {} bytes", regex.memory_size());
@@ -461,7 +458,7 @@ fn run_match(
 
 fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig, quiet: bool) {
     let regex = parse_pattern(pattern, config);
-    let mut memory = check::new_memory();
+    let mut memory = check::new_memory().matcher;
 
     let reader: Box<dyn BufRead> = match file {
         Some(path) => {

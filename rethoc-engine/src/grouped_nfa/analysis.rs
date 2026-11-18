@@ -358,15 +358,46 @@ fn zero_width_order(states: &[State], reachable: &[StateIdx]) -> Result<Vec<Stat
         });
     }
     if order.len() != reachable.len() {
-        let state = reachable
-            .iter()
-            .copied()
-            .filter(|s| indegree[s.idx()] > 0)
-            .min()
-            .expect("an unsorted state remains");
+        let state = state_on_cycle(states, reachable, &indegree);
         return Err(Rejection::ZeroWidthCycle { state: state.0 });
     }
     Ok(order)
+}
+
+/// A state on a zero-width cycle, after Kahn's sort left the states with a
+/// nonzero `indegree`.  Those include states downstream of a cycle, but
+/// each has a predecessor among them, so walking predecessors from any of
+/// them ends on a cycle.  Returns the lowest-numbered state of that cycle.
+fn state_on_cycle(states: &[State], reachable: &[StateIdx], indegree: &[u32]) -> StateIdx {
+    let left = |s: StateIdx| indegree[s.idx()] > 0;
+    let mut pred = vec![StateIdx::NONE; states.len()];
+    for &s in reachable.iter().filter(|&&s| left(s)) {
+        for_each_zero_width_successor(&states[s], |t| {
+            if left(t) {
+                pred[t.idx()] = s;
+            }
+        });
+    }
+    let mut seen = vec![false; states.len()];
+    let mut s = reachable
+        .iter()
+        .copied()
+        .find(|&s| left(s))
+        .expect("an unsorted state remains");
+    while !std::mem::replace(&mut seen[s.idx()], true) {
+        s = pred[s.idx()];
+        debug_assert!(
+            s != StateIdx::NONE,
+            "a remaining state has a remaining predecessor"
+        );
+    }
+    // `s` is on the cycle: walk it once more for its lowest state.
+    let (start, mut lowest, mut t) = (s, s, pred[s.idx()]);
+    while t != start {
+        lowest = lowest.min(t);
+        t = pred[t.idx()];
+    }
+    lowest
 }
 
 // ---------------------------------------------------------------------------
@@ -413,15 +444,15 @@ pub(crate) const fn reviewed(kind: AssertKind) -> bool {
 }
 
 /// Upper bound of the transient analysis arrays for `states` states:
-/// labels, indegrees and visited flags indexed by state, the reachable
-/// list, the work stacks and the order (each at most one entry per state),
-/// and the bounds per counter.
+/// labels, indegrees, predecessors and two sets of visited flags indexed by
+/// state, the reachable list, the work stacks and the order (each at most
+/// one entry per state), and the bounds per counter.
 pub(crate) fn analysis_bytes(states: usize, num_counters: usize) -> usize {
     states
         * (size_of::<Option<Scope>>()
             + size_of::<u32>()
-            + size_of::<bool>()
-            + 4 * size_of::<StateIdx>())
+            + 2 * size_of::<bool>()
+            + 5 * size_of::<StateIdx>())
         + num_counters * size_of::<Option<(usize, usize)>>()
 }
 

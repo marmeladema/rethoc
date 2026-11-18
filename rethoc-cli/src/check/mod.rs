@@ -190,8 +190,9 @@ pub(crate) struct Subject {
     pub(crate) backends: Vec<Backend>,
     /// Why the grouped NFA is not among the backends, when it was wanted.
     pub(crate) grouped_rejection: Option<GroupedNfaError>,
-    /// Scratch of the grouped NFA streams.
-    scratch: RefCell<GroupedScratch>,
+    /// The grouped NFA stream, created on first use and reset for every
+    /// run after that, as a user reuses a stream.
+    stream: RefCell<Option<GroupedStream>>,
 }
 
 impl Subject {
@@ -202,7 +203,7 @@ impl Subject {
         pattern: &str,
         config: &RegexConfig,
         choice: TierChoice,
-        memory: &mut MatcherMemory,
+        memory: &mut Memory,
     ) -> Result<Self, Rejection> {
         let mut compiled = config.clone();
         compiled.grouped_nfa = choice.wants_grouped();
@@ -215,7 +216,7 @@ impl Subject {
         };
         let mut backends: Vec<Backend> = candidates
             .into_iter()
-            .filter(|&t| memory.matcher_for_tier(&regex, t).is_ok())
+            .filter(|&t| memory.matcher.matcher_for_tier(&regex, t).is_ok())
             .map(Backend::Tier)
             .collect();
         if let TierChoice::Only(t) = choice
@@ -243,7 +244,7 @@ impl Subject {
             regex,
             backends,
             grouped_rejection,
-            scratch: RefCell::new(GroupedScratch::new()),
+            stream: RefCell::new(None),
         })
     }
 
@@ -261,7 +262,7 @@ impl Subject {
     /// `expected` into `failures` (which is cleared first).
     pub(crate) fn check(
         &self,
-        memory: &mut MatcherMemory,
+        memory: &mut Memory,
         input: &[u8],
         expected: bool,
         failures: &mut Vec<Failure>,
@@ -280,7 +281,7 @@ impl Subject {
     /// Run `input` on one backend.
     pub(crate) fn run(
         &self,
-        memory: &mut MatcherMemory,
+        memory: &mut Memory,
         backend: Backend,
         feed: Feed,
         input: &[u8],
@@ -288,9 +289,18 @@ impl Subject {
         let tier = match backend {
             Backend::Tier(t) => t,
             Backend::Grouped => {
-                let scratch = &mut *self.scratch.borrow_mut();
-                let mut s = GroupedStream::new(&self.regex, scratch)
-                    .expect("the grouped NFA was checked for admission");
+                let scratch = &mut memory.grouped;
+                let mut slot = self.stream.borrow_mut();
+                let s = match slot.as_mut() {
+                    Some(s) => {
+                        s.reset(&self.regex, scratch);
+                        s
+                    }
+                    None => slot.insert(
+                        GroupedStream::new(&self.regex, scratch)
+                            .expect("the grouped NFA was checked for admission"),
+                    ),
+                };
                 match feed {
                     Feed::Whole => s.chunk(&self.regex, scratch, input),
                     Feed::Bytewise => {
@@ -303,6 +313,7 @@ impl Subject {
             }
         };
         let mut m = memory
+            .matcher
             .matcher_for_tier(&self.regex, tier)
             .expect("tier was checked for eligibility");
         match feed {
@@ -397,11 +408,22 @@ pub(crate) fn regime() -> Regime {
     *REGIME.get_or_init(|| read_regime().unwrap_or_default())
 }
 
-/// A fresh [`MatcherMemory`], with the DFA state cap of the [`Regime`].
-pub(crate) fn new_memory() -> MatcherMemory {
-    let mut memory = MatcherMemory::default();
-    memory.set_dfa_state_cap(regime().dfa_states);
-    memory
+/// A fresh [`Memory`], with the DFA state cap of the [`Regime`].
+pub(crate) fn new_memory() -> Memory {
+    let mut matcher = MatcherMemory::default();
+    matcher.set_dfa_state_cap(regime().dfa_states);
+    Memory {
+        matcher,
+        grouped: GroupedScratch::new(),
+    }
+}
+
+/// What the checks reuse across inputs, as a user does across streams:
+/// the tiers' [`MatcherMemory`] and the grouped NFA's scratch.  Shared
+/// between regexes too with `fuzz --shared-memory`.
+pub(crate) struct Memory {
+    pub(crate) matcher: MatcherMemory,
+    pub(crate) grouped: GroupedScratch,
 }
 
 /// The regime as it appears in summary and result lines, e.g.

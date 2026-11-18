@@ -176,6 +176,17 @@ fn rejects_outside_the_admitted_class() {
         rejection(&forced("x(a?){2,5}z")),
         Rejection::ZeroWidthCycle { .. }
     ));
+    // The state named is on the cycle (Split 1 -> CInc 2 -> Split 1), not
+    // the consuming state 0 that the Split feeds.
+    let re = compile("(?:a?){2,3}b", 0, true);
+    let Rejection::ZeroWidthCycle { state } = rejection(&re) else {
+        panic!("expected a zero-width cycle")
+    };
+    assert!(
+        matches!(re.states[st(state)], State::Split { .. }),
+        "state {state}: {:?}",
+        re.states[st(state)]
+    );
     // A zero-width cycle is reported before the assertion exclusion.
     // (`(?:\b){2,3}` itself compiles to a lone `\b`, without a counter.)
     assert!(matches!(
@@ -297,11 +308,21 @@ fn option_leaves_the_nfa_unchanged() {
 fn info_and_dump_report_the_plan() {
     let re = forced("x(a|aa){2,5}z");
     let info = re.info();
-    let g = info.grouped_nfa.as_ref().expect("requested");
-    assert!(g.admitted);
-    assert_eq!(g.plan_bytes, plan(&re).heap_bytes());
-    assert_eq!(g.stream_bytes, 8 * g.row_words);
-    assert_eq!(g.scratch_bytes, 16 * g.row_words);
+    let Some(crate::GroupedNfaInfo::Admitted {
+        plan_bytes,
+        stream_bytes,
+        scratch_bytes,
+        ..
+    }) = info.grouped_nfa
+    else {
+        panic!("expected admission: {:?}", info.grouped_nfa)
+    };
+    assert_eq!(plan_bytes, plan(&re).heap_bytes());
+    // The sizes reported are those a stream and a scratch hold.
+    let mut scratch = GroupedScratch::new();
+    let stream = GroupedStream::new(&re, &mut scratch).unwrap();
+    assert_eq!(stream_bytes, stream.memory_bytes());
+    assert_eq!(scratch_bytes, scratch.memory_bytes());
     assert!(
         info.to_string()
             .contains("Grouped NFA (experimental): admitted")
@@ -310,9 +331,10 @@ fn info_and_dump_report_the_plan() {
 
     let re = forced("x((a|aa){2,3}){2,3}z");
     let info = re.info();
-    let g = info.grouped_nfa.as_ref().expect("requested");
-    assert!(!g.admitted);
-    assert!(g.rejection.as_ref().unwrap().contains("nested"));
+    let Some(crate::GroupedNfaInfo::Rejected { reason }) = &info.grouped_nfa else {
+        panic!("expected a rejection: {:?}", info.grouped_nfa)
+    };
+    assert!(reason.contains("nested"), "{reason}");
     assert!(re.dump(false).to_string().contains("Grouped NFA: rejected"));
 
     assert!(Regex::new("a").unwrap().info().grouped_nfa.is_none());

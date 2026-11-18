@@ -505,7 +505,13 @@ Two changes, both exact (every pass gives the same rows):
   zero between calls). The active pass visits only set bits, always the
   lowest pending one; transfers activate only higher nodes, so nodes are
   still processed in topological order. Consumption cleans the closure as
-  it reads it, and the commit moves rows from `next` to the raw frontier.
+  it reads it.
+- **No next-root arena.** The closure holds a copy of every raw row, so a
+  byte's consumption clears the raw rows and writes the successors straight
+  into them (the early-match return comes before, leaving them intact).
+  This departs from §5's ownership paragraph: worker scratch is the closure
+  arena and its bitmap only, `8(W + A)` bytes, and a stream is
+  `8(W + A)` bytes plus its struct, `A = ceil(R/64)`.
 - **Prefilter while idle.** When the raw frontier is empty and the start
   state's zero-width closure has neither an assertion nor `Match`
   (`skip_when_idle`, decided at analysis), the closure of an empty
@@ -528,8 +534,8 @@ paths):
   prefilter's speed, close to the tiers'.
 - `wide` runs one to two orders of magnitude faster than Tier 3 and the
   NFA, which pay per live instance.
-- Dense workloads pay over the P4 full sweep (median about a fifth, at
-  most about a third) for the bitmap upkeep and the per-byte choice.
+- Dense workloads pay over the P4 full sweep (median about a tenth, at
+  most about 30%) for the bitmap upkeep and the per-byte choice.
 
 Tests run every check in all three modes (automatic, full, active),
 compare both closure passes with the scalar interpreter, check the bitmap

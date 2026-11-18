@@ -108,21 +108,28 @@ pub struct ExecutionInfo {
 /// Persistent bytes (the plan, on the regex), per-stream bytes and
 /// per-worker scratch bytes are reported separately.
 #[derive(Debug, Clone, Serialize)]
-pub struct GroupedNfaInfo {
-    /// Whether the analysis admitted the graph.
-    pub admitted: bool,
-    /// Why it was rejected, if it was.
-    pub rejection: Option<String>,
-    /// Heap bytes of the plan arrays (0 when rejected).
-    pub plan_bytes: usize,
-    /// Rows: reachable NFA states.
-    pub rows: usize,
-    /// Words of one frontier (`W`).
-    pub row_words: usize,
-    /// Frontier payload of one stream: `8 W` bytes.
-    pub stream_bytes: usize,
-    /// Frontier payload of one worker's scratch: `16 W` bytes.
-    pub scratch_bytes: usize,
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum GroupedNfaInfo {
+    /// The analysis admitted the graph.
+    Admitted {
+        /// Heap bytes of the plan arrays.
+        plan_bytes: usize,
+        /// Rows: reachable NFA states.
+        rows: usize,
+        /// Words of one frontier (`W`).
+        row_words: usize,
+        /// Bytes of one stream: its raw rows, their bitmap and the struct
+        /// (`GroupedStream::memory_bytes`).
+        stream_bytes: usize,
+        /// Bytes of a worker's scratch prepared for this plan: the closure
+        /// arena and its bitmap (`GroupedScratch::memory_bytes`).
+        scratch_bytes: usize,
+    },
+    /// The analysis rejected the graph.
+    Rejected {
+        /// Why.
+        reason: String,
+    },
 }
 
 /// Start-closure diagnostics.
@@ -190,6 +197,25 @@ pub struct RegexInfo {
 // ---------------------------------------------------------------------------
 // Display impl (text output)
 // ---------------------------------------------------------------------------
+
+impl fmt::Display for GroupedNfaInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Admitted {
+                plan_bytes,
+                rows,
+                row_words,
+                stream_bytes,
+                scratch_bytes,
+            } => write!(
+                f,
+                "admitted, {rows} rows, {row_words} words; plan {plan_bytes} bytes, \
+                 stream {stream_bytes} bytes, scratch {scratch_bytes} bytes"
+            ),
+            Self::Rejected { reason } => write!(f, "rejected: {reason}"),
+        }
+    }
+}
 
 impl fmt::Display for RegexInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -313,15 +339,7 @@ impl fmt::Display for RegexInfo {
         if let Some(g) = &self.grouped_nfa {
             writeln!(f)?;
             writeln!(f)?;
-            write!(f, "Grouped NFA (experimental): ")?;
-            match &g.rejection {
-                None => write!(
-                    f,
-                    "admitted, {} rows, {} words; plan {} bytes, stream {} bytes, scratch {} bytes",
-                    g.rows, g.row_words, g.plan_bytes, g.stream_bytes, g.scratch_bytes
-                )?,
-                Some(reason) => write!(f, "rejected: {reason}")?,
-            }
+            write!(f, "Grouped NFA (experimental): {g}")?;
         }
         Ok(())
     }
