@@ -5,7 +5,8 @@ Status: P0–P4 implemented in `rethoc-engine/src/grouped_nfa/` (opt-in
 8,192-word frontier budget; all assertion kinds by raw replay; CLI, checkers,
 proptests, cargo-fuzz and the probe run it; active-row scheduling and
 prefilter skipping while idle). P4's deployment measurements (allocation and
-operation counters, many rules × many streams) and P5 are open; see "P4
+operation counters, many rules × many streams) remain open. P5 below now
+specifies the proposed automatic-selection implementation; see "P4
 findings" and "Idle cost". Designed against main `b0bb981e8c6cba7b23df176d79f741c3b61089a7`;
 source references below re-checked at `d82066d`. This work does not
 investigate existing tier correctness bugs.
@@ -114,8 +115,9 @@ cycles, milestone exclusions, or budget exhaustion. Normal regex compilation
 and existing dispatch remain available. Forced grouped selection reports the
 reason; it must not silently run a different backend or return false.
 
-Non-goals: sparse sets, interval approximation, runtime truncation, prefilter
-skipping, SIMD, context DAGs, cyclic closure, or changing automatic dispatch.
+Original P0–P3 non-goals: sparse sets, interval approximation, runtime truncation,
+prefilter skipping, SIMD, context DAGs, cyclic closure, or changing automatic
+dispatch. Idle skipping was added after P4; P5 explicitly changes dispatch.
 Counter-free graphs are useful test controls, not the initial promotion target.
 
 ## 3. Compile an immutable plan
@@ -401,8 +403,9 @@ idle bytes cost the prefilter's scan.
 
 ## 7. Milestones
 
-Keep tiers 0–4, their oracle, and `Regex::min_tier()` unchanged. Use an explicit
-experimental backend name, not Tier 5. Each milestone is independently reviewable.
+For P0–P4, keep tiers 0–4, their oracle, and `Regex::min_tier()` unchanged.
+Use an explicit backend name, not Tier 5. P5 adds automatic selection without
+renumbering the tiers. Each milestone is independently reviewable.
 
 ### P0: analysis and opt-in plan
 
@@ -620,15 +623,107 @@ automatic choice switches pass within one chunk.
 - Gate: reproducible results for the matrix below, including rejections and
   scratch reuse across plans. No silent backend omission in test summaries.
 
-### P5: production selection decision
+### P5: automatic selection — proposed implementation contract
 
-Require a meaningful workload win against the fastest relevant existing path
-without unacceptable memory, latency, compilation, or coverage regressions.
-Compare external engines on matched semantics. Correctness alone does not justify
-changing default dispatch or replacing the independent reference.
+This is the implementor handoff for the next change, not a claim that dispatch
+has already changed. It supersedes the earlier opt-in-only requirement for
+P0–P4. The initial policy is deliberately structural: no timing-derived count
+thresholds, runtime benchmarking, or mid-stream switching.
 
-Sparse compression, prefilters, bit-parallel control, and cyclic closure are
-follow-up decisions. They are not prerequisites for completing P0–P4.
+#### Selection policy
+
+Choose the first available engine in this order:
+
+1. Tier 1, when eligible.
+2. Tier 2, when eligible.
+3. Grouped NFA, when admitted by its existing analysis and limits.
+4. Tier 4, when eligible.
+5. The original NFA, otherwise.
+
+Tier 3 is excluded from automatic selection, including when grouped admission
+fails. Keep it explicitly selectable for research, reproduction and differential
+testing. Known correctness defects are a reason to exclude it from production
+selection, independently of whether it wins a particular benchmark. Do not alter
+its eligibility to hide defects, or investigate/fix those defects in this change.
+
+Retain Tier 1 and Tier 2 precedence: the available probes favor them on small
+unrolled and fixed-length counting workloads. This is an initial policy, not a
+proof that they always win. Grouped takes precedence over Tier 4 where both are
+eligible; nested or otherwise rejected patterns can still use Tier 4. Grouped
+also replaces the automatic NFA fallback wherever admitted. Explicit Tier 0
+must continue running the original NFA as an independent reference.
+
+#### Compile-time decision and configuration
+
+- Compute and store one selected-engine identifier during compilation, after
+  eligibility analysis. Use a named grouped variant; do not assign Tier 5 or
+  encode grouped as Tier 0. Runtime dispatch and diagnostics read this same
+  decision rather than independently repeating the ordering.
+- Default compilation must consider grouped after Tier 1/2 rejection. Avoid
+  building an unused grouped plan for Tier 1/2 winners unless explicit grouped
+  analysis/execution is requested. Admission failure selects the next candidate;
+  it does not reject an otherwise compilable regex.
+- Make configuration semantics explicit: normal automatic selection, an explicit
+  way to disable grouped participation, and explicit analysis for forced grouped
+  execution even when Tier 1/2 wins. Migrate/document the current opt-in
+  `RegexConfig::grouped_nfa` boolean accordingly; do not leave default `false`
+  silently preventing the new selection. API spelling is an implementation
+  choice, but these behaviors and their defaults must be unambiguous.
+- Preserve `min_tier()` as the legacy numbered eligibility query, with its
+  limitations documented. It must no longer be presented as the selected engine
+  or a speed ranking. Add a selected-engine query and update callers that need
+  actual automatic dispatch. Forced numbered tiers retain independent eligibility.
+- Keep existing grouped structural/resource limits. Do not introduce match-time
+  budgets, approximate answers, or a new performance cutoff from local timings.
+
+#### Matcher, diagnostics and tools
+
+- Integrate grouped into the normal matcher interface, including `chunk`,
+  provisional match queries, `finish`, and diagnostic formatting. Preserve the
+  existing raw-frontier assertion contract and arbitrary chunk boundaries.
+- Reuse grouped scratch and stream storage across matches through the normal
+  memory-owner lifecycle. Reset correctly when switching regexes or engines;
+  avoid fresh per-match/per-byte allocation once capacity suffices. Do not retain
+  unrelated engine caches merely to construct a grouped matcher.
+- Preserve the explicit grouped streaming API and its separation of persistent
+  stream state from reusable worker scratch. Automatic integration must not
+  require every independently managed stream to own worker scratch.
+- Report the selected engine separately from eligible engines and grouped
+  rejection reasons in info/dump/checker output. Update Display/Debug for every
+  added field. Preserve explicit `--tier 0` and `--grouped-nfa` selection and
+  their existing conflict/error handling; forced requests never silently fall back.
+- Keep differential coverage of all eligible engines. Removing Tier 3 from
+  automatic dispatch must not remove its explicit tests or known-defect markers.
+
+#### Acceptance checks
+
+- Assert selection for every branch: Tier 1; Tier 2; grouped over eligible Tier 3
+  and Tier 4; grouped where the original NFA was the only automatic path; grouped
+  rejection followed by Tier 4; and rejection followed by NFA. Assert that Tier 3
+  is never automatically selected. Use actual compiled eligibility/admission,
+  not assumptions based on pattern appearance.
+- Test default/disabled/explicit grouped configuration, diagnostics and forced
+  selection. Explicit Tier 0 must still execute the independent reference.
+- Exercise the automatic matcher against the original NFA and regex oracle under
+  all existing unrolling/merging regimes, whole input and byte-sized chunks.
+  Include empty chunks, reset/reuse, success and failure, finalization-only
+  matches, CRLF boundaries, and deferred word/line assertions. Reuse memory
+  across different patterns and across engine choices.
+- Run debug/release suites, clippy, formatting, grouped assertion sweeps and
+  bounded differential fuzzing. Retain known Tier 3 handling in those checks;
+  do not turn this integration into a Tier 3 debugging task.
+- Run the existing scanning performance gate and compare automatic selection
+  with forced competitors. Include successful and unsuccessful scans, small
+  chunks, cold construction, reset/reuse, and allocations. Account separately for
+  compiled plan, stream state and worker scratch. Update compiled-memory test
+  expectations only for explained changes; preserve tier-eligibility assertions.
+- Keep machine-specific measurements outside committed documents. Record remaining
+  deployment-evaluation gaps explicitly: this policy does not establish a global
+  throughput optimum or readiness for hundreds of interleaved rules/streams.
+
+Deliver selection, configuration/API integration, diagnostics and regression
+coverage together. Sparse count sets, changing Tier 1/2 precedence, and runtime
+adaptation remain separate follow-ups requiring their own evidence.
 
 ## 8. Test and measurement matrix
 
