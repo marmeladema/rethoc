@@ -1,5 +1,8 @@
 # Grouped NFA assertion audit
 
+For the separate Tier 1 design and cache audit, see
+[Tier 1 assertion plan audit](tier1-assertions.md).
+
 Design under review: [grouped NFA plan](../grouped-nfa.md).
 Engine baseline: `b0bb981e8c6cba7b23df176d79f741c3b61089a7`.
 No engine implementation was changed for this audit.
