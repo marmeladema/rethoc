@@ -534,8 +534,15 @@ paths):
   prefilter's speed, close to the tiers'.
 - `wide` runs one to two orders of magnitude faster than Tier 3 and the
   NFA, which pay per live instance.
-- Dense workloads pay over the P4 full sweep (median about a tenth, at
-  most about 30%) for the bitmap upkeep and the per-byte choice.
+- Dense workloads run at the P4 full sweep's speed (median ratio 0.98),
+  after successors started carrying their row offset (no node lookup per
+  transfer) and the full sweep started walking contiguous copies of its
+  zero-width and consuming nodes. One reproducible exception:
+  `(ab){1,64}c` runs at about 1.45x the P4 time, while N = 63 and 65 run
+  faster than P4 at N = 64. Callgrind counts fewer instructions and
+  simulated mispredictions for N = 64 than for N = 256, so the cause is
+  outside its model (alignment or store forwarding, say); not explained
+  without hardware counters.
 
 Tests run every check in all three modes (automatic, full, active),
 compare both closure passes with the scalar interpreter, check the bitmap

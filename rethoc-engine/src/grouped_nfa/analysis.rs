@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use super::{GroupedNfaPlan, Increment, NO_NODE, Node, NodeIdx, Op, Row};
+use super::{GroupedNfaPlan, Increment, NO_NODE, Node, NodeIdx, Op, Row, Succ};
 use crate::{AssertKind, ByteMap, CounterIdx, CounterInfo, State, StateIdx};
 
 // ---------------------------------------------------------------------------
@@ -520,17 +520,30 @@ pub(crate) fn analyze(
         debug_assert!(n != NO_NODE, "successor of a reachable state is reachable");
         n
     };
-    let mut nodes = Vec::with_capacity(order.len());
+    // Rows in node order.
+    let mut rows = Vec::with_capacity(order.len());
     let mut off = 0u32;
     for &idx in &order {
+        let words = row_words(label[idx.idx()].expect("reachable"), &bounds) as u32;
+        rows.push(Row { off, words });
+        off += words;
+    }
+    let succ = |s: StateIdx| -> Succ {
+        let node = node(s);
+        Succ {
+            node,
+            off: rows[node as usize].off,
+        }
+    };
+    let mut nodes = Vec::with_capacity(order.len());
+    for (i, &idx) in order.iter().enumerate() {
         let scope = label[idx.idx()].expect("reachable");
-        let words = row_words(scope, &bounds) as u32;
         let op = match states[idx] {
             State::Split { out, out1 } => Op::Split {
-                out: node(out),
-                out1: node(out1),
+                out: succ(out),
+                out1: succ(out1),
             },
-            State::CounterInstance { out, .. } => Op::CounterInstance { out: node(out) },
+            State::CounterInstance { out, .. } => Op::CounterInstance { out: succ(out) },
             State::CounterIncrement {
                 out,
                 out1,
@@ -538,14 +551,14 @@ pub(crate) fn analyze(
                 max,
                 ..
             } => Op::CounterIncrement {
-                out: node(out),
-                out1: node(out1),
+                out: succ(out),
+                out1: succ(out1),
                 // The word budget passed, so the domain fits `u32`.
                 inc: Increment::new(min, max),
             },
             State::Assert { kind, out } => Op::Assert {
                 kind,
-                out: node(out),
+                out: succ(out),
             },
             State::Match => Op::Match,
             State::Byte { out, out_exit, .. }
@@ -553,11 +566,11 @@ pub(crate) fn analyze(
             | State::Wildcard { out, out_exit }
             | State::ByteClassStatic { out, out_exit, .. }
             | State::ByteClassCustom { out, out_exit, .. } => Op::Edge {
-                out: node(out),
+                out: succ(out),
                 out_exit: if out_exit == StateIdx::NONE {
-                    NO_NODE
+                    Succ::NONE
                 } else {
-                    node(out_exit)
+                    succ(out_exit)
                 },
             },
             State::ByteTable { table } => Op::Table(table),
@@ -565,15 +578,15 @@ pub(crate) fn analyze(
         nodes.push(Node {
             state: idx,
             scope,
-            row: Row { off, words },
+            row: rows[i],
             op,
         });
-        off += words;
     }
 
-    let consuming = |n: &Node| matches!(n.op, Op::Edge { .. } | Op::Table(_));
-    let (consumers, zero_width): (Vec<NodeIdx>, Vec<NodeIdx>) =
-        (0..nodes.len() as NodeIdx).partition(|&i| consuming(&nodes[i as usize]));
+    debug_check_successors(&nodes);
+    let (consumers, zero_width): (Vec<Node>, Vec<Node>) = nodes
+        .iter()
+        .partition(|n| matches!(n.op, Op::Edge { .. } | Op::Table(_)));
     let plan = GroupedNfaPlan {
         zero_width: zero_width.into_boxed_slice(),
         consumers: consumers.into_boxed_slice(),
@@ -586,6 +599,57 @@ pub(crate) fn analyze(
     };
     debug_assert_eq!(plan.heap_bytes(), plan_bytes);
     Ok(plan)
+}
+
+/// Check (in debug builds) what the transfers assume of a successor
+/// without looking it up: its offset is its node's row, and its width is
+/// the source's, one word (Outside) after a break, or the counter's after
+/// an instance.
+fn debug_check_successors(nodes: &[Node]) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let check = |src: &Node, s: Succ, same_width: bool| {
+        if s == Succ::NONE {
+            return;
+        }
+        let dst = &nodes[s.node as usize];
+        assert_eq!(
+            s.off, dst.row.off,
+            "successor offset of state {}",
+            src.state
+        );
+        if same_width {
+            assert_eq!(
+                dst.row.words, src.row.words,
+                "successor width of state {}",
+                src.state
+            );
+        }
+    };
+    for n in nodes {
+        match n.op {
+            Op::Split { out, out1 } => {
+                check(n, out, true);
+                check(n, out1, true);
+            }
+            Op::Assert { out, .. } => check(n, out, true),
+            Op::Edge { out, out_exit } => {
+                check(n, out, true);
+                check(n, out_exit, true);
+            }
+            Op::CounterInstance { out } => {
+                check(n, out, false);
+                assert!(matches!(nodes[out.node as usize].scope, Scope::Counter(_)));
+            }
+            Op::CounterIncrement { out, out1, .. } => {
+                check(n, out, true);
+                check(n, out1, false);
+                assert_eq!(nodes[out1.node as usize].scope, Scope::Outside);
+            }
+            Op::Match | Op::Table(_) => {}
+        }
+    }
 }
 
 /// Whether the zero-width closure of `start` reaches neither an assertion
