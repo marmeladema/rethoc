@@ -97,9 +97,27 @@ specification. This verifies evaluator properties, not a sparse matcher.
 
 ## Remaining obligations
 
-No Rust sparse runtime exists yet. We have not verified actual graph-to-sparse
-lowering, representative layouts, allocations, primitive overflow/cap handling,
-stream lifecycle, real-byte sparse assertion replay, count-free handoff,
-unbounded saturation or any performance claim. The plan makes these milestone
-gates. Re-run the audit after changes to its assumptions; translate primitive
-checks to Rust and add end-to-end differential execution during implementation.
+When this audit was written no Rust sparse runtime existed. It now does
+(`rethoc-engine/src/grouped_nfa/sparse.rs`), and its tests carry the
+obligations this record left open; they are evidence by testing, not a proof.
+
+- The primitive checks above are translated to Rust on the production list
+  code (`sparse_tests.rs`): every subset and every pair for `h <= 8`, against
+  `exact::increment`, with the capacity checked on a scratch of exactly the
+  promised size. One correction to this record: reduction keeps the least
+  count but, after an increment, not always the greatest (`{1,2,3}` in `{0,3}`
+  reduces to `{1,3}`, then `{2}` stands for `{2,3}`); the observations are
+  equal, which is what the argument needs.
+- Graph-to-sparse lowering, layouts and limits: admission tests at each
+  boundary, and the raw rows compared with the exact grouped rows after every
+  byte (subset, least count, exit profile), also with assertions.
+- Lifecycle, allocations and replay: stream tests, the `match_tests!` builds,
+  every partition of short inputs over word, non-word, CR, LF, NUL and 0xFF
+  bytes, and the differential tools (`--sparse-counting`). The probes report
+  no allocation during a scan.
+- The mutations listed above, and those of the plan's §9 that apply to the
+  runtime, were applied to the Rust source by hand and each failed the tests;
+  they are not kept as automated mutation tests.
+
+Still open: unbounded saturation and a count-free step are not implemented
+(the idle skip is); nothing here is a performance claim.
