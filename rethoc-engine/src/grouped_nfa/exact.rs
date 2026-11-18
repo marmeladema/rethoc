@@ -31,7 +31,7 @@
 
 use std::fmt;
 
-use super::{GroupedNfaError, GroupedNfaPlan, Increment, NO_NODE, NodeIdx, Op, Row};
+use super::{GroupedNfaError, GroupedNfaPlan, Increment, NodeIdx, Op, Row, Succ};
 use crate::{AssertEval, Regex, State, StateIdx, byte_match_ci};
 
 // ---------------------------------------------------------------------------
@@ -184,7 +184,7 @@ fn has(rows: &[u64], off: usize, v: usize) -> bool {
 /// - Saturating `{min,}`: `T = (S << 1) ∩ 0..=min`, plus `min` itself if
 ///   `min ∈ S` (it stays at `min`).  All of `T` continues; break iff
 ///   `min ∈ T`.  `min = 0` works: `T = {0}` whenever `S` is nonempty.
-#[inline]
+#[inline(always)]
 pub(crate) fn increment(rows: &mut [u64], src: Row, out: Row, inc: Increment) -> (bool, bool) {
     debug_assert_eq!(src.words, out.words, "increment across scopes");
     debug_assert_ne!(src.off, out.off, "increment into its own row");
@@ -311,7 +311,7 @@ pub(crate) fn close(
             done |= bit;
             let n = (w * 64) as NodeIdx + bit.trailing_zeros();
             let node = &plan.nodes[n as usize];
-            matched |= transfer(plan, closure, node, ctx, |out| activate(active, out));
+            matched |= transfer(closure, node, ctx, |out| activate(active, out));
         }
     }
     matched
@@ -320,6 +320,7 @@ pub(crate) fn close(
 /// [`close`] by a full sweep: copy the whole raw arena and visit every
 /// node in order, skipping empty rows.  Leaves the closure bitmap alone
 /// (clean); the caller cleans the closure arena with one fill.
+#[inline(always)]
 pub(crate) fn close_full(
     plan: &GroupedNfaPlan,
     raw: &[u64],
@@ -329,12 +330,11 @@ pub(crate) fn close_full(
     closure.copy_from_slice(raw);
     closure[plan.row(plan.start).off as usize] |= 1;
     let mut matched = false;
-    for &n in plan.zero_width.iter() {
-        let node = &plan.nodes[n as usize];
+    for node in plan.zero_width.iter() {
         if is_empty_row(closure, node.row) {
             continue;
         }
-        matched |= transfer(plan, closure, node, ctx, |_| {});
+        matched |= transfer(closure, node, ctx, |_| {});
     }
     matched
 }
@@ -344,7 +344,6 @@ pub(crate) fn close_full(
 /// Returns whether `node` is a reached `Match`.
 #[inline(always)]
 fn transfer(
-    plan: &GroupedNfaPlan,
     closure: &mut [u64],
     node: &super::Node,
     ctx: BoundaryCtx,
@@ -353,29 +352,29 @@ fn transfer(
     let src = node.row;
     match node.op {
         Op::Split { out, out1 } => {
-            union_within(closure, src, plan.row(out));
-            on(out);
-            union_within(closure, src, plan.row(out1));
-            on(out1);
+            union_within(closure, src, out.row(src.words));
+            on(out.node);
+            union_within(closure, src, out1.row(src.words));
+            on(out1.node);
         }
         Op::CounterInstance { out } => {
-            closure[plan.row(out).off as usize] |= 1;
-            on(out);
+            closure[out.off as usize] |= 1;
+            on(out.node);
         }
         Op::CounterIncrement { out, out1, inc } => {
-            let (cont, brk) = increment(closure, src, plan.row(out), inc);
+            let (cont, brk) = increment(closure, src, out.row(src.words), inc);
             if cont {
-                on(out);
+                on(out.node);
             }
             if brk {
-                closure[plan.row(out1).off as usize] |= 1;
-                on(out1);
+                closure[out1.off as usize] |= 1;
+                on(out1.node);
             }
         }
         Op::Assert { kind, out } => {
             if ctx.eval(kind) == AssertEval::Pass {
-                union_within(closure, src, plan.row(out));
-                on(out);
+                union_within(closure, src, out.row(src.words));
+                on(out.node);
             }
         }
         Op::Match => return true,
@@ -419,6 +418,7 @@ pub(crate) fn consume(
 
 /// [`consume`] by a full sweep over the consuming nodes; cleans the
 /// closure arena with one fill.
+#[inline(always)]
 pub(crate) fn consume_full(
     plan: &GroupedNfaPlan,
     regex: &Regex,
@@ -429,8 +429,7 @@ pub(crate) fn consume_full(
 ) -> usize {
     debug_assert!(is_clean(next, next_active), "next scratch is not clean");
     let mut tests = 0;
-    for &n in plan.consumers.iter() {
-        let node = &plan.nodes[n as usize];
+    for node in plan.consumers.iter() {
         if !is_empty_row(closure, node.row) {
             tests += usize::from(consume_node(
                 plan,
@@ -462,11 +461,12 @@ fn consume_node(
     match node.op {
         Op::Edge { out, out_exit } => {
             if accepts(regex, &regex.states[node.state], b) {
-                union_into(closure, node.row, next, plan.row(out));
-                activate(next_active, out);
-                if out_exit != NO_NODE {
-                    union_into(closure, node.row, next, plan.row(out_exit));
-                    activate(next_active, out_exit);
+                let w = node.row.words;
+                union_into(closure, node.row, next, out.row(w));
+                activate(next_active, out.node);
+                if out_exit != Succ::NONE {
+                    union_into(closure, node.row, next, out_exit.row(w));
+                    activate(next_active, out_exit.node);
                 }
             }
             true

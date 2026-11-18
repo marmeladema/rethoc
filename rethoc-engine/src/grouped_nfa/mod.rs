@@ -135,28 +135,55 @@ pub(crate) type NodeIdx = u32;
 /// No node (an absent `out_exit`, an unreachable state).
 pub(crate) const NO_NODE: NodeIdx = u32::MAX;
 
+/// A successor: its node and the first word of its row, so that a
+/// transfer needs no lookup.  Its width follows from the scope proof: the
+/// source's, except one word for Outside after a `CounterIncrement` break
+/// and the counter's after a `CounterInstance`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Succ {
+    node: NodeIdx,
+    off: u32,
+}
+
+impl Succ {
+    /// No successor (an absent `out_exit`).
+    const NONE: Succ = Succ {
+        node: NO_NODE,
+        off: u32::MAX,
+    };
+
+    /// The successor's row, of width `words`.
+    #[inline]
+    fn row(self, words: u32) -> Row {
+        Row {
+            off: self.off,
+            words,
+        }
+    }
+}
+
 /// What a node does with its row.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Op {
     /// Union into both successors.
-    Split { out: NodeIdx, out1: NodeIdx },
+    Split { out: Succ, out1: Succ },
     /// Outside present: insert count zero at `out`.
-    CounterInstance { out: NodeIdx },
+    CounterInstance { out: Succ },
     /// `T = {counter_step(v)}`; the counts of `T` that continue go to
     /// `out`; Outside at `out1` iff some count of `T` breaks.
     CounterIncrement {
-        out: NodeIdx,
-        out1: NodeIdx,
+        out: Succ,
+        out1: Succ,
         inc: Increment,
     },
     /// Union into `out` iff the shared evaluator says `Pass` at the
     /// current boundary.
-    Assert { kind: AssertKind, out: NodeIdx },
+    Assert { kind: AssertKind, out: Succ },
     /// Nonempty (Outside present): a match.
     Match,
     /// Consumes with the one-byte predicate of its state; successors `out`
-    /// and, unless [`NO_NODE`], the fused `out_exit`.
-    Edge { out: NodeIdx, out_exit: NodeIdx },
+    /// and, unless [`Succ::NONE`], the fused `out_exit`.
+    Edge { out: Succ, out_exit: Succ },
     /// Consumes through a byte dispatch table of [`Regex::byte_tables`].
     Table(ByteTableIdx),
 }
@@ -179,11 +206,12 @@ pub(crate) struct GroupedNfaPlan {
     /// Node of every state ([`NO_NODE`] if unreachable); read for
     /// `ByteTable` targets.
     node_of: Box<[NodeIdx]>,
-    /// The zero-width and `Match` nodes, in order: the full sweep's
-    /// closure walks only these.
-    zero_width: Box<[NodeIdx]>,
-    /// The consuming nodes, in order: the full sweep's consumption.
-    consumers: Box<[NodeIdx]>,
+    /// Copies of the zero-width and `Match` nodes, in order: the full
+    /// sweep's closure walks these contiguously, without indexing `nodes`.
+    zero_width: Box<[Node]>,
+    /// Copies of the consuming nodes, in order: the full sweep's
+    /// consumption.
+    consumers: Box<[Node]>,
     /// Node of the start state, reseeded at every boundary.
     start: NodeIdx,
     /// Words in one frontier (`W`).
@@ -200,8 +228,8 @@ pub(crate) struct GroupedNfaPlan {
 impl GroupedNfaPlan {
     /// Heap bytes of a plan with these array lengths.
     fn heap_bytes_for(states: usize, nodes: usize) -> usize {
-        // `node_of`, the nodes, and the two node lists (`nodes` in all).
-        (states + nodes) * size_of::<NodeIdx>() + nodes * size_of::<Node>()
+        // `node_of`, the nodes, and their copies split in two lists.
+        states * size_of::<NodeIdx>() + 2 * nodes * size_of::<Node>()
     }
 
     /// Heap bytes of this plan's arrays.
@@ -258,11 +286,11 @@ impl fmt::Display for GroupedNfaPlan {
             self.nodes[self.start as usize].state,
             self.skip_when_idle
         )?;
-        let st = |n: NodeIdx| -> String {
-            if n == NO_NODE {
+        let st = |s: Succ| -> String {
+            if s.node == NO_NODE {
                 "-".into()
             } else {
-                self.nodes[n as usize].state.to_string()
+                self.nodes[s.node as usize].state.to_string()
             }
         };
         writeln!(f, "  nodes, in closure order:")?;
@@ -285,7 +313,7 @@ impl fmt::Display for GroupedNfaPlan {
                 Op::Match => writeln!(f, "match")?,
                 Op::Edge { out, out_exit } => {
                     write!(f, "consume -> {}", st(out))?;
-                    if out_exit != NO_NODE {
+                    if out_exit != Succ::NONE {
                         write!(f, ", {}", st(out_exit))?;
                     }
                     writeln!(f)?
