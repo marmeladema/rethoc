@@ -13,8 +13,9 @@ print("family,bound,bytes,tier,chunk,config,min_tier,compiled_bytes,compile_us,c
 # path that accepts it, including the grouped NFA.
 cases = []
 if "--grouped" in sys.argv:
-    paths = ["0", "1", "2", "3", "4", "grouped"]
-    for family in ["prefix", "variable", "exact", "flat", "phase", "mixed", "sparse"]:
+    # `grouped-full` / `grouped-active` force one of its two passes.
+    paths = ["0", "1", "2", "3", "4", "grouped", "grouped-full", "grouped-active"]
+    for family in ["prefix", "variable", "exact", "flat", "phase", "mixed", "sparse", "wide"]:
         for bound in [8, 64, 256, 1000]:
             for config in ["counters", "default"]:
                 for path in paths:

@@ -72,6 +72,21 @@ impl fmt::Display for Prefilter {
     }
 }
 
+impl Prefilter {
+    /// Offset of the first byte of `hay` that can start a match, or `None`
+    /// if there is none.  Every byte is a candidate for [`Prefilter::None`].
+    pub(crate) fn find(&self, hay: &[u8]) -> Option<usize> {
+        match *self {
+            Prefilter::None => (!hay.is_empty()).then_some(0),
+            Prefilter::Memchr1(a) => memchr::memchr(a, hay),
+            Prefilter::Memchr2(a, b) => memchr::memchr2(a, b, hay),
+            Prefilter::Memchr3(a, b, c) => memchr::memchr3(a, b, c, hay),
+            Prefilter::Memclass(ref t) => crate::memclass::memclass(t, hay),
+            Prefilter::Range(lo, hi) => crate::memrange::memrange(lo, hi, hay),
+        }
+    }
+}
+
 /// Compute a prefilter from the NFA start state.
 ///
 /// Walks epsilon transitions from `start` to collect all bytes accepted

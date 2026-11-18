@@ -22,8 +22,10 @@ For the grouped NFA comparison (`plans/grouped-nfa.md`, §8), run
 family and bound on tiers 0-4 and on the grouped NFA (`tier` column
 `grouped`), under forced counters and default compilation, plus the
 `exact`, `mixed`, `sparse` (rare activation) and `control` (counter-free)
-families.  The grouped NFA is timed on one stream reset between scans,
-with its scratch kept, like a reused `MatcherMemory`.
+families, and `wide` (12 counted alternatives, one kept alive).  Paths
+`grouped-full` and `grouped-active` force one of the grouped NFA's two
+passes.  The grouped NFA is timed on one stream reset between scans, with
+its scratch kept, like a reused `MatcherMemory`.
 
 Also record CPU/architecture, OS, dependency resolution, build configuration,
 CPU affinity, and relevant machine load with the results. Cargo.lock is ignored
