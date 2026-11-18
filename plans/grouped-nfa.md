@@ -1,9 +1,11 @@
 # Exact grouped NFA implementation plan
 
-Status: P0–P3 implemented in `rethoc-engine/src/grouped_nfa/` (opt-in
+Status: P0–P4 implemented in `rethoc-engine/src/grouped_nfa/` (opt-in
 `RegexConfig::grouped_nfa`; multiword and saturating count domains within the
-8,192-word frontier budget; all assertion kinds by raw replay); P4–P5 open;
-not benchmarked. Designed against main `b0bb981e8c6cba7b23df176d79f741c3b61089a7`;
+8,192-word frontier budget; all assertion kinds by raw replay; CLI, checkers,
+proptests, cargo-fuzz and the probe run it). P4's deployment measurements
+(allocation and operation counters, many rules × many streams) and P5 are
+open; see "P4 findings". Designed against main `b0bb981e8c6cba7b23df176d79f741c3b61089a7`;
 source references below re-checked at `d82066d`. This work does not
 investigate existing tier correctness bugs.
 
@@ -446,8 +448,47 @@ experimental backend name, not Tier 5. Each milestone is independently reviewabl
   detected by these tests: old roots kept after consumption, prev updated
   before lookahead evaluation, no EOI replay, EOI as a consumed sentinel
   byte, Defer treated as Pass.
-- P4 must fit the checker selector into `TierChoice` and add grouped runs
-  to the `assert-in-body` sweep family.
+- P4: the checkers have a `Backend { Tier(u8), Grouped }` in failures,
+  shrink targets and trace commands. The default selection (and
+  `--skip-tier`) includes the grouped NFA when it admits a pattern, so the
+  CI fuzz and sweep jobs cover it; the backend list says why it is missing
+  otherwise, and `fuzz` counts grouped checks and rejections apart from
+  the tiers. `--grouped-nfa` (brute, fuzz, shrink, sweep) checks only the
+  NFA and the grouped NFA and rejects patterns it does not admit; it cannot
+  be combined with `--tier`/`--skip-tier`. `match`/`info`/`dump` take
+  `--grouped-nfa` too. Deviation: the checkers compile one regex with the
+  option for every backend instead of a second regex; the option never
+  changes the NFA (`option_leaves_the_nfa_unchanged`, and
+  `run_match_test` compares the two builds).
+
+### P4 findings
+
+From `scripts/research_counting_probe.py --grouped` (4 KiB non-matching
+inputs, one machine; numbers stay in local artifacts):
+
+- **Large wins where the existing paths scale with the number of live
+  counts**: a consuming prefix before an ambiguous variable body
+  (`a(a|aa){1,N}b`, `a(a|aa){N}b`). Tier 3 and the NFA grow roughly
+  linearly in N per byte (Tier 3 times out at N=1000); the grouped NFA
+  stays within a small factor of its N=8 cost. Byte-at-a-time chunks keep
+  the advantage.
+- **Modest wins** on `(a|aa){1,N}b` up to N=256 against Tier 3; a loss at
+  N=1000, where the multiword rows cost more than Tier 3's ranges.
+- **Losses** wherever a DFA tier applies cleanly: Tier 1 (unrolled or
+  counter-free patterns), Tier 2 on fixed-length bodies (`a.{N}b`,
+  `(ab){1,N}c`), Tier 3 on `x(a|aa|b){N/2,N}z` beyond small N.
+- **Large losses on sparse activation and counter-free controls**: the
+  runtime sweeps every row at every byte and has no prefilter, so an idle
+  stream costs the full closure per byte while the tiers skip ahead.
+  Active-row scheduling and prefilter re-engagement (§6, non-goals of
+  P0–P4) are the obvious next optimisations.
+- Nested families are rejected (by design).
+
+So the grouped NFA is not a general replacement. Its case for P5 is a
+dispatch rule that picks it where Tier 3/the NFA degrade with ambiguous
+variable bodies, after idle-stream cost is fixed. Not yet measured:
+allocation counts, operation counters, true cold setup, and hundreds of
+rules over thousands of interleaved streams.
 
 ### P1: one-word exact, assertion-free runtime
 

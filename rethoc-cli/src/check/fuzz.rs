@@ -19,8 +19,8 @@ use rethoc_engine::fuzz_gen::{FuzzRng, generate_inputs, generate_pattern};
 
 use super::cap::{CapArgs, Run, Verdict, cap_args, parallel, run_capped};
 use super::{
-    EXIT_ABORT, EXIT_MISMATCH, EXIT_OK, EXIT_USAGE, Failure, Reference, Subject, describe, escape,
-    new_memory, regime_note, shrink_command,
+    Backend, EXIT_ABORT, EXIT_MISMATCH, EXIT_OK, EXIT_USAGE, Failure, Reference, Subject, describe,
+    escape, new_memory, regime_note, shrink_command,
 };
 use crate::{CompileArgs, compile_args};
 
@@ -34,6 +34,10 @@ pub(crate) struct FuzzArgs {
     /// Check only the NFA and this tier (default: every eligible tier)
     #[bpaf(long, argument("TIER"))]
     pub(crate) tier: Option<u8>,
+    /// Check only the NFA and the experimental grouped NFA; patterns it
+    /// does not admit are rejected
+    #[bpaf(long)]
+    pub(crate) grouped_nfa: bool,
     /// Use one MatcherMemory for every pattern of the run
     #[bpaf(long)]
     pub(crate) shared_memory: bool,
@@ -167,6 +171,9 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
     let (mut cases, mut skipped, mut compiled, mut checks, mut mismatches) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut per_tier = [0u64; 5];
+    // Checks on the grouped NFA, and compiled configurations it did not
+    // admit (it is not a tier: counted apart, never silently).
+    let (mut grouped_checks, mut grouped_rejected) = (0u64, 0u64);
     for seed in args.first..end {
         if skip.contains(&seed) {
             continue;
@@ -201,21 +208,26 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
             } else {
                 &mut own
             };
-            if let Ok(subject) = Subject::compile(
+            match Subject::compile(
                 &pattern,
                 config,
-                super::TierChoice::new(args.tier, None),
+                super::TierChoice::new(args.tier, None, args.grouped_nfa),
                 memory,
             ) {
-                if args.trace {
-                    eprintln!(
-                        "  {} min_tier={} tiers={:?}",
-                        describe(config),
-                        subject.regex.min_tier(),
-                        subject.tiers
-                    );
+                Ok(subject) => {
+                    if args.trace {
+                        eprintln!(
+                            "  {} min_tier={} tiers={}",
+                            describe(config),
+                            subject.regex.min_tier(),
+                            subject.describe_backends()
+                        );
+                    }
+                    grouped_rejected += u64::from(subject.grouped_rejection.is_some());
+                    subjects.push((subject, own));
                 }
-                subjects.push((subject, own));
+                Err(super::Rejection::NotAdmitted(_)) => grouped_rejected += 1,
+                Err(_) => {}
             }
         }
         compiled += subjects.len() as u64;
@@ -227,9 +239,12 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
             for (subject, own) in &mut subjects {
                 let memory = if args.shared_memory { &mut shared } else { own };
                 subject.check(memory, input, expected, &mut failures);
-                checks += 2 * subject.tiers.len() as u64;
-                for &t in &subject.tiers {
-                    per_tier[t as usize] += 2;
+                checks += 2 * subject.backends.len() as u64;
+                for &b in &subject.backends {
+                    match b {
+                        Backend::Tier(t) => per_tier[t as usize] += 2,
+                        Backend::Grouped => grouped_checks += 2,
+                    }
                 }
                 if failures.is_empty() {
                     continue;
@@ -265,7 +280,7 @@ fn run_in_process(args: &FuzzArgs) -> i32 {
         }
     }
     println!(
-        "seeds {}..{end}{} cases={cases} reference-rejected={skipped} compiled={compiled} checks={checks} per-tier={per_tier:?} mismatches={mismatches}",
+        "seeds {}..{end}{} cases={cases} reference-rejected={skipped} compiled={compiled} checks={checks} per-tier={per_tier:?} grouped={grouped_checks} grouped-rejected={grouped_rejected} mismatches={mismatches}",
         args.first,
         regime_note()
     );
@@ -361,6 +376,9 @@ fn supervise(args: &FuzzArgs) -> i32 {
     common.extend(args.compile.to_args());
     if let Some(t) = args.tier {
         common.extend(["--tier".into(), t.to_string()]);
+    }
+    if args.grouped_nfa {
+        common.push("--grouped-nfa".into());
     }
     if args.shared_memory {
         common.push("--shared-memory".into());

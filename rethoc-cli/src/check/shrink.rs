@@ -7,7 +7,7 @@
 use bpaf::Bpaf;
 
 use super::{
-    EXIT_MISMATCH, EXIT_OK, EXIT_REJECTED, EXIT_USAGE, Failure, Feed, Reference, Subject,
+    Backend, EXIT_MISMATCH, EXIT_OK, EXIT_REJECTED, EXIT_USAGE, Failure, Feed, Reference, Subject,
     config_args, describe, escape, new_memory, repro_env, shell_join, unescape,
 };
 use crate::{CompileArgs, compile_args};
@@ -19,6 +19,10 @@ pub(crate) struct ShrinkArgs {
     /// Check only the NFA and this tier (default: every eligible tier)
     #[bpaf(long, argument("TIER"))]
     pub(crate) tier: Option<u8>,
+    /// Check only the NFA and the experimental grouped NFA; patterns it
+    /// does not admit are rejected
+    #[bpaf(long)]
+    pub(crate) grouped_nfa: bool,
     /// Without --unroll-limit/--no-merge, use the first of the three
     /// standard configurations where the input mismatches
     #[bpaf(external(compile_args))]
@@ -62,7 +66,7 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
         match Subject::compile(
             pattern,
             &config,
-            super::TierChoice::new(args.tier, None),
+            super::TierChoice::new(args.tier, None, args.grouped_nfa),
             &mut memory,
         ) {
             Ok(s) => {
@@ -90,8 +94,8 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
     };
 
     // Keep chasing the same bug: a candidate must still fail at least
-    // one of the original (tier, feed) checks.
-    let wanted: Vec<(u8, Feed)> = failures.iter().map(|f| (f.tier, f.feed)).collect();
+    // one of the original (backend, feed) checks.
+    let wanted: Vec<(Backend, Feed)> = failures.iter().map(|f| (f.backend, f.feed)).collect();
     let mut fails = |candidate: &[u8]| {
         subject.check(
             &mut new_memory(),
@@ -99,7 +103,9 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
             reference.is_match(candidate),
             &mut failures,
         );
-        failures.iter().any(|f| wanted.contains(&(f.tier, f.feed)))
+        failures
+            .iter()
+            .any(|f| wanted.contains(&(f.backend, f.feed)))
     };
     let original = input.len();
     let mut run = (input.len() / 2).max(1);
@@ -135,11 +141,16 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
         list.join(" ")
     );
     // `match` takes literal inputs; offer a trace command when possible.
-    // Trace a failing DFA tier if there is one, with the failing feed.
+    // Trace a failing backend other than the NFA if there is one, with
+    // the failing feed.
     let traced = failures
         .iter()
-        .find(|f| f.tier != 0 && wanted.contains(&(f.tier, f.feed)))
-        .or_else(|| failures.iter().find(|f| wanted.contains(&(f.tier, f.feed))));
+        .find(|f| f.backend != Backend::NFA && wanted.contains(&(f.backend, f.feed)))
+        .or_else(|| {
+            failures
+                .iter()
+                .find(|f| wanted.contains(&(f.backend, f.feed)))
+        });
     if let Some(traced) = traced
         && input.iter().all(|b| b.is_ascii_graphic() || *b == b' ')
     {
@@ -147,7 +158,10 @@ pub(crate) fn run(args: &ShrinkArgs) -> i32 {
         if traced.feed == Feed::Bytewise {
             cmd.extend(["--chunk-size".into(), "1".into()]);
         }
-        cmd.extend(["--tier".into(), traced.tier.to_string()]);
+        match traced.backend {
+            Backend::Tier(t) => cmd.extend(["--tier".into(), t.to_string()]),
+            Backend::Grouped => cmd.push("--grouped-nfa".into()),
+        }
         cmd.extend(config_args(&subject.config));
         if pattern.starts_with('-') || input.starts_with(b"-") {
             cmd.push("--".into());

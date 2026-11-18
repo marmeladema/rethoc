@@ -350,6 +350,16 @@ impl Regex {
     pub fn grouped_nfa_admission(&self) -> Result<(), GroupedNfaError> {
         self.grouped_plan().map(|_| ())
     }
+
+    /// Experimental: feed `input` whole to a fresh grouped NFA stream and
+    /// finish it; `None` if this regex cannot run on the grouped NFA.  For
+    /// the differential harnesses.
+    #[doc(hidden)]
+    pub fn grouped_is_match(&self, scratch: &mut GroupedScratch, input: &[u8]) -> Option<bool> {
+        let mut stream = GroupedStream::new(self, scratch).ok()?;
+        stream.chunk(self, scratch, input);
+        Some(stream.finish(self, scratch))
+    }
 }
 
 #[cfg(test)]
