@@ -492,6 +492,8 @@ pub(crate) fn fixture_regex(states: Vec<State>, num_counters: usize) -> Regex {
     re.sparse_counting = Some(Box::new(
         match super::sparse::analyze(
             &re.states,
+            &re.classes,
+            &re.byte_tables,
             re.start,
             structure.as_ref().map_err(|r| *r),
             &super::sparse::SparseLimits::DEFAULT,

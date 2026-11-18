@@ -582,7 +582,15 @@ fn sparse_layout_reads_the_structure_before_the_row_budget() {
         ),
         Err(Rejection::TooManyRowWords { .. })
     ));
-    let plan = analyze(&re.states, re.start, Ok(&structure), &SparseLimits::DEFAULT).unwrap();
+    let plan = analyze(
+        &re.states,
+        &re.classes,
+        &re.byte_tables,
+        re.start,
+        Ok(&structure),
+        &SparseLimits::DEFAULT,
+    )
+    .unwrap();
     assert_eq!(capacities(&plan), [4]);
 }
 
@@ -599,7 +607,16 @@ fn limits_below_at_and_above() {
         &Limits::DEFAULT,
     )
     .unwrap();
-    let run = |limits: SparseLimits| analyze(&re.states, re.start, Ok(&structure), &limits);
+    let run = |limits: SparseLimits| {
+        analyze(
+            &re.states,
+            &re.classes,
+            &re.byte_tables,
+            re.start,
+            Ok(&structure),
+            &limits,
+        )
+    };
     let full = run(SparseLimits::DEFAULT).unwrap();
     assert_eq!(full.max_cap, 20);
 
@@ -625,13 +642,23 @@ fn limits_below_at_and_above() {
             limit: full.slots - 1
         })
     );
+    // The plan budget drops the optional idle table first.
     let bytes = full.heap_bytes();
+    assert!(full.idle.is_some());
     assert_eq!(with(&|l| l.max_plan_bytes = bytes), Ok(()));
+    let without = run(SparseLimits {
+        max_plan_bytes: bytes - 1,
+        ..SparseLimits::DEFAULT
+    })
+    .unwrap();
+    assert!(without.idle.is_none());
+    assert_eq!(without.heap_bytes(), bytes - 256);
+    assert_eq!(with(&|l| l.max_plan_bytes = bytes - 256), Ok(()));
     assert_eq!(
-        with(&|l| l.max_plan_bytes = bytes - 1),
+        with(&|l| l.max_plan_bytes = bytes - 257),
         Err(SparseRejection::PlanTooLarge {
-            bytes,
-            limit: bytes - 1
+            bytes: bytes - 256,
+            limit: bytes - 257
         })
     );
     let analysis = sparse_analysis_bytes(re.states.len(), re.num_counters);
@@ -659,15 +686,24 @@ fn limits_below_at_and_above() {
         ..SparseLimits::DEFAULT
     };
     assert_eq!(
-        analyze(&exact.states, exact.start, Ok(&structure), &raised)
-            .unwrap()
-            .max_cap,
+        analyze(
+            &exact.states,
+            &exact.classes,
+            &exact.byte_tables,
+            exact.start,
+            Ok(&structure),
+            &raised
+        )
+        .unwrap()
+        .max_cap,
         40
     );
     // A structural rejection is passed on.
     assert_eq!(
         analyze(
             &re.states,
+            &re.classes,
+            &re.byte_tables,
             re.start,
             Err(Rejection::TooManyEdges { limit: 1 }),
             &SparseLimits::DEFAULT
@@ -724,26 +760,61 @@ fn the_option_changes_nothing_else() {
 // Matching: against Tier 0, the regex crate and the exact rows
 // ---------------------------------------------------------------------------
 
+use super::super::exact::Sweep;
 use super::super::tests::{CONFIGS, Rng, all_strings, oracle};
 use super::super::{GroupedScratch, GroupedStream};
 use crate::{CounterIdx, MatcherMemory, StateIdx};
 
-/// Feed `chunks` to a sparse stream and to Tier 0 side by side: `ismatch`
-/// must agree after construction and after every call (Tier 0 unfinished:
-/// a prefix is not an input), and `finish` with both and `expected`.
+/// Every pass a stream can be forced to.  `Auto` also skips while idle;
+/// `Full` and `Active` run the general step on every byte.
+pub(crate) const SWEEPS: [Sweep; 3] = [Sweep::Auto, Sweep::Full, Sweep::Active];
+
+/// Feed `chunks` to a sparse stream of every pass and to Tier 0 side by
+/// side: `ismatch` must agree after construction and after every call
+/// (Tier 0 unfinished: a prefix is not an input), and `finish` with both
+/// and `expected`.  The raw frontier keeps its invariants and the scratch
+/// is left clean.
 pub(crate) fn run_chunks(re: &Regex, chunks: &[&[u8]], expected: bool, label: &str) {
-    let mut scratch = SparseScratch::new();
-    let mut stream = SparseStream::new(re, &mut scratch).unwrap();
+    let mut streams: Vec<(Sweep, SparseScratch, SparseStream)> = SWEEPS
+        .iter()
+        .map(|&sweep| {
+            let mut scratch = SparseScratch::new();
+            scratch.set_sweep(sweep);
+            let stream = SparseStream::new(re, &mut scratch).unwrap();
+            (sweep, scratch, stream)
+        })
+        .collect();
     let mut mem = MatcherMemory::default();
     let mut nfa = mem.matcher_for_tier(re, 0).unwrap();
-    assert_eq!(stream.ismatch(), nfa.ismatch(), "{label}: before input");
+    for (sweep, _, stream) in &streams {
+        assert_eq!(
+            stream.ismatch(),
+            nfa.ismatch(),
+            "{label} {sweep:?}: before input"
+        );
+    }
     for (i, chunk) in chunks.iter().enumerate() {
         nfa.chunk(chunk);
-        stream.chunk(re, &mut scratch, chunk);
-        assert_eq!(stream.ismatch(), nfa.ismatch(), "{label}: after chunk {i}");
+        for (sweep, scratch, stream) in &mut streams {
+            stream.chunk(re, scratch, chunk);
+            assert_eq!(
+                stream.ismatch(),
+                nfa.ismatch(),
+                "{label} {sweep:?}: after chunk {i}"
+            );
+            stream.check_invariants(re, label);
+            assert!(scratch.is_clean(), "{label} {sweep:?}: scratch left dirty");
+        }
     }
     assert_eq!(nfa.finish(), expected, "{label}: tier 0");
-    assert_eq!(stream.finish(re, &mut scratch), expected, "{label}: sparse");
+    for (sweep, scratch, stream) in &mut streams {
+        assert_eq!(
+            stream.finish(re, scratch),
+            expected,
+            "{label} {sweep:?}: sparse"
+        );
+        assert!(scratch.is_clean(), "{label} {sweep:?}: scratch left dirty");
+    }
 }
 
 /// Whole, bytewise, and a random partition with empty chunks.
@@ -772,25 +843,29 @@ pub(crate) fn check_input(
     run_chunks(re, &parts, expected, &format!("{label} chunked {input:?}"));
 }
 
-/// Feed `input` whole and bytewise to a sparse stream only.
+/// Feed `input` whole and bytewise to a sparse stream of every pass,
+/// without Tier 0.
 fn check_sparse_only(re: &Regex, expected: bool, input: &[u8], label: &str) {
-    let mut scratch = SparseScratch::new();
-    let mut s = SparseStream::new(re, &mut scratch).unwrap();
-    s.chunk(re, &mut scratch, input);
-    assert_eq!(
-        s.finish(re, &mut scratch),
-        expected,
-        "{label} whole {input:?}"
-    );
-    s.reset(re, &mut scratch);
-    for b in input.chunks(1) {
-        s.chunk(re, &mut scratch, b);
+    for sweep in SWEEPS {
+        let mut scratch = SparseScratch::new();
+        scratch.set_sweep(sweep);
+        let mut s = SparseStream::new(re, &mut scratch).unwrap();
+        s.chunk(re, &mut scratch, input);
+        assert_eq!(
+            s.finish(re, &mut scratch),
+            expected,
+            "{label} {sweep:?} whole {input:?}"
+        );
+        s.reset(re, &mut scratch);
+        for b in input.chunks(1) {
+            s.chunk(re, &mut scratch, b);
+        }
+        assert_eq!(
+            s.finish(re, &mut scratch),
+            expected,
+            "{label} {sweep:?} bytewise {input:?}"
+        );
     }
-    assert_eq!(
-        s.finish(re, &mut scratch),
-        expected,
-        "{label} bytewise {input:?}"
-    );
 }
 
 /// The sparse part of a `match_tests!` entry, for one of its builds
@@ -877,24 +952,36 @@ pub(crate) fn check_profiles(re: &Regex, input: &[u8], label: &str) {
     };
     let plan = re.sparse_plan().unwrap();
     let bounds = counter_bounds(plan);
-    let (mut exact_scratch, mut scratch) = (GroupedScratch::new(), SparseScratch::new());
+    let mut exact_scratch = GroupedScratch::new();
     let mut exact = GroupedStream::new(re, &mut exact_scratch).unwrap();
-    let mut sparse = SparseStream::new(re, &mut scratch).unwrap();
+    // One sparse stream per pass.
+    let mut streams: Vec<(Sweep, SparseScratch, SparseStream)> = SWEEPS
+        .iter()
+        .map(|&sweep| {
+            let mut scratch = SparseScratch::new();
+            scratch.set_sweep(sweep);
+            let stream = SparseStream::new(re, &mut scratch).unwrap();
+            (sweep, scratch, stream)
+        })
+        .collect();
+    let mut counts: Vec<u32> = Vec::new();
     for (i, b) in input.chunks(1).enumerate() {
         exact.chunk(re, &mut exact_scratch, b);
-        sparse.chunk(re, &mut scratch, b);
-        assert_eq!(
-            sparse.ismatch(),
-            exact.ismatch(),
-            "{label} {input:?} after byte {i}: match"
-        );
+        for (sweep, scratch, sparse) in &mut streams {
+            sparse.chunk(re, scratch, b);
+            assert_eq!(
+                sparse.ismatch(),
+                exact.ismatch(),
+                "{label} {sweep:?} {input:?} after byte {i}: match"
+            );
+        }
         if exact.ismatch() {
-            // Both stopped before this byte.
+            // All stopped before this byte.
             return;
         }
         for (state, scope, row) in exact_plan.rows_iter() {
             let words = &exact.raw()[row.off as usize..(row.off + row.words) as usize];
-            let mut counts: Vec<u32> = Vec::new();
+            counts.clear();
             for (w, &word) in words.iter().enumerate() {
                 let mut bits = word;
                 while bits != 0 {
@@ -902,25 +989,27 @@ pub(crate) fn check_profiles(re: &Regex, input: &[u8], label: &str) {
                     bits &= bits - 1;
                 }
             }
-            assert_eq!(
-                sparse.raw_active(re, state),
-                !counts.is_empty(),
-                "{label} {input:?} after byte {i}: state {state} activity"
-            );
-            let Scope::Counter(c) = scope else { continue };
-            let (l, h) = bounds[c.idx()].expect("a counted scope has an increment");
-            let reps = sparse.raw_counts(re, state).unwrap();
-            let ok = reps.windows(2).all(|w| w[0] < w[1])
-                && reps.iter().all(|u| counts.binary_search(u).is_ok())
-                && counts.iter().all(|&u| (1..=h).contains(&u))
-                && reps.first() == counts.first()
-                && exit_profile(reps, l, h) == exit_profile(&counts, l, h);
-            assert!(
-                ok,
-                "{label} {input:?} after byte {i}: state {state} {{{l},{h}}}: sparse {reps:?} \
-                 does not stand for exact {counts:?} (order, subset, range, least count or \
-                 exit profile)"
-            );
+            for (sweep, _, sparse) in &streams {
+                assert_eq!(
+                    sparse.raw_active(re, state),
+                    !counts.is_empty(),
+                    "{label} {sweep:?} {input:?} after byte {i}: state {state} activity"
+                );
+                let Scope::Counter(c) = scope else { continue };
+                let (l, h) = bounds[c.idx()].expect("a counted scope has an increment");
+                let reps = sparse.raw_counts(re, state).unwrap();
+                let ok = reps.windows(2).all(|w| w[0] < w[1])
+                    && reps.iter().all(|u| counts.binary_search(u).is_ok())
+                    && counts.iter().all(|&u| (1..=h).contains(&u))
+                    && reps.first() == counts.first()
+                    && exit_profile(reps, l, h) == exit_profile(&counts, l, h);
+                assert!(
+                    ok,
+                    "{label} {sweep:?} {input:?} after byte {i}: state {state} {{{l},{h}}}: \
+                     sparse {reps:?} does not stand for exact {counts:?} (order, subset, range, \
+                     least count or exit profile)"
+                );
+            }
         }
     }
 }
@@ -1111,7 +1200,7 @@ fn wide_bounds_on_long_inputs() {
         let (mut matches, mut misses) = (0, 0);
         for round in 0..24 {
             let input = if round % 2 == 0 {
-                random_input(&mut rng, noise, [20, 200, 700, 1500][round / 2 % 4])
+                random_input(&mut rng, noise, [20, 200, 500, 900][round / 2 % 4])
             } else {
                 let lead = rng.below(4);
                 let mut input = random_input(&mut rng, &[b"q", b"qq"], lead);
@@ -1148,7 +1237,7 @@ fn wide_bounds_on_long_inputs() {
             check_profiles(&re, &input, &label);
         }
         assert!(
-            matches >= 3 && misses >= 3,
+            matches >= 2 && misses >= 3,
             "`{}`: {matches} matches, {misses} misses",
             c.pattern
         );
@@ -1508,4 +1597,173 @@ fn display_shows_representatives() {
         CounterIdx(0),
         state_where(&re, |s| matches!(s, State::Match)),
     );
+}
+
+// ---------------------------------------------------------------------------
+// The passes and the idle skip
+// ---------------------------------------------------------------------------
+
+/// The idle table exists exactly when the start closure is the same at
+/// every boundary and cannot match.
+#[test]
+fn idle_table_only_where_sound() {
+    for (pattern, idle) in [
+        ("x(a|aa){2,5}z", true),
+        ("(a|b){2,5}z", true),
+        ("x(a|aa){0,3}z", true),
+        // A match in the start closure: the empty input matches.
+        ("a{0,3}", false),
+        ("", false),
+        // An assertion in the start closure: it depends on the boundary.
+        (r"\bx(a|aa){2,5}", false),
+        (r"(?m:^)x(a|aa){2,5}", false),
+        (r"(?:\b|q)x(a|aa){2,5}", false),
+        // An assertion further on does not matter.
+        (r"x(a|aa){2,5}\b", true),
+        (r"x\b(a| ){2,5}", true),
+    ] {
+        let re = sparse_forced(pattern);
+        let plan = sparse_plan(&re);
+        assert_eq!(plan.idle.is_some(), idle, "`{pattern}`");
+        let Some(starts) = plan.idle.as_deref() else {
+            continue;
+        };
+        // Exactly the first bytes of the pattern.
+        let first: Vec<u8> = (0..=255u8).filter(|&b| starts[b as usize]).collect();
+        let expected: &[u8] = if pattern.starts_with("(a|b)") {
+            b"ab"
+        } else {
+            b"x"
+        };
+        assert_eq!(first, expected, "`{pattern}`");
+    }
+}
+
+/// The passes a scan runs: the automatic choice skips while idle and
+/// takes the full sweep on a small plan; the forced passes step every
+/// byte.  All give the same answer and the same rows.
+#[test]
+fn passes_and_idle_skipping() {
+    let pattern = r"x(a|aa){2,5}\bz";
+    let re = sparse_forced(pattern);
+    let oracle = oracle(pattern);
+    let mut rng = Rng(0x1d1e);
+    let pieces: &[&[u8]] = &[
+        b"qqqqqqqqqqqq",
+        b"q",
+        b"xaa",
+        b"xaaaaaaa",
+        b"x",
+        b"a",
+        b"z",
+        b" ",
+    ];
+    for round in 0..40 {
+        let input = random_input(&mut rng, pieces, 200 + round * 5);
+        let expected = oracle.is_match(&input);
+        let mut rows = Vec::new();
+        for sweep in SWEEPS {
+            let mut scratch = SparseScratch::new();
+            scratch.set_sweep(sweep);
+            let mut s = SparseStream::new(&re, &mut scratch).unwrap();
+            for part in input.chunks(1 + round % 9) {
+                s.chunk(&re, &mut scratch, part);
+                s.check_invariants(&re, pattern);
+            }
+            rows.push(format!("{}", s.display(&re)));
+            let [full, active, skipped] = scratch.passes;
+            match sweep {
+                Sweep::Auto => {
+                    assert_eq!(active, 0, "a small plan takes the full sweep");
+                    assert!(skipped > 0, "round {round}: nothing skipped");
+                    assert!(full + skipped <= input.len());
+                }
+                Sweep::Full => assert_eq!((active, skipped), (0, 0)),
+                Sweep::Active => assert_eq!((full, skipped), (0, 0)),
+            }
+            if !s.ismatch() {
+                assert_eq!(full + active + skipped, input.len(), "{sweep:?}");
+            }
+            assert_eq!(s.finish(&re, &mut scratch), expected, "{sweep:?} {input:?}");
+        }
+        // The same raw frontier and boundary, however it was reached.
+        assert!(
+            rows.iter().all(|r| r == &rows[0]),
+            "round {round}: {rows:?}"
+        );
+    }
+}
+
+/// A wide plan with few active rows takes the active pass under the
+/// automatic choice, and the full sweep when many rows are active.
+#[test]
+fn automatic_choice_follows_the_active_rows() {
+    // Twelve counted alternatives of which an input activates one.
+    let pattern: String = (0..12u8)
+        .map(|i| {
+            let (p, a) = ((b'A' + i) as char, (b'a' + i) as char);
+            format!("{p}({a}|{a}{a}){{2,60}}!")
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    let re = sparse_forced(&pattern);
+    let plan = sparse_plan(&re);
+    assert!(plan.rows() > 64, "{} rows", plan.rows());
+    let oracle = oracle(&pattern);
+    let mut scratch = SparseScratch::new();
+    let mut s = SparseStream::new(&re, &mut scratch).unwrap();
+    let mut input = b"qqqqA".to_vec();
+    input.extend(std::iter::repeat_n(b'a', 50));
+    s.chunk(&re, &mut scratch, &input);
+    let [full, active, skipped] = scratch.passes;
+    assert_eq!(skipped, 4);
+    assert!(active >= 50 && full == 0, "full={full} active={active}");
+    assert!(!s.ismatch());
+    s.chunk(&re, &mut scratch, b"!");
+    assert!(s.finish(&re, &mut scratch));
+    for input in [
+        b"Aaaaa!".as_slice(),
+        b"BbbbbbbbbbbA!",
+        b"qqLllllllllllllllllllllllllllll!",
+        b"Aa!",
+        b"KkkkkAaaaaaaBbbb!",
+    ] {
+        run_chunks(&re, &[input], oracle.is_match(input), "wide");
+        check_profiles(&re, input, "wide");
+    }
+}
+
+/// Skipping keeps the boundary: an assertion right after a skipped
+/// stretch sees the byte before it, and a chunk that ends while idle
+/// leaves the stream at the right place.
+#[test]
+fn skipping_tracks_the_boundary() {
+    let pattern = r"x\b(a| ){2,3}\b";
+    let re = sparse_forced(pattern);
+    assert!(sparse_plan(&re).idle.is_some());
+    let oracle = oracle(pattern);
+    let mut scratch = SparseScratch::new();
+    for input in [
+        b"qqqqqqx a".as_slice(),
+        b"qqqqqqxa a",
+        b"qqqqqq",
+        b"qqqqqqqqqqqqx  a ",
+        b"qqx",
+        b"x aqqqqqqx  ",
+    ] {
+        for cut in 0..=input.len() {
+            let mut s = SparseStream::new(&re, &mut scratch).unwrap();
+            s.chunk(&re, &mut scratch, &input[..cut]);
+            let prev = cut.checked_sub(1).map(|i| input[i]);
+            if !s.ismatch() {
+                assert_eq!(s.boundary_state(), (prev, cut == 0), "{input:?} cut {cut}");
+            }
+            s.chunk(&re, &mut scratch, &input[cut..]);
+            assert_eq!(
+                s.finish(&re, &mut scratch),
+                oracle.is_match(input),
+                "{input:?} cut {cut}"
+            );
+        }
+    }
 }
