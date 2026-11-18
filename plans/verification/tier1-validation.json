@@ -1,0 +1,2084 @@
+{
+  "schema_version": 1,
+  "status": "complete",
+  "tested_engine_commit": "c25c3a81359f8214f08e487580eacf27ea30483a",
+  "source_revision": "e654f78748ad5fd04c94340bad3f5b434b976f38",
+  "scope": "Final-layout immutable binaries passed all 12 blocking sweeps and both 0..9000 fuzz regimes. Earlier complete snapshot retains report-only Tier 3 sweeps and verified preexisting wrong-answer observations.",
+  "limits": [
+    "Original measurements were captured before committing atop source_revision; tested_engine_commit identifies that engine snapshot, and binary hashes identify its builds. Review follow-up checks are recorded separately.",
+    "Report-only Tier 3 sweeps and their baseline replay were not repeated after the private Tier1DfaCache field-layout-only adjustment. Their evidence is explicitly retained under pre_layout.",
+    "Known-slow seed6357 remains allowlisted; ordinary fuzz batch totals exclude separately handled allowlisted seeds.",
+    "Logs are local /tmp artifacts; hashes and complete commands are retained for provenance and reproduction."
+  ],
+  "final_layout": {
+    "source_revision": "e654f78748ad5fd04c94340bad3f5b434b976f38",
+    "source_state": "Captured before committing the final implementation, including repr(C) Tier1DfaCache with transitions/stride before scratch storage; no algorithm changes after prior snapshot.",
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+    "build_environment": {
+      "CARGO_BUILD_BUILD_DIR": "/tmp/rethoc-tier1-sweep-build/build",
+      "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-sweep-build/target"
+    },
+    "binaries": {
+      "release": {
+        "path": "/tmp/rethoc-tier1-final-layout-bins/rethoc-release",
+        "sha256": "fd9e05e1e87b4164c465ad12d954a2cf0d54045517e057c59fb96c2b8e099125"
+      },
+      "debug": {
+        "path": "/tmp/rethoc-tier1-final-layout-bins/rethoc-debug",
+        "sha256": "2dc3dee3a09cb61a18afae3faf3071a1ff31506059b7e4585a77cd7e1c0b7bce"
+      }
+    },
+    "targeted_tests": {
+      "runtime_tests_passed": 6,
+      "runtime_seconds": 0.65
+    },
+    "sanity_check": {
+      "pattern": "(?Rm)^foo$",
+      "selected_engine": "tier1",
+      "compiled_memory_bytes": 980
+    },
+    "runs": [
+      {
+        "family": "tier1-assert",
+        "regime": "default",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-layout-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "--tier",
+          "1",
+          "tier1-assert"
+        ],
+        "environment": {},
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 1.88,
+        "summary": "sweep tier1-assert: runs=1260 ok=1260 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 2s",
+        "log": "/tmp/rethoc-tier1-final-layout-sweep-tier1-assert-default.log",
+        "log_sha256": "0f5a6ad6b16bbd39760e4c626b9f2fd1bf8d7278e3c0a2b1c25cf20ca7117a1f",
+        "counts": {
+          "runs": 1260,
+          "ok": 1260,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        }
+      },
+      {
+        "family": "tier1-assert",
+        "regime": "extreme",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-layout-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "--tier",
+          "1",
+          "tier1-assert"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 3.02,
+        "summary": "sweep tier1-assert dfa-states=8 byte-class-min=0: runs=1260 ok=1260 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 3s",
+        "log": "/tmp/rethoc-tier1-final-layout-sweep-tier1-assert-extreme.log",
+        "log_sha256": "04a01c7d82b63ee90f4721836db58a77f382ce442e614f5cefe0d946e58091a5",
+        "counts": {
+          "runs": 1260,
+          "ok": 1260,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        }
+      },
+      {
+        "family": "tier1-assert",
+        "regime": "debug",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-layout-bins/rethoc-debug",
+          "sweep",
+          "-j",
+          "4",
+          "--tier",
+          "1",
+          "--max-len",
+          "4",
+          "tier1-assert"
+        ],
+        "environment": {},
+        "binary": "debug",
+        "exit_code": 0,
+        "seconds": 7.34,
+        "summary": "sweep tier1-assert: runs=1260 ok=1260 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 7s",
+        "log": "/tmp/rethoc-tier1-final-layout-sweep-tier1-assert-debug.log",
+        "log_sha256": "85cf946456446321ecb1018c475cfaed4a2e021a6486a764e98624f68f806088",
+        "counts": {
+          "runs": 1260,
+          "ok": 1260,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        }
+      },
+      {
+        "family": "nullable-counter",
+        "regime": "default",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-layout-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "nullable-counter"
+        ],
+        "environment": {},
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 8.29,
+        "summary": "sweep nullable-counter: runs=3920 ok=3920 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 8s",
+        "log": "/tmp/rethoc-tier1-final-layout-sweep-nullable-counter-default.log",
+        "log_sha256": "f5bba48238e72d942838c15967309cd3d521189dbfdbd3106c505a70d10dccf0",
+        "counts": {
+          "runs": 3920,
+          "ok": 3920,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        }
+      },
+      {
+        "family": "nullable-counter",
+        "regime": "extreme",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-layout-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "nullable-counter"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 5.54,
+        "summary": "sweep nullable-counter dfa-states=8 byte-class-min=0: runs=3920 ok=3920 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 6s",
+        "log": "/tmp/rethoc-tier1-final-layout-sweep-nullable-counter-extreme.log",
+        "log_sha256": "afc561050d1e5b3e6524b19aeed94391ad5bdc992baeadb3b4eec56ba4c0867d",
+        "counts": {
+          "runs": 3920,
+          "ok": 3920,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        }
+      },
+      {
+        "family": "nullable-counter",
+        "regime": "debug",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-layout-bins/rethoc-debug",
+          "sweep",
+          "-j",
+          "4",
+          "--max-len",
+          "4",
+          "nullable-counter"
+        ],
+        "environment": {},
+        "binary": "debug",
+        "exit_code": 0,
+        "seconds": 18.91,
+        "summary": "sweep nullable-counter: runs=3920 ok=3920 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 19s",
+        "log": "/tmp/rethoc-tier1-final-layout-sweep-nullable-counter-debug.log",
+        "log_sha256": "c655eceda2e0d8972aff150525bc4e32156202fbe3b0e16366f0e1206c45280f",
+        "counts": {
+          "runs": 3920,
+          "ok": 3920,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        }
+      },
+      {
+        "family": "assert-edges",
+        "regime": "default",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-layout-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "assert-edges"
+        ],
+        "environment": {},
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 36.77,
+        "summary": "sweep assert-edges: runs=2560 ok=2560 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 37s",
+        "log": "/tmp/rethoc-tier1-final-layout-sweep-assert-edges-default.log",
+        "log_sha256": "9c91dcacff776736f60bbca19a1af5aad69b55687d56f8bcdad1d6c48d2079ae",
+        "counts": {
+          "runs": 2560,
+          "ok": 2560,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        }
+      },
+      {
+        "family": "assert-edges",
+        "regime": "extreme",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-layout-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "assert-edges"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 34.92,
+        "summary": "sweep assert-edges dfa-states=8 byte-class-min=0: runs=2560 ok=2560 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 35s",
+        "log": "/tmp/rethoc-tier1-final-layout-sweep-assert-edges-extreme.log",
+        "log_sha256": "2b84cd49095cea32c59a9c5bddcf41a450200108afed1c7c5bfe0f9fe25368f7",
+        "counts": {
+          "runs": 2560,
+          "ok": 2560,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        }
+      },
+      {
+        "family": "assert-edges",
+        "regime": "debug",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-layout-bins/rethoc-debug",
+          "sweep",
+          "-j",
+          "4",
+          "--max-len",
+          "4",
+          "assert-edges"
+        ],
+        "environment": {},
+        "binary": "debug",
+        "exit_code": 0,
+        "seconds": 19.34,
+        "summary": "sweep assert-edges: runs=2560 ok=2560 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 19s",
+        "log": "/tmp/rethoc-tier1-final-layout-sweep-assert-edges-debug.log",
+        "log_sha256": "016d5c1b716f6179ec35263c766a09a3c9dfc2c3199ca40bfe76b121fd42f937",
+        "counts": {
+          "runs": 2560,
+          "ok": 2560,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        }
+      },
+      {
+        "family": "assert-in-body",
+        "regime": "default",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-layout-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "--skip-tier",
+          "3",
+          "assert-in-body"
+        ],
+        "environment": {},
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 87.05,
+        "summary": "sweep assert-in-body: runs=13608 ok=13608 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 87s",
+        "log": "/tmp/rethoc-tier1-final-layout-sweep-assert-in-body-default.log",
+        "log_sha256": "4578e1947ea4212296fdc8683c2cfbf59b4d75d1ba071552ed1399b4621c7628",
+        "counts": {
+          "runs": 13608,
+          "ok": 13608,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        }
+      },
+      {
+        "family": "assert-in-body",
+        "regime": "extreme",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-layout-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "--skip-tier",
+          "3",
+          "assert-in-body"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 69.35,
+        "summary": "sweep assert-in-body dfa-states=8 byte-class-min=0: runs=13608 ok=13608 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 69s",
+        "log": "/tmp/rethoc-tier1-final-layout-sweep-assert-in-body-extreme.log",
+        "log_sha256": "cbefcca3fded0703b5d794602f0ad4c7c44c0d3f04f34beb167ca4f79a9690e9",
+        "counts": {
+          "runs": 13608,
+          "ok": 13608,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        }
+      },
+      {
+        "family": "assert-in-body",
+        "regime": "debug",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-layout-bins/rethoc-debug",
+          "sweep",
+          "-j",
+          "4",
+          "--skip-tier",
+          "3",
+          "--max-len",
+          "4",
+          "assert-in-body"
+        ],
+        "environment": {},
+        "binary": "debug",
+        "exit_code": 0,
+        "seconds": 36.8,
+        "summary": "sweep assert-in-body: runs=13608 ok=13608 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 37s",
+        "log": "/tmp/rethoc-tier1-final-layout-sweep-assert-in-body-debug.log",
+        "log_sha256": "3ac05cae5ba003db07751451811bc5591f2136abece815295c6360f040a6a226",
+        "counts": {
+          "runs": 13608,
+          "ok": 13608,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        }
+      }
+    ],
+    "fuzz": {
+      "binary": "/tmp/rethoc-tier1-final-layout-bins/rethoc-release",
+      "sha256": "fd9e05e1e87b4164c465ad12d954a2cf0d54045517e057c59fb96c2b8e099125",
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "requested_seed_range": {
+        "first": 0,
+        "count": 9000,
+        "last_inclusive": 8999
+      },
+      "regimes": [
+        {
+          "regime": "default",
+          "command": [
+            "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped",
+            "--time",
+            "1800",
+            "--",
+            "/tmp/rethoc-tier1-final-layout-bins/rethoc-release",
+            "fuzz",
+            "--batch",
+            "250",
+            "--allow-slow",
+            "ci/known-slow-seeds.txt",
+            "--jobs",
+            "4",
+            "0",
+            "9000"
+          ],
+          "environment_overrides": {},
+          "cleared_threshold_variables": [
+            "RETHOC_DFA_STATES",
+            "RETHOC_BYTE_CLASS_MIN_STATES"
+          ],
+          "log": "/tmp/rethoc-tier1-final-layout-fuzz-default.log",
+          "started_unix": 1795020954.5522375,
+          "status": "complete",
+          "exit_code": 0,
+          "elapsed_seconds": 91.601,
+          "summary_lines": [
+            "NOTE seed=6581 is on the slow allowlist but passed in 15.8s (watchdog 40s); remove it if that holds",
+            "KNOWN-SLOW seed=6357 ABORT: ABORT seed=6357 still running after 40s: `^ {1,35}{3,12}*((a?a?)?(a?a?)?)?((a?a?)?(a?a?)?)?((a?a?)?(a?a?)?)?((a?a?)?(a?a?)?)?$`",
+            "fuzz seeds 0..9000: failed=[] known-slow=[6357] no-longer-slow=[6581] in 91s"
+          ],
+          "resource_cap_hit": false,
+          "batch_totals": {
+            "cases": 8998,
+            "reference_rejected": 1,
+            "compiled": 26454,
+            "checks": 8332674,
+            "grouped": 2251460,
+            "grouped_rejected": 3450,
+            "mismatches": 0,
+            "per_tier": [
+              2598834,
+              1466038,
+              603552,
+              719168,
+              693622
+            ],
+            "completed_batches": 36,
+            "scope": "Batch statistics exclude the separately run allowlisted seeds 6357 and 6581."
+          },
+          "failed_seeds": [],
+          "known_slow_seeds": [
+            6357
+          ],
+          "no_longer_slow_seeds": [
+            6581
+          ],
+          "log_sha256": "3a4c534c56a9c1e54140ea62310b2269d7934c2e525f5aaab8751fac62525fce",
+          "batch_summary_lines_omitted": 36
+        },
+        {
+          "regime": "extreme",
+          "command": [
+            "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped",
+            "--time",
+            "1800",
+            "--",
+            "/tmp/rethoc-tier1-final-layout-bins/rethoc-release",
+            "fuzz",
+            "--batch",
+            "250",
+            "--allow-slow",
+            "ci/known-slow-seeds.txt",
+            "--jobs",
+            "4",
+            "0",
+            "9000"
+          ],
+          "environment_overrides": {
+            "RETHOC_DFA_STATES": "8",
+            "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+          },
+          "cleared_threshold_variables": [
+            "RETHOC_DFA_STATES",
+            "RETHOC_BYTE_CLASS_MIN_STATES"
+          ],
+          "log": "/tmp/rethoc-tier1-final-layout-fuzz-extreme.log",
+          "started_unix": 1795021046.1537983,
+          "status": "complete",
+          "exit_code": 0,
+          "elapsed_seconds": 87.2,
+          "summary_lines": [
+            "NOTE seed=6581 is on the slow allowlist but passed in 14.1s (watchdog 40s); remove it if that holds",
+            "KNOWN-SLOW seed=6357 ABORT: ABORT seed=6357 still running after 40s: `^ {1,35}{3,12}*((a?a?)?(a?a?)?)?((a?a?)?(a?a?)?)?((a?a?)?(a?a?)?)?((a?a?)?(a?a?)?)?$`",
+            "fuzz seeds 0..9000 dfa-states=8 byte-class-min=0: failed=[] known-slow=[6357] no-longer-slow=[6581] in 87s"
+          ],
+          "resource_cap_hit": false,
+          "batch_totals": {
+            "cases": 8998,
+            "reference_rejected": 1,
+            "compiled": 26454,
+            "checks": 8332674,
+            "grouped": 2251460,
+            "grouped_rejected": 3450,
+            "mismatches": 0,
+            "per_tier": [
+              2598834,
+              1466038,
+              603552,
+              719168,
+              693622
+            ],
+            "completed_batches": 36,
+            "scope": "Batch statistics exclude the separately run allowlisted seeds 6357 and 6581."
+          },
+          "failed_seeds": [],
+          "known_slow_seeds": [
+            6357
+          ],
+          "no_longer_slow_seeds": [
+            6581
+          ],
+          "log_sha256": "47095086ecd302265822f4c848c5f2a31a6bf7e7ba4f8c504f321672b9883048",
+          "batch_summary_lines_omitted": 36
+        }
+      ],
+      "completed": true,
+      "full_results_json": {
+        "path": "/tmp/rethoc-tier1-final-layout-fuzz-results.json",
+        "sha256": "303077ba142817215a0384265e5e3dd45a98fb0ae39a62241bb1800572e68d54"
+      }
+    },
+    "summary": {
+      "blocking_sweep_commands": 12,
+      "blocking_sweep_runs": 64044,
+      "blocking_sweep_mismatches": 0,
+      "blocking_sweep_rejections": 0,
+      "blocking_sweep_aborts": 0,
+      "fuzz_regimes": 2,
+      "fuzz_seed_range_per_regime": {
+        "first": 0,
+        "count": 9000
+      },
+      "fuzz_failed_seeds": []
+    }
+  },
+  "pre_layout": {
+    "source_revision": "e654f78748ad5fd04c94340bad3f5b434b976f38",
+    "source_state": "Captured from the uncommitted Tier 1 implementation atop source_revision, after counter-free reachability-table removal and consuming-alternative cycle fixtures, before the final cache-layout adjustment.",
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+    "build_environment": {
+      "CARGO_BUILD_BUILD_DIR": "/tmp/rethoc-tier1-sweep-build/build",
+      "CARGO_TARGET_DIR": "/tmp/rethoc-tier1-sweep-build/target"
+    },
+    "binaries": {
+      "release": {
+        "path": "/tmp/rethoc-tier1-final-bins/rethoc-release",
+        "sha256": "2cd485b9edb462f25e4d73ace127e7fbd524c91d77050a77bc33908bf34e0ba5"
+      },
+      "debug": {
+        "path": "/tmp/rethoc-tier1-final-bins/rethoc-debug",
+        "sha256": "aaf91d0346d091d0512cc5233d1aab2107873e7d8f43e9ca580a18a7a712188f"
+      }
+    },
+    "targeted_tests": {
+      "runtime_tests_passed": 6,
+      "cli_tests_passed": 2,
+      "runtime_seconds": 0.63
+    },
+    "compiled_cycle": {
+      "pattern": "(?:\\b(?m:^)|a)*.(?m:^)\\b",
+      "start": 4,
+      "cycle_edges": [
+        "Split4->3",
+        "Split3->0",
+        "Assert(WordAscii)0->1",
+        "Assert(StartLF)1->4"
+      ]
+    },
+    "runs": [
+      {
+        "kind": "sweep",
+        "family": "tier1-assert",
+        "regime": "default",
+        "report_only": false,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "--tier",
+          "1",
+          "tier1-assert"
+        ],
+        "environment": {},
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 5.15,
+        "summary": "sweep tier1-assert: runs=1260 ok=1260 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 5s",
+        "log": "/tmp/rethoc-tier1-final-sweep-tier1-assert-default.log",
+        "counts": {
+          "runs": 1260,
+          "ok": 1260,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "35b1a5544fcb9bb1aab90b1ad1c63f543077c8711af67ab932ba6ad29ebedee3"
+      },
+      {
+        "kind": "sweep",
+        "family": "tier1-assert",
+        "regime": "extreme",
+        "report_only": false,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "--tier",
+          "1",
+          "tier1-assert"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 4.31,
+        "summary": "sweep tier1-assert dfa-states=8 byte-class-min=0: runs=1260 ok=1260 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 4s",
+        "log": "/tmp/rethoc-tier1-final-sweep-tier1-assert-extreme.log",
+        "counts": {
+          "runs": 1260,
+          "ok": 1260,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "d26ae49f1a985e779038f3a7c2b64f3e03d0f4cb5fb453f148df5fc1452255a6"
+      },
+      {
+        "kind": "sweep",
+        "family": "tier1-assert",
+        "regime": "debug",
+        "report_only": false,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-debug",
+          "sweep",
+          "-j",
+          "4",
+          "--tier",
+          "1",
+          "--max-len",
+          "4",
+          "tier1-assert"
+        ],
+        "environment": {},
+        "binary": "debug",
+        "exit_code": 0,
+        "seconds": 6.91,
+        "summary": "sweep tier1-assert: runs=1260 ok=1260 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 7s",
+        "log": "/tmp/rethoc-tier1-final-sweep-tier1-assert-debug.log",
+        "counts": {
+          "runs": 1260,
+          "ok": 1260,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "85cf946456446321ecb1018c475cfaed4a2e021a6486a764e98624f68f806088"
+      },
+      {
+        "kind": "sweep",
+        "family": "nullable-counter",
+        "regime": "default",
+        "report_only": false,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "nullable-counter"
+        ],
+        "environment": {},
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 7.21,
+        "summary": "sweep nullable-counter: runs=3920 ok=3920 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 7s",
+        "log": "/tmp/rethoc-tier1-final-sweep-nullable-counter-default.log",
+        "counts": {
+          "runs": 3920,
+          "ok": 3920,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "aa0c3df203a945fe47642fcceee5caa5e06129fcd6773207ed576ed3677290db"
+      },
+      {
+        "kind": "sweep",
+        "family": "nullable-counter",
+        "regime": "extreme",
+        "report_only": false,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "nullable-counter"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 8.45,
+        "summary": "sweep nullable-counter dfa-states=8 byte-class-min=0: runs=3920 ok=3920 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 8s",
+        "log": "/tmp/rethoc-tier1-final-sweep-nullable-counter-extreme.log",
+        "counts": {
+          "runs": 3920,
+          "ok": 3920,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "64f3ea0dedd1a97561dab08cc09d77d5747ece53909546aee258625d60889a48"
+      },
+      {
+        "kind": "sweep",
+        "family": "nullable-counter",
+        "regime": "debug",
+        "report_only": false,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-debug",
+          "sweep",
+          "-j",
+          "4",
+          "--max-len",
+          "4",
+          "nullable-counter"
+        ],
+        "environment": {},
+        "binary": "debug",
+        "exit_code": 0,
+        "seconds": 16.32,
+        "summary": "sweep nullable-counter: runs=3920 ok=3920 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 16s",
+        "log": "/tmp/rethoc-tier1-final-sweep-nullable-counter-debug.log",
+        "counts": {
+          "runs": 3920,
+          "ok": 3920,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "3b1aac15acee7dd03f809543eb80e1af85d7de4e482e91131c3b32c7fc920f59"
+      },
+      {
+        "kind": "sweep",
+        "family": "assert-edges",
+        "regime": "default",
+        "report_only": false,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "assert-edges"
+        ],
+        "environment": {},
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 28.86,
+        "summary": "sweep assert-edges: runs=2560 ok=2560 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 29s",
+        "log": "/tmp/rethoc-tier1-final-sweep-assert-edges-default.log",
+        "counts": {
+          "runs": 2560,
+          "ok": 2560,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "e6d3b49e6b5cb503958e78167081f0fe10935621c05004de2142ac9f32cd008b"
+      },
+      {
+        "kind": "sweep",
+        "family": "assert-edges",
+        "regime": "extreme",
+        "report_only": false,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "assert-edges"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 27.73,
+        "summary": "sweep assert-edges dfa-states=8 byte-class-min=0: runs=2560 ok=2560 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 28s",
+        "log": "/tmp/rethoc-tier1-final-sweep-assert-edges-extreme.log",
+        "counts": {
+          "runs": 2560,
+          "ok": 2560,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "b73269145d9279ab286b82ca2f6bd48f466d094bb509acf93ccedf2406ddddb2"
+      },
+      {
+        "kind": "sweep",
+        "family": "assert-edges",
+        "regime": "debug",
+        "report_only": false,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-debug",
+          "sweep",
+          "-j",
+          "4",
+          "--max-len",
+          "4",
+          "assert-edges"
+        ],
+        "environment": {},
+        "binary": "debug",
+        "exit_code": 0,
+        "seconds": 14.17,
+        "summary": "sweep assert-edges: runs=2560 ok=2560 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 14s",
+        "log": "/tmp/rethoc-tier1-final-sweep-assert-edges-debug.log",
+        "counts": {
+          "runs": 2560,
+          "ok": 2560,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "7ba445af7f841766ccd94855d09815f0d1d1656cc2d261a19873c763347d7929"
+      },
+      {
+        "kind": "sweep",
+        "family": "assert-in-body",
+        "regime": "default",
+        "report_only": false,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "--skip-tier",
+          "3",
+          "assert-in-body"
+        ],
+        "environment": {},
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 69.71,
+        "summary": "sweep assert-in-body: runs=13608 ok=13608 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 70s",
+        "log": "/tmp/rethoc-tier1-final-sweep-assert-in-body-default.log",
+        "counts": {
+          "runs": 13608,
+          "ok": 13608,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "602e76276fb06777c5c8e0e7b72de7966429c7f28cbc32b658ab50b23ebceae4"
+      },
+      {
+        "kind": "sweep",
+        "family": "assert-in-body",
+        "regime": "extreme",
+        "report_only": false,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "--skip-tier",
+          "3",
+          "assert-in-body"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "binary": "release",
+        "exit_code": 0,
+        "seconds": 69.62,
+        "summary": "sweep assert-in-body dfa-states=8 byte-class-min=0: runs=13608 ok=13608 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 70s",
+        "log": "/tmp/rethoc-tier1-final-sweep-assert-in-body-extreme.log",
+        "counts": {
+          "runs": 13608,
+          "ok": 13608,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "84559122632ffc9e7910492f92cab749e47c7326cceb1ccd4589ac50ac6a9609"
+      },
+      {
+        "kind": "sweep",
+        "family": "assert-in-body",
+        "regime": "debug",
+        "report_only": false,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-debug",
+          "sweep",
+          "-j",
+          "4",
+          "--skip-tier",
+          "3",
+          "--max-len",
+          "4",
+          "assert-in-body"
+        ],
+        "environment": {},
+        "binary": "debug",
+        "exit_code": 0,
+        "seconds": 49.02,
+        "summary": "sweep assert-in-body: runs=13608 ok=13608 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 49s",
+        "log": "/tmp/rethoc-tier1-final-sweep-assert-in-body-debug.log",
+        "counts": {
+          "runs": 13608,
+          "ok": 13608,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "f8a8c73bdf1534abc153b53ad64164330618d23615c43054fc550659db6b775c"
+      },
+      {
+        "kind": "sweep",
+        "family": "tier3-assert",
+        "regime": "default",
+        "report_only": true,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "tier3-assert"
+        ],
+        "environment": {},
+        "binary": "release",
+        "exit_code": 1,
+        "seconds": 59.23,
+        "summary": "sweep tier3-assert: runs=10976 ok=10876 mismatch=100 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 59s",
+        "log": "/tmp/rethoc-tier1-final-sweep-tier3-assert-default-report-only.log",
+        "counts": {
+          "runs": 10976,
+          "ok": 10876,
+          "mismatch": 100,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "604a5c666166390932e9c2b963077eb6642e7f31adf2d1abac3acf6427923001"
+      },
+      {
+        "kind": "sweep",
+        "family": "tier3-assert",
+        "regime": "extreme",
+        "report_only": true,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "tier3-assert"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "binary": "release",
+        "exit_code": 1,
+        "seconds": 74.98,
+        "summary": "sweep tier3-assert dfa-states=8 byte-class-min=0: runs=10976 ok=10876 mismatch=100 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 75s",
+        "log": "/tmp/rethoc-tier1-final-sweep-tier3-assert-extreme-report-only.log",
+        "counts": {
+          "runs": 10976,
+          "ok": 10876,
+          "mismatch": 100,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "e18786daff052a44ef044ec17eb06c99662bfd8b33e9007b304f8d0d51d54b40"
+      },
+      {
+        "kind": "sweep",
+        "family": "tier3-assert",
+        "regime": "debug",
+        "report_only": true,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-debug",
+          "sweep",
+          "-j",
+          "4",
+          "--max-len",
+          "4",
+          "tier3-assert"
+        ],
+        "environment": {},
+        "binary": "debug",
+        "exit_code": 0,
+        "seconds": 32.33,
+        "summary": "sweep tier3-assert: runs=10976 ok=10976 mismatch=0 rejected=0 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 32s",
+        "log": "/tmp/rethoc-tier1-final-sweep-tier3-assert-debug-report-only.log",
+        "counts": {
+          "runs": 10976,
+          "ok": 10976,
+          "mismatch": 0,
+          "rejected": 0,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "46eb6a06e469b5284f5e0b70cf58c79d98d9d1b00f8c31f531ffef5804498cf4"
+      },
+      {
+        "kind": "sweep",
+        "family": "assert-in-body",
+        "regime": "default",
+        "report_only": true,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "--tier",
+          "3",
+          "assert-in-body"
+        ],
+        "environment": {},
+        "binary": "release",
+        "exit_code": 1,
+        "seconds": 23.16,
+        "summary": "sweep assert-in-body: runs=13608 ok=1788 mismatch=480 rejected=11340 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 23s",
+        "log": "/tmp/rethoc-tier1-final-sweep-assert-in-body-default-report-only.log",
+        "counts": {
+          "runs": 13608,
+          "ok": 1788,
+          "mismatch": 480,
+          "rejected": 11340,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "f2a78a2c1b7f06770974fc99bfe40ef424754729b93d581d6cf58e354b900f02"
+      },
+      {
+        "kind": "sweep",
+        "family": "assert-in-body",
+        "regime": "extreme",
+        "report_only": true,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-release",
+          "sweep",
+          "-j",
+          "4",
+          "--tier",
+          "3",
+          "assert-in-body"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "binary": "release",
+        "exit_code": 1,
+        "seconds": 22.59,
+        "summary": "sweep assert-in-body dfa-states=8 byte-class-min=0: runs=13608 ok=1788 mismatch=480 rejected=11340 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 23s",
+        "log": "/tmp/rethoc-tier1-final-sweep-assert-in-body-extreme-report-only.log",
+        "counts": {
+          "runs": 13608,
+          "ok": 1788,
+          "mismatch": 480,
+          "rejected": 11340,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "log_sha256": "b7c990309611374de832f862cf3012ecf6acb15384ea4b08b648570f3f0141aa"
+      },
+      {
+        "kind": "sweep",
+        "family": "assert-in-body",
+        "regime": "debug",
+        "report_only": true,
+        "command": [
+          "scripts/capped",
+          "--time",
+          "1800",
+          "--",
+          "/tmp/rethoc-tier1-final-bins/rethoc-debug",
+          "sweep",
+          "-j",
+          "4",
+          "--tier",
+          "3",
+          "--max-len",
+          "4",
+          "assert-in-body"
+        ],
+        "environment": {},
+        "binary": "debug",
+        "exit_code": 1,
+        "seconds": 23,
+        "summary": "sweep assert-in-body: runs=13608 ok=1875 mismatch=393 rejected=11340 aborted=0 (timeout=0 oom=0 panic=0 crash=0) in 23s",
+        "log": "/tmp/rethoc-tier1-final-sweep-assert-in-body-debug-report-only.log",
+        "counts": {
+          "runs": 13608,
+          "ok": 1875,
+          "mismatch": 393,
+          "rejected": 11340,
+          "aborted": 0,
+          "timeout": 0,
+          "oom": 0,
+          "panic": 0,
+          "crash": 0
+        },
+        "collection_note": "Collected completed child summary after pausing supervisor to delegate fuzz; elapsed rounded by sweep summary.",
+        "log_sha256": "26bafb2f3e97f0776713b1480f8c3db58afb8e3d9f5b5aa2e463269026307297"
+      }
+    ],
+    "status": "Complete pre-layout snapshot. Report-only Tier 3 observations and baseline replay belong to this snapshot.",
+    "summary": {
+      "blocking_sweep_commands": 12,
+      "blocking_sweep_runs": 64044,
+      "blocking_sweep_failures": 0,
+      "report_only_sweep_commands": 6,
+      "report_only_mismatching_runs": 1553,
+      "report_only_wrong_answer_classification": "Every logged whole/bytewise wrong-answer observation reproduced on baseline; no unexpected failures."
+    },
+    "tier3_baseline_classification": {
+      "baseline_revision": "e654f78748ad5fd04c94340bad3f5b434b976f38",
+      "baseline_binary": "/tmp/rethoc-tier1-native-base-target/release/rethoc",
+      "baseline_sha256": "c4fd471b8bbb365aa46a363d9927784b5c559189b1196be9a144a8dac0d352dd",
+      "baseline_build_directory": "/tmp/rethoc-tier1-base-build",
+      "baseline_target_directory": "/tmp/rethoc-tier1-native-base-target",
+      "baseline_note": "Verified separately: source e654f78, Regex size752, forced Tier1 CRLF rejected. Release CLI used to replay wrong-answer observations from both release and debug sweeps.",
+      "unique_match_replays": 2320,
+      "replayed_modes": [
+        "whole",
+        "bytewise"
+      ],
+      "seconds": 7.9,
+      "cache_history_fallbacks": 0,
+      "all_preexisting": true,
+      "unexpected": [],
+      "groups": [
+        {
+          "family": "tier3-assert",
+          "regime": "default",
+          "mismatching_runs": 100,
+          "observations": 200,
+          "verified_preexisting_observations": 200
+        },
+        {
+          "family": "tier3-assert",
+          "regime": "extreme",
+          "mismatching_runs": 100,
+          "observations": 200,
+          "verified_preexisting_observations": 200
+        },
+        {
+          "family": "tier3-assert",
+          "regime": "debug",
+          "mismatching_runs": 0,
+          "observations": 0,
+          "verified_preexisting_observations": 0
+        },
+        {
+          "family": "assert-in-body",
+          "regime": "default",
+          "mismatching_runs": 480,
+          "observations": 960,
+          "verified_preexisting_observations": 960
+        },
+        {
+          "family": "assert-in-body",
+          "regime": "extreme",
+          "mismatching_runs": 480,
+          "observations": 960,
+          "verified_preexisting_observations": 960
+        },
+        {
+          "family": "assert-in-body",
+          "regime": "debug",
+          "mismatching_runs": 393,
+          "observations": 786,
+          "verified_preexisting_observations": 786
+        }
+      ],
+      "log": "/tmp/rethoc-tier1-final-tier3-baseline-replay.log",
+      "log_sha256": "3536b8c15ff408ddaa2ff409caebf3550ecdd58aa5bf49c4f1fe09beb759b830"
+    },
+    "fuzz": {
+      "binary": "/tmp/rethoc-tier1-final-bins/rethoc-release",
+      "sha256": "2cd485b9edb462f25e4d73ace127e7fbd524c91d77050a77bc33908bf34e0ba5",
+      "cwd": "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98",
+      "requested_seed_range": {
+        "first": 0,
+        "count": 9000,
+        "last_inclusive": 8999
+      },
+      "regimes": [
+        {
+          "regime": "default",
+          "command": [
+            "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped",
+            "--time",
+            "1800",
+            "--",
+            "/tmp/rethoc-tier1-final-bins/rethoc-release",
+            "fuzz",
+            "--batch",
+            "250",
+            "--allow-slow",
+            "ci/known-slow-seeds.txt",
+            "--jobs",
+            "4",
+            "0",
+            "9000"
+          ],
+          "environment_overrides": {},
+          "cleared_threshold_variables": [
+            "RETHOC_DFA_STATES",
+            "RETHOC_BYTE_CLASS_MIN_STATES"
+          ],
+          "log": "/tmp/rethoc-tier1-final-fuzz-default.log",
+          "started_unix": 1795020197.9903624,
+          "status": "complete",
+          "exit_code": 0,
+          "elapsed_seconds": 86.91,
+          "summary_lines": [
+            "NOTE seed=6581 is on the slow allowlist but passed in 13.7s (watchdog 40s); remove it if that holds",
+            "KNOWN-SLOW seed=6357 ABORT: ABORT seed=6357 still running after 40s: `^ {1,35}{3,12}*((a?a?)?(a?a?)?)?((a?a?)?(a?a?)?)?((a?a?)?(a?a?)?)?((a?a?)?(a?a?)?)?$`",
+            "fuzz seeds 0..9000: failed=[] known-slow=[6357] no-longer-slow=[6581] in 86s"
+          ],
+          "resource_cap_hit": false,
+          "batch_totals": {
+            "cases": 8998,
+            "reference_rejected": 1,
+            "compiled": 26454,
+            "checks": 8332674,
+            "grouped": 2251460,
+            "grouped_rejected": 3450,
+            "mismatches": 0,
+            "per_tier": [
+              2598834,
+              1466038,
+              603552,
+              719168,
+              693622
+            ],
+            "completed_batches": 36,
+            "scope": "Batch statistics exclude the separately run allowlisted seeds 6357 and 6581."
+          },
+          "failed_seeds": [],
+          "known_slow_seeds": [
+            6357
+          ],
+          "no_longer_slow_seeds": [
+            6581
+          ],
+          "log_sha256": "6d60acc799089240af40143fcf6b41238d5a1340cd5cd0818d3c29d8b1874a29",
+          "batch_summary_lines_omitted": 36
+        },
+        {
+          "regime": "extreme",
+          "command": [
+            "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/scripts/capped",
+            "--time",
+            "1800",
+            "--",
+            "/tmp/rethoc-tier1-final-bins/rethoc-release",
+            "fuzz",
+            "--batch",
+            "250",
+            "--allow-slow",
+            "ci/known-slow-seeds.txt",
+            "--jobs",
+            "4",
+            "0",
+            "9000"
+          ],
+          "environment_overrides": {
+            "RETHOC_DFA_STATES": "8",
+            "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+          },
+          "cleared_threshold_variables": [
+            "RETHOC_DFA_STATES",
+            "RETHOC_BYTE_CLASS_MIN_STATES"
+          ],
+          "log": "/tmp/rethoc-tier1-final-fuzz-extreme.log",
+          "started_unix": 1795020284.900909,
+          "status": "complete",
+          "exit_code": 0,
+          "elapsed_seconds": 88.836,
+          "summary_lines": [
+            "NOTE seed=6581 is on the slow allowlist but passed in 21.4s (watchdog 40s); remove it if that holds",
+            "KNOWN-SLOW seed=6357 ABORT: ABORT seed=6357 still running after 40s: `^ {1,35}{3,12}*((a?a?)?(a?a?)?)?((a?a?)?(a?a?)?)?((a?a?)?(a?a?)?)?((a?a?)?(a?a?)?)?$`",
+            "fuzz seeds 0..9000 dfa-states=8 byte-class-min=0: failed=[] known-slow=[6357] no-longer-slow=[6581] in 88s"
+          ],
+          "resource_cap_hit": false,
+          "batch_totals": {
+            "cases": 8998,
+            "reference_rejected": 1,
+            "compiled": 26454,
+            "checks": 8332674,
+            "grouped": 2251460,
+            "grouped_rejected": 3450,
+            "mismatches": 0,
+            "per_tier": [
+              2598834,
+              1466038,
+              603552,
+              719168,
+              693622
+            ],
+            "completed_batches": 36,
+            "scope": "Batch statistics exclude the separately run allowlisted seeds 6357 and 6581."
+          },
+          "failed_seeds": [],
+          "known_slow_seeds": [
+            6357
+          ],
+          "no_longer_slow_seeds": [
+            6581
+          ],
+          "log_sha256": "ff87ac947634f3e0948d3a2f82a221c76893b37254a8f7f841903d3df5480a8b",
+          "batch_summary_lines_omitted": 36
+        }
+      ],
+      "completed": true,
+      "full_results_json": {
+        "path": "/tmp/rethoc-tier1-final-fuzz-results.json",
+        "sha256": "d11348a9d0c601984dbc353d42a7fd51bb15415c0bd8d97c8b8a81aa200caac1"
+      }
+    }
+  },
+  "review_followup": {
+    "engine_commit": "2c9a3b974bdf1ad05e89bd3a273740a50b14b0a3",
+    "scope": "PR 24 findings 1, 2, 3, 8, 9: sweep selection and argument ordering, CI prerequisite guard, and diagnostic formatting. Engine algorithms and cache layout unchanged.",
+    "source_sha256": {
+      "rethoc-cli/src/check/sweep.rs": "c85d2044e3966a665ddc202d5801bc221bcacbbe901215b064430d124ff25417",
+      ".github/workflows/differential.yml": "f911e9db125524b5ebfb4c58498cfd0dc2d0b4a1ae2b70071d56b6ed0cbe2666",
+      "rethoc-engine/src/dump.rs": "429228002c7642c7a6c1dcee77e0f0f83297df148f98fe5e98a552466fb6668d",
+      "rethoc-engine/src/dfa/tier1.rs": "5115d2dfb6ba7c269825a67e2368ff88762a7c37c4214e875223686d59ef957c"
+    },
+    "binaries": {
+      "debug": {
+        "sha256": "90d0ab2088a58d15bedb78e4e96906776b7bbd4dd5ac2452bfa5cf84ca0ae396"
+      },
+      "release": {
+        "sha256": "661ee97f035218e89457b6b316567ad5714967dcc4b8d4eaa4d18319bd0e10f6"
+      }
+    },
+    "full_tests": {
+      "debug": {
+        "cli_passed": 17,
+        "engine_passed": 934,
+        "engine_ignored": 4,
+        "doctests_passed": 4,
+        "doctests_ignored": 2
+      },
+      "release": {
+        "cli_passed": 17,
+        "engine_passed": 934,
+        "engine_ignored": 4,
+        "doctests_passed": 4,
+        "doctests_ignored": 2
+      }
+    },
+    "checks": [
+      "cargo fmt --check",
+      "cargo clippy --all-targets -- -D clippy::all",
+      "cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D clippy::all"
+    ],
+    "sweeps": [
+      {
+        "profile": "release",
+        "environment": {},
+        "args": [
+          "sweep",
+          "-j",
+          "4",
+          "tier1-assert"
+        ],
+        "runs": 1260,
+        "ok": 1260,
+        "mismatch": 0,
+        "rejected": 0,
+        "aborted": 0
+      },
+      {
+        "profile": "release",
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "args": [
+          "sweep",
+          "-j",
+          "4",
+          "tier1-assert"
+        ],
+        "runs": 1260,
+        "ok": 1260,
+        "mismatch": 0,
+        "rejected": 0,
+        "aborted": 0
+      },
+      {
+        "profile": "debug",
+        "environment": {},
+        "args": [
+          "sweep",
+          "-j",
+          "4",
+          "--max-len",
+          "4",
+          "tier1-assert"
+        ],
+        "runs": 1260,
+        "ok": 1260,
+        "mismatch": 0,
+        "rejected": 0,
+        "aborted": 0
+      }
+    ],
+    "smoke_checks": {
+      "other_family_lists_unchanged": 16,
+      "tier1_explicit_override_lists_unchanged": 5,
+      "tier1_default_equals_explicit_tier1": true,
+      "dump_section_spacing": "passed",
+      "cache_debug_lengths_and_capacities": "passed",
+      "workflow_guard_static_combinations": 64
+    },
+    "limitations": [
+      "Workflow guard checked statically, not on a GitHub runner.",
+      "Original benchmarks and large differential/fuzz matrices were not repeated for these tooling and formatting changes."
+    ],
+    "local_logs": "/tmp/rethoc-pr24-fixes-*.log"
+  },
+  "assertion_lookup_hoist": {
+    "finding": 7,
+    "engine_commit": "026d6e9b1641f51df4cb74fc3261f57b4c217253",
+    "source_sha256": {
+      "rethoc-engine/src/dfa/tier1.rs": "dc5ca68067ba35ac9ee90bdaab5ac0a2d618683ce92ffdb82fea5d23727f8f53"
+    },
+    "binaries": {
+      "debug": {
+        "sha256": "0f93bde3515538b9bdc33f087b5b8a74662ec71d196e47873bce0322dcdeb4e2"
+      },
+      "release": {
+        "sha256": "7e8fc4100378ae99b34948c81c66854c970bb6fb87b02fad24d1ddf45cc90047"
+      }
+    },
+    "full_tests_each_profile": {
+      "cli_passed": 17,
+      "engine_passed": 934,
+      "engine_ignored": 4,
+      "doctests_passed": 4,
+      "doctests_ignored": 2
+    },
+    "checks_passed": [
+      [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-check-build\"",
+        "fmt",
+        "--check"
+      ],
+      [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-check-build\"",
+        "test"
+      ],
+      [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-check-build\"",
+        "test",
+        "--release"
+      ],
+      [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-check-build\"",
+        "clippy",
+        "--all-targets",
+        "--",
+        "-D",
+        "clippy::all"
+      ],
+      [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-check-build\"",
+        "clippy",
+        "--manifest-path",
+        "fuzz/Cargo.toml",
+        "--all-targets",
+        "--",
+        "-D",
+        "clippy::all"
+      ],
+      [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-check-build\"",
+        "build",
+        "--release",
+        "-p",
+        "rethoc-cli"
+      ],
+      [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-check-build\"",
+        "build",
+        "-p",
+        "rethoc-cli"
+      ]
+    ],
+    "sweep_runs": 3780,
+    "fuzz_seeds_each_regime": "0..500",
+    "fuzz_checks_each_regime": 465734,
+    "differential_runs": [
+      {
+        "name": "sweep-default",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "600",
+          "--",
+          "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/target/release/rethoc",
+          "sweep",
+          "-j",
+          "4",
+          "tier1-assert"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "seconds": 3.67,
+        "log": "/tmp/rethoc-pr24-hoist-sweep-default.log",
+        "log_sha256": "ea62ba42b45370a4b0dc55fd0f63fc6e6a18ede81b343d4cd4be2170a9fbc3a7"
+      },
+      {
+        "name": "sweep-extreme",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "600",
+          "--",
+          "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/target/release/rethoc",
+          "sweep",
+          "-j",
+          "4",
+          "tier1-assert"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "exit_code": 0,
+        "seconds": 4.61,
+        "log": "/tmp/rethoc-pr24-hoist-sweep-extreme.log",
+        "log_sha256": "d349fbad8bbb0e6ca220bad397c3a855dd23f6c59d281799cbf6726f0318b608"
+      },
+      {
+        "name": "sweep-debug",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "600",
+          "--",
+          "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/target/debug/rethoc",
+          "sweep",
+          "-j",
+          "4",
+          "--max-len",
+          "4",
+          "tier1-assert"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "seconds": 6.38,
+        "log": "/tmp/rethoc-pr24-hoist-sweep-debug.log",
+        "log_sha256": "8a0230d0fcf70a262b862204cdd0b39c9558a357e1ef47bae66455195ce04f81"
+      },
+      {
+        "name": "fuzz-default",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "600",
+          "--",
+          "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/target/release/rethoc",
+          "fuzz",
+          "--batch",
+          "250",
+          "-j",
+          "2",
+          "0",
+          "500"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "seconds": 14.0,
+        "log": "/tmp/rethoc-pr24-hoist-fuzz-default.log",
+        "log_sha256": "6535db5206777cf2ffc6af25c0e7b0c6efd2b35e949a64104205dd8d8b6b7823"
+      },
+      {
+        "name": "fuzz-extreme",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "600",
+          "--",
+          "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/target/release/rethoc",
+          "fuzz",
+          "--batch",
+          "250",
+          "-j",
+          "2",
+          "0",
+          "500"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "exit_code": 0,
+        "seconds": 10.27,
+        "log": "/tmp/rethoc-pr24-hoist-fuzz-extreme.log",
+        "log_sha256": "fffe3031d37745730e9bbf8e69ab602a7f11ea46e7a76258ee5ffb6fd035849d"
+      }
+    ],
+    "local_checks_log": "/tmp/rethoc-pr24-hoist-checks.json",
+    "performance": "tier1-performance.json:assertion_lookup_hoist",
+    "scope": "Existing regression tests reused for this semantics-preserving refactor. Full suites, three Tier 1 sweeps, and default/extreme batch fuzzing rerun after the code change. Earlier larger fuzz matrices remain historical snapshots."
+  },
+  "boxed_empty_analysis": {
+    "engine_commit": "e7676d0dd0064786624fb9579c2c68119040bc37",
+    "source_sha256": {
+      "rethoc-engine/src/lib.rs": "12ee1ab53621e1442d13a47aae237eb767e2919da0c9a7086923759c956763e4",
+      "rethoc-engine/src/dfa/tier1.rs": "da01933b5212a0c2749fe60acdaeff1c9a53ae4f92fd5067c34901a3626acd15",
+      "rethoc-engine/src/dfa/tier1/analysis.rs": "74c390d398248982121384dcbedf851fde7c01700caecd6b102b3ba337ba2fbc",
+      "rethoc-engine/src/dfa/tier1/assertion_tests.rs": "842ebb758eb55033b9fc2b35d9cd32743ad4b34bfa07ebd3ac99e41016ee82aa",
+      "rethoc-engine/src/dump.rs": "70658be3a062dd6e577c36e2e8c56d2b3228ba1204562d601b589541f14dfc59"
+    },
+    "binaries": {
+      "debug": {
+        "sha256": "54fe97cb0a782e421bfe7e19a69c4aeee9b9fd69c77278584e43748b4b5e8794"
+      },
+      "release": {
+        "sha256": "a858bf8efc5a01e80283b61febfa8a27a1cf9631137ca061dee008cb30888165"
+      }
+    },
+    "full_tests_each_profile": {
+      "cli_passed": 17,
+      "engine_passed": 935,
+      "engine_ignored": 4,
+      "doctests_passed": 4,
+      "doctests_ignored": 2
+    },
+    "checks_passed": [
+      [
+        "python3",
+        "scripts/bless_memory.py"
+      ],
+      [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-check-build\"",
+        "fmt",
+        "--check"
+      ],
+      [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-check-build\"",
+        "test"
+      ],
+      [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-check-build\"",
+        "test",
+        "--release"
+      ],
+      [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-check-build\"",
+        "clippy",
+        "--all-targets",
+        "--",
+        "-D",
+        "clippy::all"
+      ],
+      [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-check-build\"",
+        "clippy",
+        "--manifest-path",
+        "fuzz/Cargo.toml",
+        "--all-targets",
+        "--",
+        "-D",
+        "clippy::all"
+      ],
+      [
+        "python3",
+        "scripts/bless_memory.py",
+        "--check"
+      ],
+      [
+        "/home/elie/.cargo/bin/cargo",
+        "--config",
+        "build.build-dir=\"/tmp/rethoc-tier1-check-build\"",
+        "build",
+        "-p",
+        "rethoc-cli"
+      ]
+    ],
+    "memory": {
+      "sizes_bytes": {
+        "Regex": 760,
+        "DfaMatcher": 64,
+        "AnyMatcher": 608,
+        "MatcherMemory": 1640
+      },
+      "compiled_bytes": {
+        "abc": 904,
+        "\\babc\\b": 980,
+        "(?Rm)^abc$": 980
+      },
+      "unused_analysis_owner_bytes_added": 16,
+      "populated_analysis_bytes_change": 0,
+      "blessed_entries": 173,
+      "blessed_entry_delta_bytes": 16,
+      "all_memory_entries_checked": 506,
+      "notes": "The outer Box is retained unconditionally. Empty entries allocate no payload. Counts exclude allocator overhead. Regex and matcher object sizes remain unchanged."
+    },
+    "sweep_runs": 3780,
+    "fuzz_seeds_each_regime": "0..500",
+    "fuzz_checks_each_regime": 465734,
+    "differential_runs": [
+      {
+        "name": "sweep-default",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "600",
+          "--",
+          "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/target/release/rethoc",
+          "sweep",
+          "-j",
+          "4",
+          "tier1-assert"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "seconds": 1.84,
+        "log": "/tmp/rethoc-pr24-empty-sweep-default.log",
+        "log_sha256": "0f5a6ad6b16bbd39760e4c626b9f2fd1bf8d7278e3c0a2b1c25cf20ca7117a1f"
+      },
+      {
+        "name": "sweep-extreme",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "600",
+          "--",
+          "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/target/release/rethoc",
+          "sweep",
+          "-j",
+          "4",
+          "tier1-assert"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "exit_code": 0,
+        "seconds": 1.75,
+        "log": "/tmp/rethoc-pr24-empty-sweep-extreme.log",
+        "log_sha256": "e20734be2d29e0529072310d6cb053f4ac090910531600a6a698e18cc50821f1"
+      },
+      {
+        "name": "sweep-debug",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "600",
+          "--",
+          "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/target/debug/rethoc",
+          "sweep",
+          "-j",
+          "4",
+          "--max-len",
+          "4",
+          "tier1-assert"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "seconds": 2.39,
+        "log": "/tmp/rethoc-pr24-empty-sweep-debug.log",
+        "log_sha256": "0f5a6ad6b16bbd39760e4c626b9f2fd1bf8d7278e3c0a2b1c25cf20ca7117a1f"
+      },
+      {
+        "name": "fuzz-default",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "600",
+          "--",
+          "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/target/release/rethoc",
+          "fuzz",
+          "--batch",
+          "250",
+          "-j",
+          "2",
+          "0",
+          "500"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "seconds": 9.41,
+        "log": "/tmp/rethoc-pr24-empty-fuzz-default.log",
+        "log_sha256": "c58bc22bde61c134662372fcdb271b921e9772747df3f45795098259a41859f2"
+      },
+      {
+        "name": "fuzz-extreme",
+        "command": [
+          "scripts/capped",
+          "--time",
+          "600",
+          "--",
+          "/home/elie/.local/share/giskard/projects/01M7N1JDJ3YEVMDJZTVK5QCAWN/worktrees/01M7Q5SNCX2TA3X8Y7FHF7BT98/target/release/rethoc",
+          "fuzz",
+          "--batch",
+          "250",
+          "-j",
+          "2",
+          "0",
+          "500"
+        ],
+        "environment": {
+          "RETHOC_DFA_STATES": "8",
+          "RETHOC_BYTE_CLASS_MIN_STATES": "0"
+        },
+        "exit_code": 0,
+        "seconds": 9.21,
+        "log": "/tmp/rethoc-pr24-empty-fuzz-extreme.log",
+        "log_sha256": "71241c8ab80c345c2ea820f6f984da1dacbf4211ee5f15cb0293df7f53fdf8e9"
+      }
+    ],
+    "performance": "tier1-performance.json:boxed_empty_analysis",
+    "scope": "Full debug/release suites, both workspace Clippy checks, formatting, memory blessing/check, three Tier 1 sweeps, and default/extreme batch fuzzing completed after the representation change. Earlier larger matrices remain historical snapshots."
+  }
+}

@@ -2,6 +2,8 @@
 //!
 //! Each run is a child `rethoc brute` under a memory and time cap, so a
 //! pattern that blows up is counted and the sweep goes on.
+//! The `tier1-assert` family defaults to checking the NFA and Tier 1;
+//! explicit backend selectors override that default.
 
 use std::io::Write;
 use std::str::FromStr;
@@ -10,7 +12,10 @@ use std::time::Instant;
 use bpaf::Bpaf;
 
 use super::cap::{CapArgs, Verdict, cap_args, parallel, run_capped};
-use super::{EXIT_ABORT, EXIT_MISMATCH, EXIT_OK, regime_note, repro_env, shell_join};
+use super::{
+    EXIT_ABORT, EXIT_MISMATCH, EXIT_OK, EXIT_REJECTED, TierChoice, regime_note, repro_env,
+    shell_join,
+};
 
 /// A generated family of patterns.
 #[derive(Clone, Copy, Debug)]
@@ -23,6 +28,8 @@ pub(crate) enum Family {
     AssertEdges,
     /// See [`assert_in_body`].
     AssertInBody,
+    /// See [`tier1_assert`].
+    Tier1Assert,
 }
 
 impl Family {
@@ -33,6 +40,7 @@ impl Family {
             Self::Tier3Assert => "tier3-assert",
             Self::AssertEdges => "assert-edges",
             Self::AssertInBody => "assert-in-body",
+            Self::Tier1Assert => "tier1-assert",
         }
     }
 }
@@ -46,9 +54,10 @@ impl FromStr for Family {
             "tier3-assert" => Ok(Self::Tier3Assert),
             "assert-edges" => Ok(Self::AssertEdges),
             "assert-in-body" => Ok(Self::AssertInBody),
+            "tier1-assert" => Ok(Self::Tier1Assert),
             other => Err(format!(
                 "unknown family `{other}` (expected nullable-counter, tier3-assert, \
-                 assert-edges or assert-in-body)"
+                 assert-edges, assert-in-body or tier1-assert)"
             )),
         }
     }
@@ -62,7 +71,8 @@ pub(crate) struct SweepArgs {
     #[bpaf(long)]
     pub(crate) list: bool,
     /// Check only the NFA and this tier; patterns not eligible for it
-    /// count as rejected
+    /// count as rejected. Defaults to 1 for tier1-assert unless another
+    /// backend selector is given
     #[bpaf(long, argument("TIER"))]
     pub(crate) tier: Option<u8>,
     /// Check every eligible tier but this one (Tier 3 is known to be
@@ -80,9 +90,24 @@ pub(crate) struct SweepArgs {
     /// Caps and parallelism of the child processes
     #[bpaf(external(cap_args))]
     pub(crate) cap: CapArgs,
-    /// nullable-counter, tier3-assert, assert-edges or assert-in-body
+    /// nullable-counter, tier3-assert, assert-edges, assert-in-body or tier1-assert
     #[bpaf(positional("FAMILY"))]
     pub(crate) family: Family,
+}
+
+impl SweepArgs {
+    /// Apply the family's default only when no backend selector was supplied.
+    fn choice(&self) -> TierChoice {
+        if matches!(self.family, Family::Tier1Assert)
+            && self.tier.is_none()
+            && self.skip_tier.is_none()
+            && !self.grouped_nfa
+        {
+            TierChoice::Only(1)
+        } else {
+            TierChoice::new(self.tier, self.skip_tier, self.grouped_nfa)
+        }
+    }
 }
 
 /// Arguments of one `rethoc brute` run.
@@ -97,13 +122,16 @@ struct SweepRun {
 const MAX_LEN_ARG: usize = 6;
 
 impl SweepRun {
-    fn new(pattern: String, alphabet: &str, max_len: usize, unroll: usize) -> Self {
+    fn new(pattern: String, alphabet: &str, max_len: usize, unroll: usize, merge: bool) -> Self {
         let mut args: Vec<String> = ["brute", "--show", "1", "--alphabet", alphabet, "--max-len"]
             .map(String::from)
             .into();
         debug_assert_eq!(args.len(), MAX_LEN_ARG);
         args.push(max_len.to_string());
         args.extend(["--unroll-limit".into(), unroll.to_string()]);
+        if !merge {
+            args.push("--no-merge".into());
+        }
         if pattern.starts_with('-') {
             args.push("--".into());
         }
@@ -112,6 +140,25 @@ impl SweepRun {
             pattern,
             unroll,
             args,
+        }
+    }
+
+    /// Override input length before inserting the effective backend selector.
+    fn configure(&mut self, max_len: Option<usize>, choice: TierChoice) {
+        if let Some(n) = max_len {
+            self.args[MAX_LEN_ARG] = n.to_string();
+        }
+        // Backend flags shift MAX_LEN_ARG, so they must be inserted last.
+        match choice {
+            TierChoice::All => {}
+            TierChoice::Only(tier) => {
+                self.args.splice(1..1, ["--tier".into(), tier.to_string()]);
+            }
+            TierChoice::Except(tier) => {
+                self.args
+                    .splice(1..1, ["--skip-tier".into(), tier.to_string()]);
+            }
+            TierChoice::Grouped => self.args.insert(1, "--grouped-nfa".into()),
         }
     }
 }
@@ -149,6 +196,7 @@ fn nullable_counter() -> Vec<SweepRun> {
                             "edy ",
                             5,
                             unroll,
+                            true,
                         ));
                     }
                 }
@@ -189,7 +237,7 @@ fn tier3_assert() -> Vec<SweepRun> {
     }
     patterns
         .into_iter()
-        .map(|p| SweepRun::new(p, "abc ", 6, 0))
+        .map(|p| SweepRun::new(p, "abc ", 6, 0, true))
         .collect()
 }
 
@@ -233,7 +281,13 @@ fn assert_edges() -> Vec<SweepRun> {
             for a in ASSERTIONS {
                 for s in SUFFIXES {
                     for unroll in [32, 0] {
-                        runs.push(SweepRun::new(format!("{p}{c}{a}{s}"), r"a c\n-", 6, unroll));
+                        runs.push(SweepRun::new(
+                            format!("{p}{c}{a}{s}"),
+                            r"a c\n-",
+                            6,
+                            unroll,
+                            true,
+                        ));
                     }
                 }
             }
@@ -313,10 +367,91 @@ fn assert_in_body() -> Vec<SweepRun> {
                             r"ab c\n",
                             6,
                             unroll,
+                            true,
                         ));
                     }
                 }
             }
+        }
+    }
+    runs
+}
+
+/// Every accepted assertion kind, including CRLF, in ordered chains before
+/// and after consumption, alternatives, and zero-width cycles. Every pattern
+/// remains counter-free with unrolling disabled, so forced Tier 1 must admit
+/// every run. The alphabet separates word, ordinary nonword, CR, LF and raw
+/// non-ASCII bytes. Five-byte inputs reach paths on both sides of CRLF pairs.
+///
+/// Three compile configurations mirror the checking commands' defaults;
+/// explicit options keep a failure attributable to a single capped child.
+fn tier1_assert() -> Vec<SweepRun> {
+    const ASSERTIONS: [&str; 10] = [
+        "^",
+        "$",
+        "(?m:^)",
+        "(?m:$)",
+        "(?Rm:^)",
+        "(?Rm:$)",
+        r"\b",
+        r"\B",
+        r"\b{start}",
+        r"\b{end}",
+    ];
+    let mut patterns = Vec::new();
+    for first in ASSERTIONS {
+        for second in ASSERTIONS {
+            patterns.extend([
+                format!("{first}{second}a"),
+                format!(".{first}{second}"),
+                format!(r"(?:{first}{second}a|\r{second}{first})"),
+                // The consuming alternative preserves the star: regex-syntax
+                // otherwise reduces an assertion-only repetition to optional.
+                format!("(?:{first}{second}|a)*.{second}{first}"),
+            ]);
+        }
+    }
+    patterns.extend(
+        [
+            // The prerequisite context and optimistic-EOF defects.
+            r"\b(?m:^)a",
+            r"\B(?m:^)",
+            r"a$\B",
+            r"$\b",
+            "$^",
+            // Bare CR, CRLF middle positions, trailing CR, mixed line modes.
+            r"\r(?Rm:^)a",
+            r"\r(?Rm:^)\n",
+            r"\r(?Rm:$)\n",
+            r"(?Rm:^)$",
+            r"\n\b(?Rm:^)a",
+            r"\r(?Rm:$)(?m:$)\n",
+            // Triples: both resolution phases must preserve the boundary.
+            r"\B(?Rm:^)\B",
+            r"\b(?Rm:^)\b{start}a",
+            r"a\b{end}(?Rm:$)$",
+            r"\r(?Rm:^)\B$",
+            // Consumers and bypasses exercise class, case-folded, table and
+            // fused consume/branch lowering as well as nullable continuations.
+            r"(?i:a)\b(?Rm:$)",
+            r"[a\r\n]\B(?Rm:^)[^a]",
+            r"(?:aa| a|\ra|\na)\b(?Rm:$)",
+            r"(?:a?\b|\r(?Rm:^))a?",
+            r"(?:a\B|\r(?Rm:^))*a(?Rm:$)",
+        ]
+        .map(String::from),
+    );
+
+    let mut runs = Vec::new();
+    for pattern in patterns {
+        for (unroll, merge) in [(32, true), (0, true), (0, false)] {
+            runs.push(SweepRun::new(
+                pattern.clone(),
+                r"a \r\n\xFF",
+                5,
+                unroll,
+                merge,
+            ));
         }
     }
     runs
@@ -329,29 +464,22 @@ fn runs(family: Family) -> Vec<SweepRun> {
         Family::Tier3Assert => tier3_assert(),
         Family::AssertEdges => assert_edges(),
         Family::AssertInBody => assert_in_body(),
+        Family::Tier1Assert => tier1_assert(),
     }
 }
 
 /// Run `rethoc sweep`; returns the exit code.
 pub(crate) fn run(args: &SweepArgs) -> i32 {
+    // This family's contract is that all its graphs are Tier 1 eligible.
+    // Do not let an eligibility regression turn a blocking sweep green by
+    // silently rejecting the patterns it is meant to check. Explicitly
+    // selecting another backend retains the usual rejection semantics.
+    let choice = args.choice();
+    let require_admission =
+        matches!(args.family, Family::Tier1Assert) && choice == TierChoice::Only(1);
     let mut runs = runs(args.family);
-    if let Some(n) = args.max_len {
-        for r in &mut runs {
-            r.args[MAX_LEN_ARG] = n.to_string();
-        }
-    }
-    // After the `--max-len` rewrite: these insertions move its position.
-    for (flag, tier) in [("--tier", args.tier), ("--skip-tier", args.skip_tier)] {
-        if let Some(t) = tier {
-            for r in &mut runs {
-                r.args.splice(1..1, [flag.to_string(), t.to_string()]);
-            }
-        }
-    }
-    if args.grouped_nfa {
-        for r in &mut runs {
-            r.args.insert(1, "--grouped-nfa".into());
-        }
+    for r in &mut runs {
+        r.configure(args.max_len, choice);
     }
     if args.list {
         let mut out = std::io::stdout().lock();
@@ -376,7 +504,9 @@ pub(crate) fn run(args: &SweepArgs) -> i32 {
         |r| run_capped(&r.args, caps),
         |r, result| {
             counts[index(result.verdict)] += 1;
-            if !matches!(result.verdict, Verdict::Ok | Verdict::Rejected) {
+            if !matches!(result.verdict, Verdict::Ok | Verdict::Rejected)
+                || (require_admission && result.verdict == Verdict::Rejected)
+            {
                 println!(
                     "{} unroll={}{} `{}`: {}",
                     result.verdict.label(),
@@ -417,6 +547,8 @@ pub(crate) fn run(args: &SweepArgs) -> i32 {
         EXIT_MISMATCH
     } else if aborted > 0 {
         EXIT_ABORT
+    } else if require_admission && count(Verdict::Rejected) > 0 {
+        EXIT_REJECTED
     } else {
         EXIT_OK
     }
@@ -426,10 +558,101 @@ pub(crate) fn run(args: &SweepArgs) -> i32 {
 mod tests {
     use super::*;
 
+    fn parse_sweep(selectors: &[&str], family: &str) -> SweepArgs {
+        let argv: Vec<&str> = std::iter::once("sweep")
+            .chain(selectors.iter().copied())
+            .chain(std::iter::once(family))
+            .collect();
+        let crate::Opts::Sweep(args) = crate::opts()
+            .run_inner(bpaf::Args::from(argv.as_slice()))
+            .expect("sweep arguments must parse")
+        else {
+            panic!("expected the sweep command");
+        };
+        args
+    }
+
+    fn parse_child(run: &SweepRun) -> crate::check::brute::BruteArgs {
+        let argv: Vec<&str> = run.args.iter().map(String::as_str).collect();
+        let crate::Opts::Brute(args) = crate::opts()
+            .run_inner(bpaf::Args::from(argv.as_slice()))
+            .expect("generated child arguments must parse")
+        else {
+            panic!("expected the brute command");
+        };
+        args
+    }
+
+    #[test]
+    fn tier1_sweep_defaults_and_explicit_selectors_reach_the_child() {
+        let cases: &[(&[&str], TierChoice)] = &[
+            (&[], TierChoice::Only(1)),
+            (&["--tier", "1"], TierChoice::Only(1)),
+            (&["--tier", "0"], TierChoice::Only(0)),
+            (&["--tier", "2"], TierChoice::Only(2)),
+            (&["--skip-tier", "1"], TierChoice::Except(1)),
+            (&["--skip-tier", "3"], TierChoice::Except(3)),
+            (&["--grouped-nfa"], TierChoice::Grouped),
+        ];
+        for &(selectors, expected) in cases {
+            let args = parse_sweep(selectors, "tier1-assert");
+            let mut run = SweepRun::new("a".into(), "a", 2, 0, true);
+            run.configure(args.max_len, args.choice());
+            let child = parse_child(&run);
+            assert_eq!(
+                TierChoice::new(child.tier, child.skip_tier, child.grouped_nfa),
+                expected,
+                "selectors={selectors:?}",
+            );
+        }
+        for family in [
+            "nullable-counter",
+            "tier3-assert",
+            "assert-edges",
+            "assert-in-body",
+        ] {
+            assert_eq!(parse_sweep(&[], family).choice(), TierChoice::All);
+        }
+    }
+
+    /// A future eligibility regression must reject the child, rather than
+    /// silently checking only the remaining engines and returning success.
+    #[test]
+    fn default_tier1_child_rejects_an_ineligible_pattern() {
+        for (selectors, expected_exit) in [
+            (&[][..], EXIT_REJECTED),
+            (&["--tier", "1"][..], EXIT_REJECTED),
+            (&["--tier", "0"][..], EXIT_OK),
+        ] {
+            let args = parse_sweep(selectors, "tier1-assert");
+            let mut run = SweepRun::new("a{2}".into(), "a", 2, 0, true);
+            run.configure(args.max_len, args.choice());
+            assert_eq!(crate::check::brute::run(&parse_child(&run)), expected_exit);
+        }
+    }
+
+    /// Exercise the real parser: flags must stay before the pattern's `--`,
+    /// and adding them must not break the sweep's input-length override.
+    #[test]
+    fn compilation_flags_precede_hyphenated_patterns() {
+        for pattern in ["a", "-a", "--no-merge"] {
+            for merge in [true, false] {
+                let mut run = SweepRun::new(pattern.into(), "a-", 7, 0, merge);
+                run.configure(Some(2), TierChoice::Only(1));
+                let child = parse_child(&run);
+                assert_eq!(child.pattern, pattern);
+                assert_eq!(child.max_len, 2);
+                assert_eq!(child.compile.unroll_limit, Some(0));
+                assert_eq!(child.compile.no_merge, !merge);
+                assert_eq!(crate::check::brute::run(&child), EXIT_OK);
+            }
+        }
+    }
+
     /// `--max-len` rewrites the argument at `MAX_LEN_ARG`.
     #[test]
     fn max_len_argument_position() {
-        let run = SweepRun::new("a".into(), "ab", 6, 32);
+        let run = SweepRun::new("a".into(), "ab", 6, 32, true);
         assert_eq!(run.args[MAX_LEN_ARG - 1], "--max-len");
         assert_eq!(run.args[MAX_LEN_ARG], "6");
     }
@@ -495,6 +718,63 @@ mod tests {
             r" ?(.{2,3}\bc)+$",
         ] {
             assert!(patterns.iter().any(|p| p == known), "missing {known}");
+        }
+    }
+
+    #[test]
+    fn tier1_assert_covers_contexts_and_compile_configs() {
+        let runs = tier1_assert();
+        assert_eq!(runs.len(), (10 * 10 * 4 + 20) * 3);
+        for configs in runs.as_chunks::<3>().0 {
+            assert_eq!(configs[0].pattern, configs[1].pattern);
+            assert_eq!(configs[0].pattern, configs[2].pattern);
+            assert_eq!(configs[0].unroll, 32);
+            assert_eq!(configs[1].unroll, 0);
+            assert_eq!(configs[2].unroll, 0);
+            assert!(!configs[0].args.iter().any(|arg| arg == "--no-merge"));
+            assert!(!configs[1].args.iter().any(|arg| arg == "--no-merge"));
+            assert!(configs[2].args.iter().any(|arg| arg == "--no-merge"));
+            for run in configs {
+                assert_eq!(run.args[4], r"a \r\n\xFF");
+                assert_eq!(run.args[MAX_LEN_ARG], "5");
+            }
+        }
+        let patterns: Vec<_> = runs.iter().map(|run| run.pattern.as_str()).collect();
+        for required in [
+            r"\b(?m:^)a",
+            r"\B(?m:^)",
+            r"a$\B",
+            r"\r(?Rm:^)\n",
+            r"\r(?Rm:$)\n",
+            r"(?:\b{end}(?Rm:^)|a)*.(?Rm:^)\b{end}",
+        ] {
+            assert!(patterns.contains(&required), "missing {required}");
+        }
+    }
+
+    /// The family must stay useful under --tier 1: rejecting CRLF or quietly
+    /// retaining a counter would otherwise remove the intended coverage.
+    #[test]
+    fn tier1_assert_patterns_are_admitted() {
+        use rethoc_engine::{MatcherMemory, Regex, RegexConfig};
+
+        for run in tier1_assert() {
+            let re = Regex::with_config(
+                &run.pattern,
+                RegexConfig {
+                    max_unroll_states: run.unroll,
+                    merge_repetitions: !run.args.iter().any(|arg| arg == "--no-merge"),
+                    ..Default::default()
+                },
+            )
+            .expect("sweep pattern must compile");
+            let mut memory = MatcherMemory::default();
+            assert!(
+                memory.matcher_for_tier(&re, 1).is_ok(),
+                "Tier 1 rejected {} (unroll={})",
+                run.pattern,
+                run.unroll
+            );
         }
     }
 }

@@ -47,3 +47,19 @@ harness = false
 [[bench]]
 name = "memclass"
 harness = false
+
+[[bench]]
+name = "tier1_assertions"
+harness = false
+
+[[bench]]
+name = "tier1_assertions_profile"
+harness = false
+
+[[bench]]
+name = "tier1_assertions_new"
+harness = false
+
+[[bench]]
+name = "tier1_assertions_compile_limits"
+harness = false

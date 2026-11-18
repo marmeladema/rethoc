@@ -75,6 +75,9 @@ jobs:
             allow-failure: false
           - family: assert-edges
             allow-failure: false
+          - family: tier1-assert
+            tiers: --tier 1
+            allow-failure: false
           - family: assert-in-body
             tiers: --skip-tier 3
             allow-failure: false
@@ -139,7 +142,43 @@ jobs:
         run: |
           git worktree add "$RUNNER_TEMP/base" "origin/$GITHUB_BASE_REF"
           cd "$RUNNER_TEMP/base"
-          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
-            cargo bench --bench reengage_profile -- --save-baseline=main
+          CARGO_TARGET_DIR="$RUNNER_TEMP/base-target" \
+            cargo --config "build.build-dir=\"$RUNNER_TEMP/base-build\"" \
+              bench --bench reengage_profile -- --save-baseline=main
+      - name: Assertion baseline with identical fixtures
+        id: assertion_baseline
+        run: |
+          cp rethoc-engine/benches/tier1_assertions_profile.rs "$RUNNER_TEMP/base/rethoc-engine/benches/"
+          cp rethoc-engine/benches/common/tier1_assertion_cases.rs "$RUNNER_TEMP/base/rethoc-engine/benches/common/"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          manifest = Path(os.environ['RUNNER_TEMP']) / 'base/rethoc-engine/Cargo.toml'
+          text = manifest.read_text()
+          if 'name = "tier1_assertions_profile"' not in text:
+              manifest.write_text(text + '\n[[bench]]\nname = "tier1_assertions_profile"\nharness = false\n')
+          PY
+          cd "$RUNNER_TEMP/base"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/base-target" \
+            cargo --config "build.build-dir=\"$RUNNER_TEMP/base-build\"" \
+              bench --bench tier1_assertions_profile -- --save-baseline=main
+      # Share measurements only, never compiled artifacts across revisions.
+      - name: Copy measurement baselines
+        id: copy_baselines
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/target/gungraun"
+          cp -a "$RUNNER_TEMP/base-target/gungraun/." "$GITHUB_WORKSPACE/target/gungraun/"
       - name: Compare this PR against the baseline
-        run: cargo bench --bench reengage_profile -- --baseline=main
+        run: |
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+            cargo --config "build.build-dir=\"$RUNNER_TEMP/candidate-build\"" \
+              bench --bench reengage_profile -- --baseline=main
+      - name: Compare existing assertion use cases
+        if: >-
+          ${{ !cancelled()
+              && steps.assertion_baseline.outcome == 'success'
+              && steps.copy_baselines.outcome == 'success' }}
+        run: |
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+            cargo --config "build.build-dir=\"$RUNNER_TEMP/candidate-build\"" \
+              bench --bench tier1_assertions_profile -- --baseline=main
