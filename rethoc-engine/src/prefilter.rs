@@ -72,18 +72,47 @@ impl fmt::Display for Prefilter {
     }
 }
 
+/// Dispatch on a [`Prefilter`]: evaluate `$none` for [`Prefilter::None`],
+/// otherwise `$body` with `$find` bound to a closure
+/// `|hay: &[u8]| -> Option<usize>` that returns the offset of the first
+/// candidate byte.  The one place that maps a variant to its search; each
+/// variant gets its own closure type, so a generic `$body` is compiled
+/// once per variant with the search inlined, and a hot loop pays no
+/// per-call dispatch.
+macro_rules! with_prefilter {
+    ($prefilter:expr, $none:expr, |$find:ident| $body:expr) => {
+        match $prefilter {
+            $crate::Prefilter::None => $none,
+            $crate::Prefilter::Memchr1(a) => {
+                let $find = |hay: &[u8]| memchr::memchr(a, hay);
+                $body
+            }
+            $crate::Prefilter::Memchr2(a, b) => {
+                let $find = |hay: &[u8]| memchr::memchr2(a, b, hay);
+                $body
+            }
+            $crate::Prefilter::Memchr3(a, b, c) => {
+                let $find = |hay: &[u8]| memchr::memchr3(a, b, c, hay);
+                $body
+            }
+            $crate::Prefilter::Memclass(t) => {
+                let $find = |hay: &[u8]| $crate::memclass::memclass(&t, hay);
+                $body
+            }
+            $crate::Prefilter::Range(lo, hi) => {
+                let $find = |hay: &[u8]| $crate::memrange::memrange(lo, hi, hay);
+                $body
+            }
+        }
+    };
+}
+pub(crate) use with_prefilter;
+
 impl Prefilter {
     /// Offset of the first byte of `hay` that can start a match, or `None`
     /// if there is none.  Every byte is a candidate for [`Prefilter::None`].
     pub(crate) fn find(&self, hay: &[u8]) -> Option<usize> {
-        match *self {
-            Prefilter::None => (!hay.is_empty()).then_some(0),
-            Prefilter::Memchr1(a) => memchr::memchr(a, hay),
-            Prefilter::Memchr2(a, b) => memchr::memchr2(a, b, hay),
-            Prefilter::Memchr3(a, b, c) => memchr::memchr3(a, b, c, hay),
-            Prefilter::Memclass(ref t) => crate::memclass::memclass(t, hay),
-            Prefilter::Range(lo, hi) => crate::memrange::memrange(lo, hi, hay),
-        }
+        with_prefilter!(*self, (!hay.is_empty()).then_some(0), |find| find(hay))
     }
 }
 

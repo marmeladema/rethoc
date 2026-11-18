@@ -2,10 +2,14 @@
 //!
 //! # Active rows
 //!
-//! A frontier (the stream's raw rows, or the closure and next-root arenas
-//! of the scratch) comes with a bitmap of its nonempty rows, one bit per
-//! node.  Invariant: a row whose bit is clear is all zero, and a set bit
-//! means a nonempty row.  The scratch arenas are all zero between calls.
+//! A frontier (the stream's raw rows, or the closure arena of the scratch)
+//! comes with a bitmap of its nonempty rows, one bit per node.  Invariant:
+//! a row whose bit is clear is all zero, and a set bit means a nonempty
+//! row.  The scratch is all zero between calls.
+//!
+//! A byte is closed from the raw rows into the scratch; the closure holds
+//! a copy of every raw row, so consumption clears the raw rows and writes
+//! the successors straight into them.
 //!
 //! Each byte runs one of two equivalent passes, chosen by [`Sweep`]:
 //!
@@ -381,9 +385,10 @@ fn transfer(
 }
 
 /// Consume `b` from the closed rows into `next`/`next_active` (clean on
-/// entry): every active consuming node tests its predicate once and moves
-/// its whole row.  Cleans the closure on the way (each row once read).
-/// Returns the number of predicate tests.
+/// entry; the stream passes its raw rows, cleared): every active consuming
+/// node tests its predicate once and moves its whole row.  Cleans the
+/// closure on the way (each row once read).  Returns the number of
+/// predicate tests.
 pub(crate) fn consume(
     plan: &GroupedNfaPlan,
     regex: &Regex,
@@ -479,40 +484,18 @@ fn consume_node(
     }
 }
 
-/// Replace the rows of `raw`/`raw_active` by those of `next`/`next_active`
-/// and clean `next`.  Returns whether any row is active.
-fn replace(
-    plan: &GroupedNfaPlan,
-    raw: &mut [u64],
-    raw_active: &mut [u64],
-    next: &mut [u64],
-    next_active: &mut [u64],
-) -> bool {
-    for_each_active(raw_active, |n| zero_row(raw, plan.row(n)));
-    for_each_active(next_active, |n| {
-        let r = plan.row(n);
-        copy_row(next, raw, r);
-        zero_row(next, r);
-    });
-    raw_active.copy_from_slice(next_active);
-    next_active.fill(0);
-    raw_active.iter().any(|&w| w != 0)
-}
-
 // ---------------------------------------------------------------------------
 // Worker scratch
 // ---------------------------------------------------------------------------
 
-/// Per-worker scratch: the closure and next-root arenas with their active
-/// bitmaps.  Borrowed only during a call, so streams of different regexes
-/// can share one, one call at a time.  Capacity grows to the largest plan
-/// seen and is kept; the arenas are all zero between calls.
+/// Per-worker scratch: the closure arena and its active bitmap.  Borrowed
+/// only during a call, so streams of different regexes can share one, one
+/// call at a time.  Capacity grows to the largest plan seen and is kept;
+/// the arena is all zero between calls.
 #[derive(Debug, Default)]
 pub struct GroupedScratch {
     closure: Vec<u64>,
-    next: Vec<u64>,
     closure_active: Vec<u64>,
-    next_active: Vec<u64>,
     sweep: Sweep,
     /// Bytes stepped by the full sweep and by the active rows (for tests).
     #[cfg(test)]
@@ -544,24 +527,19 @@ impl GroupedScratch {
 
     /// Make room for `plan`, before any scanning.
     fn prepare(&mut self, plan: &GroupedNfaPlan) {
-        let (w, a) = (plan.words(), plan.active_words());
-        if self.closure.len() < w {
-            self.closure.resize(w, 0);
-            self.next.resize(w, 0);
+        fn grow(v: &mut Vec<u64>, len: usize) {
+            if v.len() < len {
+                v.reserve_exact(len - v.len());
+                v.resize(len, 0);
+            }
         }
-        if self.closure_active.len() < a {
-            self.closure_active.resize(a, 0);
-            self.next_active.resize(a, 0);
-        }
+        grow(&mut self.closure, plan.words());
+        grow(&mut self.closure_active, plan.active_words());
     }
 
-    /// Bytes held by the arenas and bitmaps (their high-water capacity).
+    /// Bytes held by the arena and bitmap (their high-water capacity).
     pub fn memory_bytes(&self) -> usize {
-        (self.closure.capacity()
-            + self.next.capacity()
-            + self.closure_active.capacity()
-            + self.next_active.capacity())
-            * size_of::<u64>()
+        (self.closure.capacity() + self.closure_active.capacity()) * size_of::<u64>()
     }
 
     /// Force a pass, for tests and measurements; [`Sweep::Auto`] is the
@@ -574,7 +552,7 @@ impl GroupedScratch {
     /// Whether every arena and bitmap is all zero (for tests).
     #[cfg(test)]
     pub(crate) fn is_clean(&self) -> bool {
-        is_clean(&self.closure, &self.closure_active) && is_clean(&self.next, &self.next_active)
+        is_clean(&self.closure, &self.closure_active)
     }
 }
 
@@ -601,8 +579,8 @@ pub struct GroupedStream {
     regex_id: u64,
     raw: Box<[u64]>,
     raw_active: Box<[u64]>,
-    /// No raw row is active.
-    idle: bool,
+    /// Active raw rows: none means idle.
+    live: u32,
     prev: Option<u8>,
     at_start: bool,
     matched: bool,
@@ -619,7 +597,7 @@ impl GroupedStream {
             regex_id: regex.id,
             raw: vec![0; plan.words()].into_boxed_slice(),
             raw_active: vec![0; plan.active_words()].into_boxed_slice(),
-            idle: true,
+            live: 0,
             prev: None,
             at_start: true,
             matched: false,
@@ -634,7 +612,7 @@ impl GroupedStream {
     pub fn reset(&mut self, regex: &Regex, scratch: &mut GroupedScratch) {
         let plan = self.plan(regex);
         clear(plan, &mut self.raw, &mut self.raw_active);
-        self.idle = true;
+        self.live = 0;
         self.prev = None;
         self.at_start = true;
         self.matched = false;
@@ -655,7 +633,7 @@ impl GroupedStream {
         let skip = plan.skip_when_idle && !matches!(prefilter, crate::Prefilter::None);
         let mut i = 0;
         while i < input.len() {
-            if skip && self.idle {
+            if skip && self.live == 0 {
                 // The closure of an empty frontier is the start closure,
                 // the same at every boundary, without a match; a byte the
                 // prefilter rules out leaves the frontier empty.
@@ -701,7 +679,7 @@ impl GroupedStream {
         self.matched
     }
 
-    /// Bytes owned by this stream.
+    /// Bytes owned by this stream ([`GroupedNfaPlan::stream_bytes`]).
     pub fn memory_bytes(&self) -> usize {
         size_of::<Self>() + (self.raw.len() + self.raw_active.len()) * size_of::<u64>()
     }
@@ -760,15 +738,13 @@ impl GroupedStream {
         match sweep {
             Sweep::Full => true,
             Sweep::Active => false,
-            Sweep::Auto => {
-                let live: u32 = self.raw_active.iter().map(|w| w.count_ones()).sum();
-                plan.rows() <= SMALL_PLAN_ROWS || live as usize * 8 >= plan.rows()
-            }
+            Sweep::Auto => plan.rows() <= SMALL_PLAN_ROWS || self.live as usize * 8 >= plan.rows(),
         }
     }
 
-    /// Close before `b`, then consume it: the raw rows become the
-    /// consuming successors.  Returns whether a match was found first.
+    /// Close before `b`, then consume it: the raw rows are replaced by the
+    /// consuming successors (the closure holds their old contents).
+    /// Returns whether a match was found first.
     fn step(
         &mut self,
         plan: &GroupedNfaPlan,
@@ -783,31 +759,27 @@ impl GroupedStream {
         {
             scratch.passes[usize::from(!full)] += 1;
         }
-        let s = scratch;
-        let (closure, active) = (&mut s.closure[..w], &mut s.closure_active[..a]);
-        let (next, next_active) = (&mut s.next[..w], &mut s.next_active[..a]);
+        let (closure, active) = (&mut scratch.closure[..w], &mut scratch.closure_active[..a]);
+        let (raw, raw_active) = (&mut *self.raw, &mut *self.raw_active);
         if full {
-            if close_full(plan, &self.raw, closure, ctx) {
+            if close_full(plan, raw, closure, ctx) {
                 closure.fill(0);
                 self.matched = true;
                 return true;
             }
-            consume_full(plan, regex, closure, next, next_active, b);
-            self.raw.copy_from_slice(next);
-            self.raw_active.copy_from_slice(next_active);
-            next.fill(0);
-            next_active.fill(0);
-            self.idle = self.raw_active.iter().all(|&x| x == 0);
+            raw.fill(0);
+            raw_active.fill(0);
+            consume_full(plan, regex, closure, raw, raw_active, b);
         } else {
-            if close(plan, &self.raw, &self.raw_active, closure, active, ctx) {
+            if close(plan, raw, raw_active, closure, active, ctx) {
                 clear(plan, closure, active);
                 self.matched = true;
                 return true;
             }
-            consume(plan, regex, closure, active, next, next_active, b);
-            let raw = (&mut *self.raw, &mut *self.raw_active);
-            self.idle = !replace(plan, raw.0, raw.1, next, next_active);
+            clear(plan, raw, raw_active);
+            consume(plan, regex, closure, active, raw, raw_active, b);
         }
+        self.live = raw_active.iter().map(|w| w.count_ones()).sum();
         self.prev = Some(b);
         self.at_start = false;
         false
@@ -829,6 +801,19 @@ impl GroupedStream {
     #[cfg(test)]
     pub(crate) fn boundary_state(&self) -> (Option<u8>, bool) {
         (self.prev, self.at_start)
+    }
+}
+
+impl GroupedNfaPlan {
+    /// Bytes of one stream of this plan ([`GroupedStream::memory_bytes`]).
+    pub(crate) fn stream_bytes(&self) -> usize {
+        size_of::<GroupedStream>() + (self.words() + self.active_words()) * size_of::<u64>()
+    }
+
+    /// Bytes of a scratch prepared for this plan alone
+    /// ([`GroupedScratch::memory_bytes`]).
+    pub(crate) fn scratch_bytes(&self) -> usize {
+        (self.words() + self.active_words()) * size_of::<u64>()
     }
 }
 

@@ -1324,23 +1324,15 @@ impl Regex {
             },
             prefilter: prefilter_desc,
             grouped_nfa: self.grouped_nfa.as_deref().map(|g| match g {
-                grouped_nfa::GroupedNfa::Admitted(plan) => GroupedNfaInfo {
-                    admitted: true,
-                    rejection: None,
+                grouped_nfa::GroupedNfa::Admitted(plan) => GroupedNfaInfo::Admitted {
                     plan_bytes: plan.heap_bytes(),
                     rows: plan.rows(),
                     row_words: plan.words(),
-                    stream_bytes: plan.words() * size_of::<u64>(),
-                    scratch_bytes: 2 * plan.words() * size_of::<u64>(),
+                    stream_bytes: plan.stream_bytes(),
+                    scratch_bytes: plan.scratch_bytes(),
                 },
-                grouped_nfa::GroupedNfa::Rejected(r) => GroupedNfaInfo {
-                    admitted: false,
-                    rejection: Some(r.to_string()),
-                    plan_bytes: 0,
-                    rows: 0,
-                    row_words: 0,
-                    stream_bytes: 0,
-                    scratch_bytes: 0,
+                grouped_nfa::GroupedNfa::Rejected(r) => GroupedNfaInfo::Rejected {
+                    reason: r.to_string(),
                 },
             }),
         }
@@ -4396,24 +4388,9 @@ impl<'a> NfaMatcher<'a> {
         if self.ever_matched {
             return;
         }
-        match self.prefilter {
-            Prefilter::None => self.chunk_no_prefilter(input),
-            Prefilter::Memchr1(needle) => {
-                self.chunk_prefilter(input, |hay| memchr::memchr(needle, hay));
-            }
-            Prefilter::Memchr2(b1, b2) => {
-                self.chunk_prefilter(input, |hay| memchr::memchr2(b1, b2, hay));
-            }
-            Prefilter::Memchr3(b1, b2, b3) => {
-                self.chunk_prefilter(input, |hay| memchr::memchr3(b1, b2, b3, hay));
-            }
-            Prefilter::Memclass(t) => {
-                self.chunk_prefilter(input, |hay| crate::memclass::memclass(&t, hay));
-            }
-            Prefilter::Range(lo, hi) => {
-                self.chunk_prefilter(input, |hay| crate::memrange::memrange(lo, hi, hay));
-            }
-        }
+        prefilter::with_prefilter!(self.prefilter, self.chunk_no_prefilter(input), |find| {
+            self.chunk_prefilter(input, find)
+        })
     }
 
     /// Fast path: no prefilter, process every byte.

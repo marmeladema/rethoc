@@ -605,26 +605,9 @@ impl<'a> DfaMatcher<'a> {
         // candidate byte instead of stepping byte-by-byte.  This is
         // re-engaged every time the DFA returns to the start state, not
         // just once at chunk entry.
-        match self.prefilter {
-            Prefilter::None => self.chunk_no_prefilter(input),
-            Prefilter::Memchr1(needle) => {
-                self.chunk_prefilter(input, start_id, |hay| memchr::memchr(needle, hay));
-            }
-            Prefilter::Memchr2(b1, b2) => {
-                self.chunk_prefilter(input, start_id, |hay| memchr::memchr2(b1, b2, hay));
-            }
-            Prefilter::Memchr3(b1, b2, b3) => {
-                self.chunk_prefilter(input, start_id, |hay| memchr::memchr3(b1, b2, b3, hay));
-            }
-            Prefilter::Memclass(t) => {
-                self.chunk_prefilter(input, start_id, |hay| crate::memclass::memclass(&t, hay));
-            }
-            Prefilter::Range(lo, hi) => {
-                self.chunk_prefilter(input, start_id, |hay| {
-                    crate::memrange::memrange(lo, hi, hay)
-                });
-            }
-        }
+        crate::prefilter::with_prefilter!(self.prefilter, self.chunk_no_prefilter(input), |find| {
+            self.chunk_prefilter(input, start_id, find)
+        })
     }
 
     #[inline(always)]

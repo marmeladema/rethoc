@@ -28,6 +28,9 @@ fn main() {
         "grouped" => GroupedSweep::Auto,
         "grouped-full" => GroupedSweep::Full,
         "grouped-active" => GroupedSweep::Active,
+        other if grouped => {
+            panic!("unknown path `{other}`: grouped, grouped-full or grouped-active")
+        }
         _ => GroupedSweep::Auto,
     };
     let tier: u8 = if grouped {
