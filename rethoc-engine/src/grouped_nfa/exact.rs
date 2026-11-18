@@ -35,6 +35,7 @@
 
 use std::fmt;
 
+use super::stats::stat;
 use super::{GroupedNfaError, GroupedNfaPlan, Increment, NodeIdx, Op, Row, Succ};
 use crate::{AssertEval, Regex, State, StateIdx, byte_match_ci};
 
@@ -83,6 +84,8 @@ impl BoundaryCtx {
 fn union_within(rows: &mut [u64], src: Row, dst: Row) {
     debug_assert_eq!(src.words, dst.words, "union of rows of different scopes");
     debug_assert_ne!(src.off, dst.off, "union of a row into itself");
+    stat!(words_unioned += src.words);
+    stat!(fanout += 1);
     for i in 0..src.words as usize {
         rows[dst.off as usize + i] |= rows[src.off as usize + i];
     }
@@ -92,6 +95,8 @@ fn union_within(rows: &mut [u64], src: Row, dst: Row) {
 #[inline]
 fn union_into(from: &[u64], src: Row, to: &mut [u64], dst: Row) {
     debug_assert_eq!(src.words, dst.words, "union of rows of different scopes");
+    stat!(words_unioned += src.words);
+    stat!(fanout += 1);
     if src.words == 1 {
         to[dst.off as usize] |= from[src.off as usize];
         return;
@@ -104,6 +109,7 @@ fn union_into(from: &[u64], src: Row, to: &mut [u64], dst: Row) {
 /// `rows[r] = 0`.  Most rows are one word: a store, not a `memset` call.
 #[inline]
 fn zero_row(rows: &mut [u64], r: Row) {
+    stat!(words_cleared += r.words);
     if r.words == 1 {
         rows[r.off as usize] = 0;
     } else {
@@ -114,6 +120,7 @@ fn zero_row(rows: &mut [u64], r: Row) {
 /// `to[r] = from[r]`, a store for one-word rows.
 #[inline]
 fn copy_row(from: &[u64], to: &mut [u64], r: Row) {
+    stat!(words_copied += r.words);
     if r.words == 1 {
         to[r.off as usize] = from[r.off as usize];
     } else {
@@ -193,6 +200,7 @@ pub(crate) fn increment(rows: &mut [u64], src: Row, out: Row, inc: Increment) ->
     debug_assert_eq!(src.words, out.words, "increment across scopes");
     debug_assert_ne!(src.off, out.off, "increment into its own row");
     let (s0, o0, w) = (src.off as usize, out.off as usize, src.words as usize);
+    stat!(words_incremented += w);
     if w == 1 {
         return increment_word(rows, s0, o0, inc);
     }
@@ -331,6 +339,7 @@ pub(crate) fn close_full(
     closure: &mut [u64],
     ctx: BoundaryCtx,
 ) -> bool {
+    stat!(words_copied += raw.len());
     closure.copy_from_slice(raw);
     closure[plan.row(plan.start).off as usize] |= 1;
     let mut matched = false;
@@ -354,6 +363,7 @@ fn transfer(
     mut on: impl FnMut(NodeIdx),
 ) -> bool {
     let src = node.row;
+    stat!(rows_closed += 1);
     match node.op {
         Op::Split { out, out1 } => {
             union_within(closure, src, out.row(src.words));
@@ -362,15 +372,18 @@ fn transfer(
             on(out1.node);
         }
         Op::CounterInstance { out } => {
+            stat!(fanout += 1);
             closure[out.off as usize] |= 1;
             on(out.node);
         }
         Op::CounterIncrement { out, out1, inc } => {
             let (cont, brk) = increment(closure, src, out.row(src.words), inc);
             if cont {
+                stat!(fanout += 1);
                 on(out.node);
             }
             if brk {
+                stat!(fanout += 1);
                 closure[out1.off as usize] |= 1;
                 on(out1.node);
             }
@@ -421,6 +434,7 @@ pub(crate) fn consume(
         zero_row(closure, node.row);
     });
     active.fill(0);
+    stat!(tests += done.tests);
     done
 }
 
@@ -445,7 +459,9 @@ pub(crate) fn consume_full(
             consume_node(plan, regex, closure, node, next, next_active, b, &mut done);
         }
     }
+    stat!(words_cleared += closure.len());
     closure.fill(0);
+    stat!(tests += done.tests);
     done
 }
 
@@ -490,6 +506,31 @@ fn consume_node(
         }
         _ => {}
     }
+}
+
+/// Add the active rows of a raw frontier, and the counts of its counted
+/// rows, to the operation counters.
+#[cfg(feature = "op-stats")]
+fn count_frontier(plan: &GroupedNfaPlan, raw: &[u64], raw_active: &[u64]) {
+    for_each_active(raw_active, |n| {
+        let node = &plan.nodes[n as usize];
+        stat!(live_rows += 1);
+        if node.scope == super::Scope::Outside {
+            return;
+        }
+        let (mut values, mut runs, mut carry) = (0u32, 0u32, 0u64);
+        for &word in &raw[node.row.range()] {
+            values += word.count_ones();
+            // A run starts at a count whose predecessor is absent.
+            runs += (word & !(word << 1 | carry)).count_ones();
+            carry = word >> 63;
+        }
+        stat!(counted_rows += 1);
+        stat!(counted_words += node.row.words);
+        stat!(count_values += values);
+        stat!(count_runs += runs);
+        stat!(max_row_values max= values);
+    });
 }
 
 /// Whether row `r` holds exactly bit 0.
@@ -751,6 +792,8 @@ impl GroupedStream {
                 if self.live == 0 {
                     // Find the next byte that starts something: the others
                     // leave an empty frontier empty.
+                    #[cfg(feature = "op-stats")]
+                    let start = i;
                     let found = loop {
                         let rest = &input[i..];
                         let off = if has_prefilter {
@@ -768,10 +811,12 @@ impl GroupedStream {
                         }
                     };
                     let Some(j) = found else {
+                        stat!(bytes_skipped += input.len() - start);
                         self.prev = input.last().copied();
                         self.at_start = false;
                         return;
                     };
+                    stat!(bytes_skipped += j - start);
                     i = j;
                 }
                 if self.unit && self.all_count_free(tables) {
@@ -781,6 +826,7 @@ impl GroupedStream {
                     {
                         scratch.passes[2] += next - i + usize::from(found);
                     }
+                    stat!(steps_count_free += next - i);
                     if found {
                         return;
                     }
@@ -794,11 +840,13 @@ impl GroupedStream {
                 match prefilter.find(&input[i..]) {
                     Some(0) => {}
                     Some(off) => {
+                        stat!(bytes_skipped += off);
                         i += off;
                         self.prev = Some(input[i - 1]);
                         self.at_start = false;
                     }
                     None => {
+                        stat!(bytes_skipped += input.len() - i);
                         self.prev = input.last().copied();
                         self.at_start = false;
                         return;
@@ -1019,9 +1067,11 @@ impl GroupedStream {
         let (w, a) = (plan.words(), plan.active_words());
         let ctx = self.ctx(boundary);
         let full = self.full_sweep(plan, scratch.sweep);
+        stat!(provisional += 1);
         let (closure, active) = (&mut scratch.closure[..w], &mut scratch.closure_active[..a]);
         if full {
             self.matched |= close_full(plan, &self.raw, closure, ctx);
+            stat!(words_cleared += closure.len());
             closure.fill(0);
         } else {
             self.matched |= close(plan, &self.raw, &self.raw_active, closure, active, ctx);
@@ -1059,15 +1109,18 @@ impl GroupedStream {
         let (closure, active) = (&mut scratch.closure[..w], &mut scratch.closure_active[..a]);
         let (raw, raw_active) = (&mut *self.raw, &mut *self.raw_active);
         if full {
+            stat!(steps_full += 1);
             if close_full(plan, raw, closure, ctx) {
                 closure.fill(0);
                 self.matched = true;
                 return true;
             }
+            stat!(words_cleared += raw.len());
             raw.fill(0);
             raw_active.fill(0);
             self.unit = consume_full(plan, regex, closure, raw, raw_active, b).unit;
         } else {
+            stat!(steps_active += 1);
             if close(plan, raw, raw_active, closure, active, ctx) {
                 clear(plan, closure, active);
                 self.matched = true;
@@ -1077,6 +1130,8 @@ impl GroupedStream {
             self.unit = consume(plan, regex, closure, active, raw, raw_active, b).unit;
         }
         self.live = raw_active.iter().map(|w| w.count_ones()).sum();
+        #[cfg(feature = "op-stats")]
+        count_frontier(plan, raw, raw_active);
         self.prev = Some(b);
         self.at_start = false;
         false

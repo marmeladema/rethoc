@@ -2,11 +2,17 @@
 """Run isolated counting probes, preserving timeout results beside timings.
 
 `--grouped` runs the grouped NFA comparison instead of the default set.
+`--sparse` runs the families of plans/sparse-counting-sets.md, section 10;
+with `--stats` it prints what one scan does (admission, sizes, allocations
+and operation counters) instead of timings, which needs a probe built with
+`--features op-stats`.
 """
 import subprocess
 import sys
 
-print("family,bound,bytes,tier,chunk,config,min_tier,compiled_bytes,compile_us,cold_us,runs,warm_ns_per_byte,warm_us,engine", flush=True)
+stats = "--stats" in sys.argv
+if not stats:
+    print("family,bound,bytes,tier,chunk,config,min_tier,compiled_bytes,compile_us,cold_us,runs,warm_ns_per_byte,warm_us,engine", flush=True)
 
 # `--grouped`: the grouped NFA comparison (plans/grouped-nfa.md, §8): every
 # family and bound under forced counters and default compilation, on every
@@ -27,6 +33,21 @@ if "--grouped" in sys.argv:
     for bound in [4, 8, 16]:
         for path in ["4", "grouped"]:
             cases.append(("nested", bound, 1024, path, 1024, "counters"))
+elif "--sparse" in sys.argv:
+    # Forced counters only: under default compilation small bounds unroll
+    # and the comparison is no longer one of representations.  With
+    # `--stats` only the grouped NFA has counters to report.
+    paths = ["grouped"] if stats else ["auto", "0", "2", "4", "grouped", "grouped-full", "grouped-active"]
+    for family in ["range", "rangemid", "rangenarrow", "rangeexact", "sustained", "sustainedx",
+                   "mixed", "seq", "phase", "unbounded"]:
+        for bound in [8, 64, 256, 1000]:
+            for path in paths:
+                cases.append((family, bound, 65536, path, 4096, "counters"))
+    for family in ["holey", "loop", "control", "nullable"]:
+        for path in paths:
+            cases.append((family, 8, 65536, path, 4096, "counters"))
+    for path in paths:
+        cases.append(("nested", 8, 65536, path, 4096, "counters"))
 else:
     for family in ["flat", "phase", "variable", "prefix"]:
         for bound in [8, 64, 256]:
@@ -45,15 +66,23 @@ else:
     for bound in [4, 8, 16]:
         for size in [256, 1024]:
             cases.append(("nested", bound, size, 4, size, "counters"))
+header_printed = not stats
 for case in cases:
-    args = list(map(str, case))
+    args = list(map(str, case)) + (["stats"] if stats else [])
     result = subprocess.run(
-        ["scripts/capped", "--mem", "1000000", "--time", "5", "--",
+        ["scripts/capped", "--mem", "1000000", "--time", "30" if "--sparse" in sys.argv else "5", "--",
          "target/release/examples/research_counting_probe", *args],
         text=True, capture_output=True,
     )
     if result.returncode:
         print(",".join(args) + f",exit_{result.returncode}", flush=True)
         print(result.stderr, end="", file=sys.stderr)
-    else:
-        print(result.stdout, end="", flush=True)
+        continue
+    lines = result.stdout.splitlines(keepends=True)
+    if stats:
+        # Every stats run prints the header: keep the first one.
+        if not header_printed:
+            print(lines[0], end="")
+            header_printed = True
+        lines = lines[1:]
+    print("".join(lines), end="", flush=True)

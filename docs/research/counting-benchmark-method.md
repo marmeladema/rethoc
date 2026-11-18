@@ -29,6 +29,62 @@ column is the engine it picks.  Paths
 passes.  The grouped NFA is timed on one stream reset between scans, with
 its scratch kept, like a reused `MatcherMemory`.
 
+### Sparse counting experiment (`plans/sparse-counting-sets.md`)
+
+`python3 scripts/research_counting_probe.py --sparse` runs the families of
+the plan's §10 under forced counters, 64 KiB per scan: `range`, `rangemid`,
+`rangenarrow` and `rangeexact` (`x(a|aa|b){l,N}z`, a new `x` every `N`
+bytes), `sustained` and `sustainedx` (new entries do not kill the older
+ones), `mixed` (short-lived entries), `seq`, `holey`, `loop`, `phase`,
+`control`, and the exclusions `nested`, `nullable` and `unbounded`.
+
+Timings say how long a scan takes, not what it does. For that, build the
+probe a second time with the engine's `op-stats` feature and add `--stats`:
+
+```sh
+cargo build --release -p rethoc-engine --examples --features op-stats
+python3 scripts/research_counting_probe.py --sparse --stats > target/research-counting/stats.csv
+```
+
+Each row is one warm scan: admission (with the rejection reason), the
+compiled counters, plan, stream and scratch bytes, the allocations made
+during the scan, and the grouped NFA's operation counters
+(`rethoc_engine::grouped_op_stats::OpStats`): bytes per pass, words of
+count rows copied, ORed, shifted and cleared, predicate tests, rows
+written, and the size of the count sets after every byte (rows, words,
+values, runs of consecutive values). The counters and the counting
+allocator exist only in that build and slow it down: **never take a time
+from a build with `op-stats`**, and rebuild without the feature before
+timing (`target/release/examples` holds whichever was built last).
+
+### Many patterns on many streams
+
+`research_multistream ENGINE PATTERNS STREAMS BYTES CHUNK default|counters LIMIT [check]`
+keeps independent state for every pattern on every stream and feeds the
+streams chunk by chunk, interleaved. The patterns are the families above
+with rotating bounds (8, 64, 256, 1000) and letters; the inputs are runs of
+`a`-`d` with single `x`, `y` and a rare `z`, fixed by the stream number.
+One pattern in 16 can match; the others scan every stream to its end.
+
+```sh
+scripts/capped --mem 6000000 --time 400 -- \
+  target/release/examples/research_multistream grouped 520 32 16384 1500 counters 65536 check
+```
+
+It reports, separately: patterns rejected by the compiler (`LIMIT` is
+`max_estimated_states`; 2048 is the default) or by the engine, with the
+reason; bytes of the compiled programs; bytes of the inputs; stream state
+as the engine reports it and as the allocator saw it (`op-stats` build);
+allocations and growth during the scan; resident memory; time per byte
+and the latency of one chunk of one stream over all patterns. `check`
+compares every result with `regex` on the whole input after the
+measurements, so the oracle is in neither the time nor the memory.
+
+The grouped NFA shares the compiled plans and one worker scratch between
+all streams. The other engines have no stream type apart from
+`MatcherMemory`, so the harness gives every (stream, pattern) pair its
+own: their memory figures measure that API, not the least an engine needs.
+
 Also record CPU/architecture, OS, dependency resolution, build configuration,
 CPU affinity, and relevant machine load with the results. Cargo.lock is ignored
 by this repository; retain a copy with local results to identify dependencies.

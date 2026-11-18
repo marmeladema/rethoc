@@ -6,21 +6,35 @@
 //! pattern), or `grouped-full` / `grouped-active` for the grouped NFA with
 //! one of its two passes forced.  The last column is the engine automatic
 //! selection picks.
+//!
+//! A seventh argument `stats` prints, instead of timings, what one warm
+//! scan does: admission, sizes, allocations and the grouped NFA's operation
+//! counters (`plans/sparse-counting-sets.md`, S0).  The allocations and the
+//! counters need a build with `--features op-stats`; never time that build.
+
+#[allow(dead_code)]
+#[path = "common/counting_alloc.rs"]
+mod counting_alloc;
+
+#[cfg(feature = "op-stats")]
+#[global_allocator]
+static ALLOC: counting_alloc::Counting = counting_alloc::Counting;
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
+use rethoc_engine::grouped_op_stats::{self, OpStats};
 use rethoc_engine::{
     GroupedNfaMode, GroupedScratch, GroupedStream, GroupedSweep, MatcherMemory, Regex, RegexConfig,
 };
 
 fn main() {
     let args: Vec<_> = std::env::args().collect();
-    assert_eq!(
-        args.len(),
-        7,
-        "family bound bytes tier chunk default|counters"
+    assert!(
+        args.len() == 7 || (args.len() == 8 && args[7] == "stats"),
+        "family bound bytes tier chunk default|counters [stats]"
     );
+    let stats = args.len() == 8;
     let family = &args[1];
     let bound: usize = args[2].parse().expect("bound");
     let bytes: usize = args[3].parse().expect("bytes");
@@ -63,6 +77,24 @@ fn main() {
             })
             .collect::<Vec<_>>()
             .join("|"),
+        // The families of plans/sparse-counting-sets.md, §10: a wide, a
+        // middle, a narrow and an exact range behind a consuming prefix.
+        "range" => format!("x(a|aa|b){{1,{bound}}}z"),
+        "rangemid" => format!("x(a|aa|b){{{},{bound}}}z", bound / 2),
+        "rangenarrow" => format!("x(a|aa|b){{{},{bound}}}z", bound - bound / 10),
+        "rangeexact" => format!("x(a|aa|b){{{bound}}}z"),
+        // Sustained entry: new prefixes do not kill the older body paths.
+        "sustained" => format!("a(a|aa){{1,{bound}}}z"),
+        "sustainedx" => format!("x(a|aa|x){{{},{bound}}}z", bound / 2),
+        // Holey count sets (`bound` unused).
+        "holey" => "x(a|aaa){2,8}z".to_string(),
+        // Two scopes in sequence.
+        "seq" => format!("x(a|aa){{1,{bound}}}y(b|bb){{1,{bound}}}z"),
+        // A loop around a completed scope (`bound` unused).
+        "loop" => "(a{2,5}b)*c".to_string(),
+        // Exclusions of the sparse experiment (`nested` is above).
+        "nullable" => "(a?){2,5}z".to_string(),
+        "unbounded" => format!("x(a|aa){{{bound},}}z"),
         _ => panic!("unknown family"),
     };
     let config = RegexConfig {
@@ -104,6 +136,45 @@ fn main() {
                 *byte = if i % 512 == 0 { b'a' } else { b'q' };
             }
         }
+        // A new `x` every `bound` bytes over `aab`: each episode lasts until
+        // the next one starts.
+        "range" | "rangemid" | "rangenarrow" | "rangeexact" => {
+            for (i, byte) in hay.iter_mut().enumerate() {
+                *byte = match (i % bound.max(2), i % 3) {
+                    (0, _) => b'x',
+                    (_, 2) => b'b',
+                    _ => b'a',
+                };
+            }
+        }
+        // `x` every third byte: it starts an episode and stays in the body.
+        "sustainedx" => {
+            for byte in hay.iter_mut().step_by(3) {
+                *byte = b'x';
+            }
+        }
+        "holey" | "nullable" | "unbounded" => {
+            for byte in hay.iter_mut().step_by(64) {
+                *byte = b'x';
+            }
+        }
+        // `x`, `a`s to half the period, `y`, then `b`s.
+        "seq" => {
+            let period = 2 * bound.max(2);
+            for (i, byte) in hay.iter_mut().enumerate() {
+                *byte = match i % period {
+                    0 => b'x',
+                    p if p < period / 2 => b'a',
+                    p if p == period / 2 => b'y',
+                    _ => b'b',
+                };
+            }
+        }
+        "loop" => {
+            for byte in hay.iter_mut().skip(3).step_by(4) {
+                *byte = b'b';
+            }
+        }
         _ => {}
     }
     let oracle = regex::bytes::RegexBuilder::new(&pattern)
@@ -124,9 +195,16 @@ fn main() {
     } else {
         memory.matcher_for_tier(&re, tier).is_ok()
     };
+    if stats {
+        println!("{}", stats_header());
+    }
     if !eligible {
+        let reason = match re.grouped_nfa_admission() {
+            Err(e) if grouped && stats => format!(": {e}").replace(',', ";"),
+            _ => String::new(),
+        };
         println!(
-            "{family},{bound},{bytes},{tier_arg},{chunk},{},ineligible",
+            "{family},{bound},{bytes},{tier_arg},{chunk},{},ineligible{reason}",
             args[6]
         );
         return;
@@ -155,6 +233,46 @@ fn main() {
         }
         assert_eq!(black_box(matcher.finish()), expected);
     };
+    if stats {
+        // One scan to grow every buffer, then the measured one.
+        run();
+        grouped_op_stats::take();
+        let before = counting_alloc::snapshot();
+        run();
+        let after = counting_alloc::snapshot();
+        let ops = grouped_op_stats::take();
+        let info = re.info();
+        let counters: Vec<String> = info
+            .counters
+            .iter()
+            .map(|c| match c.max {
+                usize::MAX => format!("{}..", c.min),
+                max => format!("{}..{max}", c.min),
+            })
+            .collect();
+        let (plan, stream_bytes, scratch_bytes) = match info.grouped_nfa {
+            Some(rethoc_engine::GroupedNfaInfo::Admitted {
+                plan_bytes,
+                stream_bytes,
+                scratch_bytes,
+                ..
+            }) if grouped => (plan_bytes, stream_bytes, scratch_bytes),
+            _ => (0, 0, 0),
+        };
+        let ops: Vec<String> = ops.values().iter().map(u64::to_string).collect();
+        println!(
+            "{family},{bound},{bytes},{tier_arg},{chunk},{},ok,{},{},{},{plan},{stream_bytes},{scratch_bytes},{},{},{},{}",
+            args[6],
+            counters.join(";"),
+            info.memory.num_states,
+            re.memory_size(),
+            grouped_op_stats::ENABLED,
+            after.allocs - before.allocs,
+            after.alloc_bytes - before.alloc_bytes,
+            ops.join(",")
+        );
+        return;
+    }
     let start = Instant::now();
     run();
     let cold_us = start.elapsed().as_secs_f64() * 1e6;
@@ -177,4 +295,13 @@ fn main() {
         elapsed * 1e6 / runs as f64,
         re.engine()
     );
+}
+
+/// The CSV header of the `stats` rows.
+fn stats_header() -> String {
+    format!(
+        "family,bound,bytes,tier,chunk,config,status,counters,states,regex_bytes,plan_bytes,\
+         stream_bytes,scratch_bytes,instrumented,scan_allocs,scan_alloc_bytes,{}",
+        OpStats::FIELDS.join(",")
+    )
 }

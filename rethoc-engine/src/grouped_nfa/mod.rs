@@ -57,6 +57,7 @@
 
 mod analysis;
 mod exact;
+pub mod stats;
 
 use std::fmt;
 
