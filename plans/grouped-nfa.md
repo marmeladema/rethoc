@@ -3,9 +3,10 @@
 Status: P0–P4 implemented in `rethoc-engine/src/grouped_nfa/` (opt-in
 `RegexConfig::grouped_nfa`; multiword and saturating count domains within the
 8,192-word frontier budget; all assertion kinds by raw replay; CLI, checkers,
-proptests, cargo-fuzz and the probe run it). P4's deployment measurements
-(allocation and operation counters, many rules × many streams) and P5 are
-open; see "P4 findings". Designed against main `b0bb981e8c6cba7b23df176d79f741c3b61089a7`;
+proptests, cargo-fuzz and the probe run it; active-row scheduling and
+prefilter skipping while idle). P4's deployment measurements (allocation and
+operation counters, many rules × many streams) and P5 are open; see "P4
+findings" and "Idle cost". Designed against main `b0bb981e8c6cba7b23df176d79f741c3b61089a7`;
 source references below re-checked at `d82066d`. This work does not
 investigate existing tier correctness bugs.
 
@@ -392,6 +393,12 @@ This is input-linear and allocation-free within scanning after preparation,
 Active-row scheduling is a later measured optimization with its own ordering
 invariant, not part of the initial implementation.
 
+Implemented after P4 (see "Idle cost"): with an active-row bitmap per
+frontier, an active pass costs `O(A + live rows and their transfers)` per
+byte, `A = ceil(R/64)`; the full sweep stays `O(R + W + B)`. While the raw
+frontier is empty and the start closure is static, prefilter skipping makes
+idle bytes cost the prefilter's scan.
+
 ## 7. Milestones
 
 Keep tiers 0–4, their oracle, and `Regex::min_tier()` unchanged. Use an explicit
@@ -477,11 +484,10 @@ inputs, one machine; numbers stay in local artifacts):
 - **Losses** wherever a DFA tier applies cleanly: Tier 1 (unrolled or
   counter-free patterns), Tier 2 on fixed-length bodies (`a.{N}b`,
   `(ab){1,N}c`), Tier 3 on `x(a|aa|b){N/2,N}z` beyond small N.
-- **Large losses on sparse activation and counter-free controls**: the
-  runtime sweeps every row at every byte and has no prefilter, so an idle
-  stream costs the full closure per byte while the tiers skip ahead.
-  Active-row scheduling and prefilter re-engagement (§6, non-goals of
-  P0–P4) are the obvious next optimisations.
+- **Large losses on sparse activation and counter-free controls** (at
+  P4): the runtime swept every row at every byte and had no prefilter, so
+  an idle stream cost the full closure per byte while the tiers skipped
+  ahead. Fixed afterwards; see "Idle cost".
 - Nested families are rejected (by design).
 
 So the grouped NFA is not a general replacement. Its case for P5 is a
@@ -489,6 +495,46 @@ dispatch rule that picks it where Tier 3/the NFA degrade with ambiguous
 variable bodies, after idle-stream cost is fixed. Not yet measured:
 allocation counts, operation counters, true cold setup, and hundreds of
 rules over thousands of interleaved streams.
+
+### Idle cost
+
+Two changes, both exact (every pass gives the same rows):
+
+- **Active rows.** Each frontier carries a bitmap of its nonempty rows,
+  one bit per node (a row whose bit is clear is zero; scratch arenas are
+  zero between calls). The active pass visits only set bits, always the
+  lowest pending one; transfers activate only higher nodes, so nodes are
+  still processed in topological order. Consumption cleans the closure as
+  it reads it, and the commit moves rows from `next` to the raw frontier.
+- **Prefilter while idle.** When the raw frontier is empty and the start
+  state's zero-width closure has neither an assertion nor `Match`
+  (`skip_when_idle`, decided at analysis), the closure of an empty
+  frontier is the same at every boundary and never matches; bytes the
+  regex's prefilter rules out leave the frontier empty and are skipped,
+  with `prev`/`at_start` advanced. The prefilter itself already bails on
+  assertions and empty matches.
+
+Measured with the probe (plus a `wide` family: 12 counted alternatives,
+input keeping one alive, and the forced `grouped-full`/`grouped-active`
+paths):
+
+- The active pass loses to the full sweep by up to 2× on small or dense
+  plans (bookkeeping per row), and wins by up to 4× on wide plans with few
+  live rows. Each byte therefore picks: the full sweep for plans of at
+  most 32 rows or with at least one raw row in eight active, the active
+  pass otherwise. The automatic choice stays within a few percent of the
+  better pass on every family.
+- Idle streams (`sparse`, `control`) drop from tens of ns/byte to the
+  prefilter's speed, close to the tiers'.
+- `wide` runs one to two orders of magnitude faster than Tier 3 and the
+  NFA, which pay per live instance.
+- Dense workloads pay over the P4 full sweep (median about a fifth, at
+  most about a third) for the bitmap upkeep and the per-byte choice.
+
+Tests run every check in all three modes (automatic, full, active),
+compare both closure passes with the scalar interpreter, check the bitmap
+invariant and a clean scratch after every call, and include a plan whose
+automatic choice switches pass within one chunk.
 
 ### P1: one-word exact, assertion-free runtime
 

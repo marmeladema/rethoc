@@ -61,7 +61,7 @@ use crate::{AssertKind, ByteTableIdx, Regex, StateIdx};
 
 pub use analysis::Rejection;
 pub(crate) use analysis::{Limits, Scope, analyze};
-pub use exact::{GroupedScratch, GroupedStream};
+pub use exact::{GroupedScratch, GroupedStream, Sweep};
 
 // ---------------------------------------------------------------------------
 // Plan
@@ -75,12 +75,6 @@ pub(crate) struct Row {
 }
 
 impl Row {
-    /// No row (unreachable state, absent `out_exit`).
-    const NONE: Row = Row {
-        off: u32::MAX,
-        words: 0,
-    };
-
     #[inline]
     fn range(self) -> std::ops::Range<usize> {
         self.off as usize..(self.off + self.words) as usize
@@ -133,85 +127,90 @@ impl fmt::Display for Increment {
     }
 }
 
-/// A zero-width (or `Match`) state's transfer, in closure order.
+/// Index of a node: a reachable state's position in the topological order
+/// of the zero-width graph.  Rows and active bits are indexed by it, and
+/// every zero-width edge goes from a lower to a higher node.
+pub(crate) type NodeIdx = u32;
+
+/// No node (an absent `out_exit`, an unreachable state).
+pub(crate) const NO_NODE: NodeIdx = u32::MAX;
+
+/// What a node does with its row.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum ZeroOp {
+pub(crate) enum Op {
     /// Union into both successors.
-    Split { src: Row, out: Row, out1: Row },
+    Split { out: NodeIdx, out1: NodeIdx },
     /// Outside present: insert count zero at `out`.
-    CounterInstance { src: Row, out: Row },
+    CounterInstance { out: NodeIdx },
     /// `T = {counter_step(v)}`; the counts of `T` that continue go to
     /// `out`; Outside at `out1` iff some count of `T` breaks.
     CounterIncrement {
-        src: Row,
-        out: Row,
-        out1: Row,
+        out: NodeIdx,
+        out1: NodeIdx,
         inc: Increment,
     },
     /// Union into `out` iff the shared evaluator says `Pass` at the
     /// current boundary.
-    Assert {
-        kind: AssertKind,
-        src: Row,
-        out: Row,
-    },
+    Assert { kind: AssertKind, out: NodeIdx },
     /// Nonempty (Outside present): a match.
-    Match { src: Row },
-}
-
-/// How a consuming state moves its row on a byte it accepts.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum ConsumerKind {
-    /// A one-byte predicate with successors `out` and, unless
-    /// [`Row::NONE`], the fused `out_exit`.
-    Edge { out: Row, out_exit: Row },
-    /// A byte dispatch table, read from [`Regex::byte_tables`].
+    Match,
+    /// Consumes with the one-byte predicate of its state; successors `out`
+    /// and, unless [`NO_NODE`], the fused `out_exit`.
+    Edge { out: NodeIdx, out_exit: NodeIdx },
+    /// Consumes through a byte dispatch table of [`Regex::byte_tables`].
     Table(ByteTableIdx),
 }
 
-/// A consuming state.
+/// A reachable state.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Consumer {
+pub(crate) struct Node {
     state: StateIdx,
-    src: Row,
-    kind: ConsumerKind,
+    scope: Scope,
+    row: Row,
+    op: Op,
 }
 
 /// The immutable compiled plan of an admitted graph.
 #[derive(Debug)]
 pub(crate) struct GroupedNfaPlan {
-    /// Zero-width and `Match` transfers in topological order.
-    ops: Box<[ZeroOp]>,
-    /// Consuming states.
-    consumers: Box<[Consumer]>,
-    /// Row of every state ([`Row::NONE`] if unreachable); read for
+    /// Reachable states in topological order of the zero-width graph;
+    /// rows are laid out in the same order.
+    nodes: Box<[Node]>,
+    /// Node of every state ([`NO_NODE`] if unreachable); read for
     /// `ByteTable` targets.
-    row_of: Box<[Row]>,
-    /// Scope of every row, in arena order (for display and tests).
-    scopes: Box<[(StateIdx, Scope)]>,
-    /// Row of the start state, reseeded at every boundary.
-    start: Row,
+    node_of: Box<[NodeIdx]>,
+    /// The zero-width and `Match` nodes, in order: the full sweep's
+    /// closure walks only these.
+    zero_width: Box<[NodeIdx]>,
+    /// The consuming nodes, in order: the full sweep's consumption.
+    consumers: Box<[NodeIdx]>,
+    /// Node of the start state, reseeded at every boundary.
+    start: NodeIdx,
     /// Words in one frontier (`W`).
     words: usize,
+    /// Words of one active-row bitmap: one bit per node.
+    active_words: usize,
+    /// Whether the start state's zero-width closure has no assertion and
+    /// no `Match`, so that the closure of an empty frontier is the same at
+    /// every boundary and never matches: bytes the regex's prefilter rules
+    /// out can then be skipped while the frontier is empty.
+    skip_when_idle: bool,
 }
 
 impl GroupedNfaPlan {
     /// Heap bytes of a plan with these array lengths.
-    fn heap_bytes_for(states: usize, rows: usize, ops: usize, consumers: usize) -> usize {
-        states * size_of::<Row>()
-            + rows * size_of::<(StateIdx, Scope)>()
-            + ops * size_of::<ZeroOp>()
-            + consumers * size_of::<Consumer>()
+    fn heap_bytes_for(states: usize, nodes: usize) -> usize {
+        // `node_of`, the nodes, and the two node lists (`nodes` in all).
+        (states + nodes) * size_of::<NodeIdx>() + nodes * size_of::<Node>()
     }
 
     /// Heap bytes of this plan's arrays.
     pub(crate) fn heap_bytes(&self) -> usize {
-        Self::heap_bytes_for(
-            self.row_of.len(),
-            self.scopes.len(),
-            self.ops.len(),
-            self.consumers.len(),
-        )
+        debug_assert_eq!(
+            self.zero_width.len() + self.consumers.len(),
+            self.nodes.len()
+        );
+        Self::heap_bytes_for(self.node_of.len(), self.nodes.len())
     }
 
     /// Words in one frontier.
@@ -219,9 +218,33 @@ impl GroupedNfaPlan {
         self.words
     }
 
+    /// Words of one active-row bitmap.
+    pub(crate) fn active_words(&self) -> usize {
+        self.active_words
+    }
+
     /// Rows: one per reachable state.
     pub(crate) fn rows(&self) -> usize {
-        self.scopes.len()
+        self.nodes.len()
+    }
+
+    /// The row of a node.
+    #[inline]
+    fn row(&self, node: NodeIdx) -> Row {
+        self.nodes[node as usize].row
+    }
+
+    /// Reachable states with their scope and row, in node order.
+    #[cfg(test)]
+    pub(crate) fn rows_iter(&self) -> impl Iterator<Item = (StateIdx, Scope, Row)> + '_ {
+        self.nodes.iter().map(|n| (n.state, n.scope, n.row))
+    }
+
+    /// The row of a state, if it is reachable.
+    #[cfg(test)]
+    pub(crate) fn row_of_state(&self, state: StateIdx) -> Option<Row> {
+        let n = self.node_of[state.idx()];
+        (n != NO_NODE).then(|| self.row(n))
     }
 }
 
@@ -229,62 +252,47 @@ impl fmt::Display for GroupedNfaPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "  rows: {} ({} words), start row {}",
-            self.scopes.len(),
+            "  rows: {} ({} words), start state {}, skip when idle: {}",
+            self.nodes.len(),
             self.words,
-            self.start.off
+            self.nodes[self.start as usize].state,
+            self.skip_when_idle
         )?;
-        for &(state, scope) in self.scopes.iter() {
-            let row = self.row_of[state.idx()];
-            writeln!(
+        let st = |n: NodeIdx| -> String {
+            if n == NO_NODE {
+                "-".into()
+            } else {
+                self.nodes[n as usize].state.to_string()
+            }
+        };
+        writeln!(f, "  nodes, in closure order:")?;
+        for node in self.nodes.iter() {
+            let (s, row) = (node.state, node.row);
+            write!(
                 f,
-                "    state {state}: {scope}, words {}..{}",
+                "    {s} ({}, words {}..{}): ",
+                node.scope,
                 row.off,
                 row.off + row.words
             )?;
-        }
-        let state_of = |row: Row| -> String {
-            self.scopes
-                .iter()
-                .find(|(s, _)| self.row_of[s.idx()] == row)
-                .map_or_else(|| "-".to_string(), |(s, _)| s.to_string())
-        };
-        writeln!(f, "  closure order:")?;
-        for op in self.ops.iter() {
-            match *op {
-                ZeroOp::Split { src, out, out1 } => writeln!(
-                    f,
-                    "    {} split -> {}, {}",
-                    state_of(src),
-                    state_of(out),
-                    state_of(out1)
-                )?,
-                ZeroOp::CounterInstance { src, out } => {
-                    writeln!(f, "    {} CI -> {}", state_of(src), state_of(out))?
+            match node.op {
+                Op::Split { out, out1 } => writeln!(f, "split -> {}, {}", st(out), st(out1))?,
+                Op::CounterInstance { out } => writeln!(f, "CI -> {}", st(out))?,
+                Op::CounterIncrement { out, out1, inc } => {
+                    writeln!(f, "CInc{inc} cont -> {}, break -> {}", st(out), st(out1))?
                 }
-                ZeroOp::CounterIncrement {
-                    src,
-                    out,
-                    out1,
-                    inc,
-                } => writeln!(
-                    f,
-                    "    {} CInc{inc} cont -> {}, break -> {}",
-                    state_of(src),
-                    state_of(out),
-                    state_of(out1)
-                )?,
-                ZeroOp::Assert { kind, src, out } => writeln!(
-                    f,
-                    "    {} {} -> {}",
-                    state_of(src),
-                    kind.label(),
-                    state_of(out)
-                )?,
-                ZeroOp::Match { src } => writeln!(f, "    {} match", state_of(src))?,
+                Op::Assert { kind, out } => writeln!(f, "{} -> {}", kind.label(), st(out))?,
+                Op::Match => writeln!(f, "match")?,
+                Op::Edge { out, out_exit } => {
+                    write!(f, "consume -> {}", st(out))?;
+                    if out_exit != NO_NODE {
+                        write!(f, ", {}", st(out_exit))?;
+                    }
+                    writeln!(f)?
+                }
+                Op::Table(t) => writeln!(f, "consume via table {}", t.idx())?,
             }
         }
-        writeln!(f, "  consumers: {}", self.consumers.len())?;
         Ok(())
     }
 }

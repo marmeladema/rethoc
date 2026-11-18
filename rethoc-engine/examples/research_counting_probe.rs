@@ -2,12 +2,15 @@
 //!
 //! `tier` is 0-4, or `grouped` for the experimental grouped NFA (compiled
 //! with `RegexConfig::grouped_nfa`; `ineligible` when it does not admit the
-//! pattern).
+//! pattern), or `grouped-full` / `grouped-active` for the grouped NFA with
+//! one of its two passes forced.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use rethoc_engine::{GroupedScratch, GroupedStream, MatcherMemory, Regex, RegexConfig};
+use rethoc_engine::{
+    GroupedScratch, GroupedStream, GroupedSweep, MatcherMemory, Regex, RegexConfig,
+};
 
 fn main() {
     let args: Vec<_> = std::env::args().collect();
@@ -20,7 +23,13 @@ fn main() {
     let bound: usize = args[2].parse().expect("bound");
     let bytes: usize = args[3].parse().expect("bytes");
     let tier_arg = args[4].as_str();
-    let grouped = tier_arg == "grouped";
+    let grouped = tier_arg.starts_with("grouped");
+    let sweep = match tier_arg {
+        "grouped" => GroupedSweep::Auto,
+        "grouped-full" => GroupedSweep::Full,
+        "grouped-active" => GroupedSweep::Active,
+        _ => GroupedSweep::Auto,
+    };
     let tier: u8 = if grouped {
         0
     } else {
@@ -40,6 +49,14 @@ fn main() {
         "sparse" => format!("a(a|aa){{1,{bound}}}b"),
         // Counter-free control (`bound` unused).
         "control" => "abc|abd".to_string(),
+        // A wide plan of which the input activates one branch out of 12.
+        "wide" => (0..12u8)
+            .map(|i| {
+                let (p, a) = ((b'A' + i) as char, (b'a' + i) as char);
+                format!("{p}({a}|{a}{a}){{1,{bound}}}!")
+            })
+            .collect::<Vec<_>>()
+            .join("|"),
         _ => panic!("unknown family"),
     };
     let config = RegexConfig {
@@ -69,6 +86,8 @@ fn main() {
                 };
             }
         }
+        // `A` then `a`s: only the first branch is ever active.
+        "wide" => hay[0] = b'A',
         // One `a` every 512 bytes of `q`.
         "sparse" | "control" => {
             for (i, byte) in hay.iter_mut().enumerate() {
@@ -103,6 +122,7 @@ fn main() {
     // The grouped NFA: one stream, reset between scans like a reused
     // matcher; its scratch is kept like a `MatcherMemory`.
     let mut scratch = GroupedScratch::new();
+    scratch.set_sweep(sweep);
     let mut stream = grouped.then(|| GroupedStream::new(&re, &mut scratch).expect("admitted"));
     let mut run = || {
         if let Some(stream) = stream.as_mut() {

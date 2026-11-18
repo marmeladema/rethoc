@@ -78,6 +78,7 @@ pub use dump::DumpRegex;
 #[doc(hidden)]
 pub use grouped_nfa::{
     GroupedNfaError, GroupedScratch, GroupedStream, Rejection as GroupedRejection,
+    Sweep as GroupedSweep,
 };
 pub use info::{
     CounterInfo, ExecutionInfo, GroupedNfaInfo, MemoryInfo, NfaStateBreakdown, RegexInfo,

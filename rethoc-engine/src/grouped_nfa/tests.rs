@@ -6,7 +6,9 @@ use std::collections::BTreeSet;
 
 use super::analysis::{self, Limits, Rejection, Scope};
 use super::exact::{self, Boundary, BoundaryCtx};
-use super::{GroupedNfaError, GroupedNfaPlan, GroupedScratch, GroupedStream, Increment, Row};
+use super::{
+    GroupedNfaError, GroupedNfaPlan, GroupedScratch, GroupedStream, Increment, Row, Sweep,
+};
 use crate::{
     AssertEval, ByteMap, CounterIdx, MatcherMemory, Regex, RegexConfig, State, StateIdx,
     byte_match_ci, counter_step,
@@ -111,10 +113,9 @@ impl Rng {
 
 /// The scope of each state with a row in `plan`.
 fn scope_of(plan: &GroupedNfaPlan, state: StateIdx) -> Option<Scope> {
-    plan.scopes
-        .iter()
-        .find(|(s, _)| *s == state)
-        .map(|&(_, scope)| scope)
+    plan.rows_iter()
+        .find(|&(s, _, _)| s == state)
+        .map(|(_, scope, _)| scope)
 }
 
 #[test]
@@ -210,10 +211,9 @@ fn counted_rows_span_words() {
         let re = forced(pattern);
         let plan = plan(&re);
         let widths: BTreeSet<u32> = plan
-            .scopes
-            .iter()
-            .filter(|(_, scope)| matches!(scope, Scope::Counter(_)))
-            .map(|(s, _)| plan.row_of[s.idx()].words)
+            .rows_iter()
+            .filter(|(_, scope, _)| matches!(scope, Scope::Counter(_)))
+            .map(|(_, _, row)| row.words)
             .collect();
         assert_eq!(widths, BTreeSet::from([words]), "`{pattern}`");
     }
@@ -477,7 +477,7 @@ fn fixture_zero_width_graph() {
     ];
     let plan = analyze_fixture(&states, 1, &Limits::DEFAULT).unwrap();
     assert_eq!(plan.rows(), 3);
-    assert_eq!(plan.row_of[3], super::Row::NONE);
+    assert_eq!(plan.row_of_state(st(3)), None);
 }
 
 #[test]
@@ -511,9 +511,8 @@ fn budgets_below_at_and_above() {
     // Every state of a fresh forced compile is reachable except the dead
     // sentinels that the byte-table pass leaves; count the reachable ones.
     let reachable_edges: usize = full
-        .scopes
-        .iter()
-        .map(|(s, _)| match states[*s] {
+        .rows_iter()
+        .map(|(s, _, _)| match states[s] {
             State::ByteTable { .. } => 256,
             State::Match => 0,
             _ => 2,
@@ -604,14 +603,15 @@ fn check_increment(min: usize, max: usize, counts: &BTreeSet<usize>, prefill: &B
         rows[w + v / 64] |= 1 << (v % 64);
     }
     let before = rows[..w].to_vec();
-    let brk = exact::increment(&mut rows, src, out, inc);
+    let (any_cont, brk) = exact::increment(&mut rows, src, out, inc);
 
     let mut cont = prefill.clone();
-    let mut expected_brk = false;
+    let (mut expected_cont, mut expected_brk) = (false, false);
     for &v in counts {
         let nv = counter_step(v, min, max);
         if nv < max {
             cont.insert(nv);
+            expected_cont = true;
         }
         expected_brk |= nv >= min;
     }
@@ -621,6 +621,7 @@ fn check_increment(min: usize, max: usize, counts: &BTreeSet<usize>, prefill: &B
     let label = format!("{inc} S={counts:?}");
     assert_eq!(got, cont, "{label}: continue (padding included)");
     assert_eq!(brk, expected_brk, "{label}: break");
+    assert_eq!(any_cont, expected_cont, "{label}: anything continued");
     assert_eq!(rows[..w], before[..], "{label}: source row changed");
 }
 
@@ -683,7 +684,9 @@ fn increment_matches_counter_step_across_words() {
                 continue;
             }
             for set in random_sets(&mut rng, max) {
-                let prefill = random_sets(&mut rng, max).swap_remove(4 + rng.below(200));
+                let density = [2, 8, 64][rng.below(3)];
+                let prefill: BTreeSet<usize> =
+                    (0..max).filter(|_| rng.below(density) == 0).collect();
                 check_increment(min, max, &set, &prefill);
             }
         }
@@ -806,11 +809,20 @@ fn scalar_consume(re: &Regex, closure: &BTreeSet<Config>, b: u8) -> BTreeSet<Con
     next
 }
 
+/// Check the active-row invariant: a node's bit is set iff its row is
+/// nonempty.
+fn check_active(plan: &GroupedNfaPlan, rows: &[u64], active: &[u64], label: &str) {
+    for (n, (state, _, row)) in plan.rows_iter().enumerate() {
+        let bit = active[n / 64] >> (n % 64) & 1 != 0;
+        let nonempty = rows[row.range()].iter().any(|&w| w != 0);
+        assert_eq!(bit, nonempty, "{label}: active bit of state {state}");
+    }
+}
+
 /// Expand grouped rows into configurations.
 fn expand(plan: &GroupedNfaPlan, rows: &[u64]) -> BTreeSet<Config> {
     let mut out = BTreeSet::new();
-    for &(state, scope) in plan.scopes.iter() {
-        let row = plan.row_of[state.idx()];
+    for (state, scope, row) in plan.rows_iter() {
         for v in 0..row.words as usize * 64 {
             if rows[row.off as usize + v / 64] >> (v % 64) & 1 == 0 {
                 continue;
@@ -834,52 +846,100 @@ fn expand(plan: &GroupedNfaPlan, rows: &[u64]) -> BTreeSet<Config> {
 /// match flag after construction, after each byte and at the end.
 pub(crate) fn check_against_scalar(re: &Regex, input: &[u8], label: &str) {
     let plan = plan(re);
-    let mut scratch = GroupedScratch::new();
-    let mut stream = GroupedStream::new(re, &mut scratch).unwrap();
+    // One stream per pass, in lockstep with one scalar run.
+    let mut streams: Vec<(Sweep, GroupedScratch, GroupedStream)> = SWEEPS
+        .iter()
+        .map(|&sweep| {
+            let mut scratch = GroupedScratch::new();
+            scratch.set_sweep(sweep);
+            let stream = GroupedStream::new(re, &mut scratch).unwrap();
+            (sweep, scratch, stream)
+        })
+        .collect();
     let mut raw: BTreeSet<Config> = BTreeSet::new();
-    let mut closure_rows = vec![0u64; plan.words()];
     let ctx = |i: usize, boundary| BoundaryCtx {
         at_start: i == 0,
         prev: i.checked_sub(1).map(|j| input[j]),
         boundary,
     };
     let (_, mut matched) = scalar_close(re, &raw, ctx(0, Boundary::UnknownNext));
-    assert_eq!(stream.ismatch(), matched, "{label}: ismatch at start");
+    for (sweep, _, stream) in &streams {
+        assert_eq!(
+            stream.ismatch(),
+            matched,
+            "{label} {sweep:?}: ismatch at start"
+        );
+    }
     for (i, &b) in input.iter().enumerate() {
-        assert_eq!(expand(plan, stream.raw()), raw, "{label}: raw roots at {i}");
         let (closure, m) = scalar_close(re, &raw, ctx(i, Boundary::BeforeByte(b)));
+        // Both closure passes, from the first stream's raw rows.
+        let stream = &streams[0].2;
+        assert_eq!(expand(plan, stream.raw()), raw, "{label}: raw roots at {i}");
+        check_active(plan, stream.raw(), stream.raw_active(), label);
+        let mut rows = vec![0u64; plan.words()];
+        let mut active = vec![0u64; plan.active_words()];
+        let c = ctx(i, Boundary::BeforeByte(b));
         let gm = exact::close(
             plan,
             stream.raw(),
-            &mut closure_rows,
-            ctx(i, Boundary::BeforeByte(b)),
+            stream.raw_active(),
+            &mut rows,
+            &mut active,
+            c,
         );
         assert_eq!(
-            expand(plan, &closure_rows),
+            expand(plan, &rows),
             closure,
-            "{label}: closure at {i}"
+            "{label}: active closure at {i}"
         );
-        assert_eq!(gm, m, "{label}: match at {i}");
-        stream.chunk(re, &mut scratch, &[b]);
-        if matched || m {
-            assert!(stream.ismatch(), "{label}: ismatch at {i}");
-            assert!(stream.finish(re, &mut scratch), "{label}: finish");
+        check_active(plan, &rows, &active, label);
+        assert_eq!(gm, m, "{label}: active closure match at {i}");
+        let mut rows = vec![0u64; plan.words()];
+        let gm = exact::close_full(plan, stream.raw(), &mut rows, c);
+        assert_eq!(expand(plan, &rows), closure, "{label}: full closure at {i}");
+        assert_eq!(gm, m, "{label}: full closure match at {i}");
+
+        let done = matched || m;
+        if !done {
+            raw = scalar_consume(re, &closure, b);
+            let (_, m) = scalar_close(re, &raw, ctx(i + 1, Boundary::UnknownNext));
+            matched |= m;
+        }
+        for (sweep, scratch, stream) in &mut streams {
+            stream.chunk(re, scratch, &[b]);
+            assert!(
+                scratch.is_clean(),
+                "{label} {sweep:?}: scratch left dirty at {i}"
+            );
+            if done {
+                assert!(stream.ismatch(), "{label} {sweep:?}: ismatch at {i}");
+                assert!(stream.finish(re, scratch), "{label} {sweep:?}: finish");
+            } else {
+                assert_eq!(
+                    expand(plan, stream.raw()),
+                    raw,
+                    "{label} {sweep:?}: raw after {i}"
+                );
+                check_active(plan, stream.raw(), stream.raw_active(), label);
+                assert_eq!(
+                    stream.ismatch(),
+                    matched,
+                    "{label} {sweep:?}: ismatch after {i}"
+                );
+            }
+        }
+        if done {
             return;
         }
-        raw = scalar_consume(re, &closure, b);
-        let (_, m) = scalar_close(re, &raw, ctx(i + 1, Boundary::UnknownNext));
-        matched |= m;
-        assert_eq!(stream.ismatch(), matched, "{label}: ismatch after {i}");
-    }
-    if !matched {
-        assert_eq!(expand(plan, stream.raw()), raw, "{label}: final raw roots");
     }
     let (_, m) = scalar_close(re, &raw, ctx(input.len(), Boundary::EndOfInput));
-    assert_eq!(
-        stream.finish(re, &mut scratch),
-        matched || m,
-        "{label}: finish"
-    );
+    for (sweep, scratch, stream) in &mut streams {
+        assert_eq!(
+            stream.finish(re, scratch),
+            matched || m,
+            "{label} {sweep:?}: finish"
+        );
+    }
 }
 
 /// Every string over `alphabet` up to `max_len`.
@@ -946,7 +1006,12 @@ fn configurations_match_scalar_interpreter() {
                 continue;
             }
             let label = format!("`{pattern}` unroll={unroll} merge={merge}");
-            for input in all_strings(alphabet, 6) {
+            // Up to length 6, at most about 1,000 strings per alphabet.
+            let len = (1..=6)
+                .take_while(|&l| alphabet.len().pow(l as u32) <= 1024)
+                .last()
+                .unwrap_or(1);
+            for input in all_strings(alphabet, len) {
                 check_against_scalar(&re, &input, &format!("{label} on {input:?}"));
             }
         }
@@ -996,20 +1061,49 @@ pub(crate) fn oracle(pattern: &str) -> regex::bytes::Regex {
 /// `ismatch` must agree after construction and every call, `finish` must
 /// agree with both.
 pub(crate) fn run_chunks(re: &Regex, chunks: &[&[u8]], expected: bool, label: &str) {
-    let mut scratch = GroupedScratch::new();
-    let mut stream = GroupedStream::new(re, &mut scratch).unwrap();
+    // One stream per pass, each with its own scratch.
+    let mut streams: Vec<(Sweep, GroupedScratch, GroupedStream)> = SWEEPS
+        .iter()
+        .map(|&sweep| {
+            let mut scratch = GroupedScratch::new();
+            scratch.set_sweep(sweep);
+            let stream = GroupedStream::new(re, &mut scratch).unwrap();
+            (sweep, scratch, stream)
+        })
+        .collect();
     let mut mem = MatcherMemory::default();
     let mut nfa = mem.matcher_for_tier(re, 0).unwrap();
-    assert_eq!(stream.ismatch(), nfa.ismatch(), "{label}: before input");
-    for (i, chunk) in chunks.iter().enumerate() {
-        stream.chunk(re, &mut scratch, chunk);
-        nfa.chunk(chunk);
-        assert_eq!(stream.ismatch(), nfa.ismatch(), "{label}: after chunk {i}");
+    for (sweep, _, stream) in &streams {
+        assert_eq!(
+            stream.ismatch(),
+            nfa.ismatch(),
+            "{label} {sweep:?}: before input"
+        );
     }
-    let got = stream.finish(re, &mut scratch);
+    for (i, chunk) in chunks.iter().enumerate() {
+        nfa.chunk(chunk);
+        for (sweep, scratch, stream) in &mut streams {
+            stream.chunk(re, scratch, chunk);
+            assert_eq!(
+                stream.ismatch(),
+                nfa.ismatch(),
+                "{label} {sweep:?}: after chunk {i}"
+            );
+        }
+    }
     assert_eq!(nfa.finish(), expected, "{label}: tier 0");
-    assert_eq!(got, expected, "{label}: grouped");
+    for (sweep, scratch, stream) in &mut streams {
+        assert_eq!(
+            stream.finish(re, scratch),
+            expected,
+            "{label} {sweep:?}: grouped"
+        );
+        assert!(scratch.is_clean(), "{label} {sweep:?}: scratch left dirty");
+    }
 }
+
+/// Every pass a stream can be forced to.
+const SWEEPS: [Sweep; 3] = [Sweep::Auto, Sweep::Full, Sweep::Active];
 
 /// Whole, bytewise, and a random partition with empty chunks.
 pub(crate) fn check_input(
@@ -1190,9 +1284,9 @@ fn saturated_counters_on_long_streams() {
 fn one_predicate_test_per_active_state() {
     let re = forced("x(a|aa){2,9}z");
     let plan = plan(&re);
-    let mut closure = vec![0u64; plan.words()];
-    let mut next = vec![0u64; plan.words()];
-    let mut raw = vec![0u64; plan.words()];
+    let (w, a) = (plan.words(), plan.active_words());
+    let mut raw = vec![0u64; w];
+    let mut raw_active = vec![0u64; a];
     let mut saw_grouping = false;
     let mut prev = None;
     for (i, &b) in b"xaaaaaaaaz".iter().enumerate() {
@@ -1201,25 +1295,37 @@ fn one_predicate_test_per_active_state() {
             prev,
             boundary: Boundary::BeforeByte(b),
         };
-        exact::close(plan, &raw, &mut closure, ctx);
-        let active = plan
-            .consumers
+        let (mut closure, mut active) = (vec![0u64; w], vec![0u64; a]);
+        exact::close(plan, &raw, &raw_active, &mut closure, &mut active, ctx);
+        let consumers: Vec<_> = plan
+            .nodes
             .iter()
-            .filter(|c| closure[c.src.range()].iter().any(|&w| w != 0))
-            .count();
-        let counts: u32 = plan
-            .consumers
+            .filter(|n| matches!(n.op, super::Op::Edge { .. } | super::Op::Table(_)))
+            .filter(|n| closure[n.row.range()].iter().any(|&w| w != 0))
+            .collect();
+        let counts: u32 = consumers
             .iter()
-            .map(|c| {
-                closure[c.src.range()]
+            .map(|n| {
+                closure[n.row.range()]
                     .iter()
                     .map(|w| w.count_ones())
                     .sum::<u32>()
             })
             .sum();
-        saw_grouping |= counts as usize > active;
-        assert_eq!(exact::consume(plan, &re, &closure, &mut next, b), active);
-        raw.copy_from_slice(&next);
+        saw_grouping |= counts as usize > consumers.len();
+        let (mut next, mut next_active) = (vec![0u64; w], vec![0u64; a]);
+        let tests = exact::consume(
+            plan,
+            &re,
+            &mut closure,
+            &mut active,
+            &mut next,
+            &mut next_active,
+            b,
+        );
+        assert_eq!(tests, consumers.len());
+        raw = next;
+        raw_active = next_active;
         prev = Some(b);
     }
     assert!(saw_grouping, "some state should hold several counts");
@@ -1306,4 +1412,126 @@ fn interleaved_streams_share_scratch() {
         high_water,
         "scratch keeps its high water"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Skipping while idle
+// ---------------------------------------------------------------------------
+
+/// Whether streams of `re` skip bytes with the prefilter while idle.
+fn skips(re: &Regex) -> bool {
+    plan(re).skip_when_idle && !matches!(re.prefilter, crate::Prefilter::None)
+}
+
+/// Mostly bytes the prefilter rules out, with a few candidates and short
+/// runs that can match.
+fn sparse_input(rng: &mut Rng, pieces: &[&[u8]]) -> Vec<u8> {
+    let mut input = Vec::new();
+    for _ in 0..1 + rng.below(6) {
+        input.extend(std::iter::repeat_n(b'q', rng.below(40)));
+        input.extend_from_slice(pieces[rng.below(pieces.len())]);
+    }
+    input
+}
+
+#[test]
+fn skipping_while_idle_keeps_results() {
+    let cases: &[(&str, &[&[u8]])] = &[
+        (
+            "a(a|aa){1,5}b",
+            &[b"a", b"aab", b"aaaab", b"ab", b"aaaaaaaaab"],
+        ),
+        (r"x(a|aa){2,5}\b", &[b"x", b"xaa", b"xaaa ", b"xaaq", b"xa"]),
+        ("(ab|cd){1,8}e", &[b"ab", b"abcde", b"cdcdcde", b"e"]),
+        ("[a-c]{2,4}x", &[b"ab", b"abcx", b"cx", b"aaaaax"]),
+        (
+            r"(?m:^)?a{2,3}(?m:$)",
+            &[b"aa", b"aa\n", b"aaaa\n", b"\naa"],
+        ),
+    ];
+    let mut rng = Rng(0x5eed);
+    for &(pattern, pieces) in cases {
+        let oracle = oracle(pattern);
+        for (unroll, merge) in CONFIGS {
+            let re = compile(pattern, unroll, merge);
+            if re.grouped_plan().is_err() {
+                continue;
+            }
+            let label = format!("`{pattern}` unroll={unroll} merge={merge}");
+            for k in 0..60 {
+                let input = sparse_input(&mut rng, pieces);
+                check_input(&re, &oracle, &input, k, &label);
+                check_against_scalar(&re, &input, &label);
+            }
+        }
+    }
+}
+
+#[test]
+fn skipping_is_used_only_when_sound() {
+    // A plain counted pattern: the start closure is static.
+    assert!(skips(&forced("a(a|aa){1,5}b")));
+    // An assertion or a match in the start closure depends on the
+    // boundary: no skipping.
+    assert!(!plan(&forced(r"\ba(a|aa){1,5}")).skip_when_idle);
+    assert!(!plan(&forced(r"(?m:^)a{2,3}")).skip_when_idle);
+    assert!(!plan(&forced("a{0,3}")).skip_when_idle);
+}
+
+/// Skipped bytes still advance the boundary: `prev` and the at-start flag
+/// are those of the last byte, skipped or not.
+#[test]
+fn skipping_tracks_the_boundary() {
+    let re = forced("a(a|aa){1,5}b");
+    assert!(skips(&re));
+    let mut scratch = GroupedScratch::new();
+    let mut s = GroupedStream::new(&re, &mut scratch).unwrap();
+    s.chunk(&re, &mut scratch, b"qqqz");
+    assert_eq!(s.boundary_state(), (Some(b'z'), false));
+    assert!(s.raw_active().iter().all(|&w| w == 0));
+    s.chunk(&re, &mut scratch, b"qqa");
+    assert_eq!(s.boundary_state(), (Some(b'a'), false));
+    assert!(s.raw_active().iter().any(|&w| w != 0));
+    s.chunk(&re, &mut scratch, b"aq");
+    assert_eq!(s.boundary_state(), (Some(b'q'), false));
+    s.chunk(&re, &mut scratch, b"qqqqaaab");
+    assert!(s.ismatch());
+    assert!(scratch.is_clean());
+}
+
+/// On a plan of more than 32 rows, the automatic choice switches between
+/// the two passes as activity rises and falls, also within one chunk; the
+/// scratch must be clean for either at every byte.
+#[test]
+fn automatic_choice_switches_within_a_chunk() {
+    // Each capital letter opens one branch and continues the others, so a
+    // run of capitals keeps many branches alive at once.
+    let pattern: String = (0..12u8)
+        .map(|i| format!("{}[A-Za-z]{{2,9}}!", (b'A' + i) as char))
+        .collect::<Vec<_>>()
+        .join("|");
+    let re = forced(&pattern);
+    assert!(plan(&re).rows() > 32);
+    let oracle = oracle(&pattern);
+    let mut rng = Rng(99);
+    let pieces: [&[u8]; 6] = [b"ABCDEFGHIJKL", b"!", b"Abc!", b"qqqq", b"ABq", b"AbcdefG!"];
+    let mut passes = [0, 0];
+    for k in 0..200 {
+        let input: Vec<u8> = (0..1 + rng.below(8))
+            .flat_map(|_| pieces[rng.below(pieces.len())].iter().copied())
+            .collect();
+        let mut scratch = GroupedScratch::new();
+        let mut s = GroupedStream::new(&re, &mut scratch).unwrap();
+        s.chunk(&re, &mut scratch, &input);
+        assert!(scratch.is_clean());
+        assert_eq!(
+            s.finish(&re, &mut scratch),
+            oracle.is_match(&input),
+            "{input:?}"
+        );
+        passes[0] += scratch.passes[0];
+        passes[1] += scratch.passes[1];
+        check_input(&re, &oracle, &input, k, &format!("`{pattern}`"));
+    }
+    assert!(passes[0] > 0 && passes[1] > 0, "{passes:?}");
 }

@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use super::{Consumer, ConsumerKind, GroupedNfaPlan, Increment, Row, ZeroOp};
+use super::{GroupedNfaPlan, Increment, NO_NODE, Node, NodeIdx, Op, Row};
 use crate::{AssertKind, ByteMap, CounterIdx, CounterInfo, State, StateIdx};
 
 // ---------------------------------------------------------------------------
@@ -197,19 +197,6 @@ fn edge_entries(state: &State) -> usize {
         State::Match => 0,
         _ => 2,
     }
-}
-
-/// True for states that consume a byte.
-pub(crate) fn is_consuming(state: &State) -> bool {
-    matches!(
-        state,
-        State::Byte { .. }
-            | State::ByteCI { .. }
-            | State::Wildcard { .. }
-            | State::ByteClassStatic { .. }
-            | State::ByteClassCustom { .. }
-            | State::ByteTable { .. }
-    )
 }
 
 /// Propagate scope labels from `start` (Outside) over every edge.
@@ -426,11 +413,15 @@ pub(crate) const fn reviewed(kind: AssertKind) -> bool {
 }
 
 /// Upper bound of the transient analysis arrays for `states` states:
-/// labels and indegrees indexed by state, the reachable list, the work
-/// stacks and the order (each at most one entry per state), and the bounds
-/// per counter.
+/// labels, indegrees and visited flags indexed by state, the reachable
+/// list, the work stacks and the order (each at most one entry per state),
+/// and the bounds per counter.
 pub(crate) fn analysis_bytes(states: usize, num_counters: usize) -> usize {
-    states * (size_of::<Option<Scope>>() + size_of::<u32>() + 4 * size_of::<StateIdx>())
+    states
+        * (size_of::<Option<Scope>>()
+            + size_of::<u32>()
+            + size_of::<bool>()
+            + 4 * size_of::<StateIdx>())
         + num_counters * size_of::<Option<(usize, usize)>>()
 }
 
@@ -481,9 +472,7 @@ pub(crate) fn analyze(
         });
     }
 
-    let n_ops = order.iter().filter(|&&s| !is_consuming(&states[s])).count();
-    let n_consumers = order.len() - n_ops;
-    let plan_bytes = GroupedNfaPlan::heap_bytes_for(states.len(), order.len(), n_ops, n_consumers);
+    let plan_bytes = GroupedNfaPlan::heap_bytes_for(states.len(), order.len());
     if plan_bytes > limits.max_plan_bytes {
         return Err(Rejection::PlanTooLarge {
             bytes: plan_bytes,
@@ -491,90 +480,96 @@ pub(crate) fn analyze(
         });
     }
 
-    let mut row_of = vec![Row::NONE; states.len()];
-    let mut scopes = Vec::with_capacity(order.len());
+    let mut node_of = vec![NO_NODE; states.len()];
+    for (i, &idx) in order.iter().enumerate() {
+        node_of[idx.idx()] = i as NodeIdx;
+    }
+    let node = |s: StateIdx| -> NodeIdx {
+        let n = node_of[s.idx()];
+        debug_assert!(n != NO_NODE, "successor of a reachable state is reachable");
+        n
+    };
+    let mut nodes = Vec::with_capacity(order.len());
     let mut off = 0u32;
     for &idx in &order {
         let scope = label[idx.idx()].expect("reachable");
-        let w = row_words(scope, &bounds) as u32;
-        row_of[idx.idx()] = Row { off, words: w };
-        scopes.push((idx, scope));
-        off += w;
-    }
-
-    let mut ops = Vec::with_capacity(n_ops);
-    let mut consumers = Vec::with_capacity(n_consumers);
-    let row = |s: StateIdx| -> Row {
-        let r = row_of[s.idx()];
-        debug_assert!(
-            r != Row::NONE,
-            "successor of a reachable state is reachable"
-        );
-        r
-    };
-    for &idx in &order {
-        let src = row(idx);
-        match states[idx] {
-            State::Split { out, out1 } => ops.push(ZeroOp::Split {
-                src,
-                out: row(out),
-                out1: row(out1),
-            }),
-            State::CounterInstance { out, .. } => {
-                ops.push(ZeroOp::CounterInstance { src, out: row(out) })
-            }
+        let words = row_words(scope, &bounds) as u32;
+        let op = match states[idx] {
+            State::Split { out, out1 } => Op::Split {
+                out: node(out),
+                out1: node(out1),
+            },
+            State::CounterInstance { out, .. } => Op::CounterInstance { out: node(out) },
             State::CounterIncrement {
                 out,
                 out1,
                 min,
                 max,
                 ..
-            } => ops.push(ZeroOp::CounterIncrement {
-                src,
-                out: row(out),
-                out1: row(out1),
+            } => Op::CounterIncrement {
+                out: node(out),
+                out1: node(out1),
                 // The word budget passed, so the domain fits `u32`.
                 inc: Increment::new(min, max),
-            }),
-            State::Assert { kind, out } => ops.push(ZeroOp::Assert {
+            },
+            State::Assert { kind, out } => Op::Assert {
                 kind,
-                src,
-                out: row(out),
-            }),
-            State::Match => ops.push(ZeroOp::Match { src }),
+                out: node(out),
+            },
+            State::Match => Op::Match,
             State::Byte { out, out_exit, .. }
             | State::ByteCI { out, out_exit, .. }
             | State::Wildcard { out, out_exit }
             | State::ByteClassStatic { out, out_exit, .. }
-            | State::ByteClassCustom { out, out_exit, .. } => consumers.push(Consumer {
-                state: idx,
-                src,
-                kind: ConsumerKind::Edge {
-                    out: row(out),
-                    out_exit: if out_exit == StateIdx::NONE {
-                        Row::NONE
-                    } else {
-                        row(out_exit)
-                    },
+            | State::ByteClassCustom { out, out_exit, .. } => Op::Edge {
+                out: node(out),
+                out_exit: if out_exit == StateIdx::NONE {
+                    NO_NODE
+                } else {
+                    node(out_exit)
                 },
-            }),
-            State::ByteTable { table } => consumers.push(Consumer {
-                state: idx,
-                src,
-                kind: ConsumerKind::Table(table),
-            }),
-        }
+            },
+            State::ByteTable { table } => Op::Table(table),
+        };
+        nodes.push(Node {
+            state: idx,
+            scope,
+            row: Row { off, words },
+            op,
+        });
+        off += words;
     }
 
-    let start = row(start);
+    let consuming = |n: &Node| matches!(n.op, Op::Edge { .. } | Op::Table(_));
+    let (consumers, zero_width): (Vec<NodeIdx>, Vec<NodeIdx>) =
+        (0..nodes.len() as NodeIdx).partition(|&i| consuming(&nodes[i as usize]));
     let plan = GroupedNfaPlan {
-        ops: ops.into_boxed_slice(),
+        zero_width: zero_width.into_boxed_slice(),
         consumers: consumers.into_boxed_slice(),
-        row_of: row_of.into_boxed_slice(),
-        scopes: scopes.into_boxed_slice(),
-        start,
+        start: node(start),
+        skip_when_idle: start_closure_is_static(states, start),
+        active_words: nodes.len().div_ceil(64),
+        nodes: nodes.into_boxed_slice(),
+        node_of: node_of.into_boxed_slice(),
         words: off as usize,
     };
     debug_assert_eq!(plan.heap_bytes(), plan_bytes);
     Ok(plan)
+}
+
+/// Whether the zero-width closure of `start` reaches neither an assertion
+/// nor `Match`: then it is the same at every boundary and never matches.
+fn start_closure_is_static(states: &[State], start: StateIdx) -> bool {
+    let mut seen = vec![false; states.len()];
+    let mut stack = vec![start];
+    while let Some(idx) = stack.pop() {
+        if std::mem::replace(&mut seen[idx.idx()], true) {
+            continue;
+        }
+        match states[idx] {
+            State::Assert { .. } | State::Match => return false,
+            ref s => for_each_zero_width_successor(s, |t| stack.push(t)),
+        }
+    }
+    true
 }
