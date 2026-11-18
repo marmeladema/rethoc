@@ -58,8 +58,8 @@ pub struct MemoryInfo {
     pub num_byte_tables: usize,
     /// Size of one byte-map table in bytes.
     pub byte_table_size: usize,
-    /// Bytes of the experimental grouped NFA plan or rejection; 0 unless
-    /// it was requested.
+    /// Bytes of the grouped NFA plan or rejection; 0 when its analysis did
+    /// not run.
     pub grouped_nfa: usize,
 }
 
@@ -96,14 +96,21 @@ pub struct NfaStateBreakdown {
 /// A tier-1 pattern has no counters and uses a plain lazy DFA.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecutionInfo {
-    /// Numeric tier: 0 = NFA only, 1–4 = DFA tiers.
-    pub tier: u8,
-    /// Human-readable description of the selected tier.
-    pub tier_name: String,
+    /// The engine automatic selection runs the regex on (`tier1`, `tier2`,
+    /// `grouped`, `tier4` or `nfa`).
+    pub engine: String,
+    /// Description of that engine.
+    pub engine_name: String,
+    /// Every engine the regex can run on, the NFA first (`nfa`, `tier1`
+    /// to `tier4`, `grouped` when its plan was built and admitted).
+    pub eligible: Vec<String>,
+    /// Legacy numbered eligibility (`Regex::min_tier`): not the selected
+    /// engine.
+    pub min_tier: u8,
 }
 
-/// Experimental grouped NFA diagnostics, present when the regex was
-/// compiled with `RegexConfig::grouped_nfa`.
+/// Grouped NFA diagnostics, present when its analysis ran (see
+/// `GroupedNfaMode`).
 ///
 /// Persistent bytes (the plan, on the regex), per-stream bytes and
 /// per-worker scratch bytes are reported separately.
@@ -189,7 +196,7 @@ pub struct RegexInfo {
     pub start_closure: StartClosureInfo,
     /// Prefilter description (e.g. `"memchr1('a')"` or `"none"`).
     pub prefilter: String,
-    /// Experimental grouped NFA analysis, when requested.
+    /// Grouped NFA analysis, when it ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grouped_nfa: Option<GroupedNfaInfo>,
 }
@@ -319,7 +326,13 @@ impl fmt::Display for RegexInfo {
 
         // Execution tier
         writeln!(f)?;
-        writeln!(f, "Execution: {}", self.execution.tier_name)?;
+        writeln!(f, "Execution: {}", self.execution.engine_name)?;
+        writeln!(
+            f,
+            "Eligible engines: {} (legacy min_tier {})",
+            self.execution.eligible.join(", "),
+            self.execution.min_tier
+        )?;
 
         // Start closure
         writeln!(f)?;
@@ -339,7 +352,7 @@ impl fmt::Display for RegexInfo {
         if let Some(g) = &self.grouped_nfa {
             writeln!(f)?;
             writeln!(f)?;
-            write!(f, "Grouped NFA (experimental): {g}")?;
+            write!(f, "Grouped NFA: {g}")?;
         }
         Ok(())
     }

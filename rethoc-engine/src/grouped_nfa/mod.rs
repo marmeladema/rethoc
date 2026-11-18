@@ -1,4 +1,4 @@
-//! Experimental exact grouped NFA (`plans/grouped-nfa.md`).
+//! Exact grouped NFA (`plans/grouped-nfa.md`).
 //!
 //! The Thompson NFA keeps one thread per `(state, counter context)`; a
 //! state reached with many counts is visited, hashed and stepped once per
@@ -19,11 +19,14 @@
 //!
 //! # Status
 //!
-//! Milestones P0 (analysis, opt-in plan), P1 (runtime), P2 (multiword and
-//! saturating count domains) and P3 (assertions by raw replay).  The backend is selected
-//! only explicitly: compile with
-//! [`RegexConfig::grouped_nfa`](crate::RegexConfig::grouped_nfa) and run a
-//! [`GroupedStream`].  Default dispatch and the tiers are unchanged.
+//! Milestones P0–P5 (`plans/grouped-nfa.md`).  Automatic selection
+//! ([`Regex::engine`](crate::Regex::engine)) runs the grouped NFA when
+//! neither Tier 1 nor Tier 2 applies and it admits the pattern; see
+//! [`GroupedNfaMode`](crate::GroupedNfaMode) to disable it or to analyse it
+//! for every regex.  It can also be forced
+//! ([`MatcherMemory::matcher_grouped`](crate::MatcherMemory::matcher_grouped))
+//! or run on a [`GroupedStream`] with a separately owned
+//! [`GroupedScratch`].
 //!
 //! Admitted graphs ([`analysis`]): every reachable state has one incoming
 //! scope (outside, or inside exactly one counter), the zero-width graph is
@@ -61,7 +64,7 @@ use crate::{AssertKind, ByteTableIdx, Regex, StateIdx};
 
 pub use analysis::Rejection;
 pub(crate) use analysis::{Limits, Scope, analyze};
-pub use exact::{GroupedScratch, GroupedStream, Sweep};
+pub use exact::{GroupedMatcher, GroupedScratch, GroupedStream, Sweep};
 
 // ---------------------------------------------------------------------------
 // Plan
@@ -401,8 +404,11 @@ impl GroupedNfa {
 /// Why a regex cannot run on the grouped backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupedNfaError {
-    /// The regex was compiled without
-    /// [`RegexConfig::grouped_nfa`](crate::RegexConfig::grouped_nfa).
+    /// The grouped NFA was not analysed for this regex: disabled
+    /// ([`GroupedNfaMode::Disabled`](crate::GroupedNfaMode::Disabled)), or
+    /// not needed by automatic selection because Tier 1 or 2 runs it
+    /// (compile with [`GroupedNfaMode::Always`](crate::GroupedNfaMode::Always)
+    /// to force it).
     NotRequested,
     /// The analysis rejected the graph.
     Rejected(Rejection),
@@ -411,9 +417,11 @@ pub enum GroupedNfaError {
 impl fmt::Display for GroupedNfaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotRequested => {
-                write!(f, "the regex was compiled without the grouped NFA option")
-            }
+            Self::NotRequested => write!(
+                f,
+                "the grouped NFA was not analysed for this regex (disabled, or Tier 1/2 runs it; \
+                 compile with GroupedNfaMode::Always to force it)"
+            ),
             Self::Rejected(r) => write!(f, "not admitted by the grouped NFA: {r}"),
         }
     }
@@ -431,7 +439,7 @@ impl Regex {
         }
     }
 
-    /// Whether this regex can run on the experimental grouped NFA, and
+    /// Whether this regex can run on the grouped NFA, and
     /// why not.
     #[doc(hidden)]
     pub fn grouped_nfa_admission(&self) -> Result<(), GroupedNfaError> {
@@ -451,5 +459,7 @@ impl Regex {
 
 #[cfg(test)]
 mod assertion_tests;
+#[cfg(test)]
+mod selection_tests;
 #[cfg(test)]
 pub(crate) mod tests;

@@ -428,6 +428,16 @@ impl fmt::Display for DumpRegex<'_> {
         )?;
         writeln!(f)?;
 
+        // -- Selection --------------------------------------------------------
+        writeln!(
+            f,
+            "Selected engine: {} ({})",
+            r.engine(),
+            r.engine().description()
+        )?;
+        writeln!(f, "  legacy min_tier: {}", r.min_tier())?;
+        writeln!(f)?;
+
         // -- Tier Eligibility -------------------------------------------------
         writeln!(f, "Tier Eligibility:")?;
         writeln!(f, "  tier1 (lazy DFA):              {}", r.dfa_eligible)?;
@@ -436,7 +446,7 @@ impl fmt::Display for DumpRegex<'_> {
         writeln!(f, "  tier4 (counter programs):       {}", r.tier4_eligible)?;
         writeln!(f)?;
 
-        // -- Grouped NFA (experimental, only when requested) -----------------
+        // -- Grouped NFA (when analysed) ---------------------------------------
         match r.grouped_nfa.as_deref() {
             None => {}
             Some(crate::grouped_nfa::GroupedNfa::Rejected(reason)) => {

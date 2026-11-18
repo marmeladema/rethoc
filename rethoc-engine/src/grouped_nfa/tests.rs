@@ -32,7 +32,7 @@ pub(crate) fn compile(pattern: &str, unroll: usize, merge: bool) -> Regex {
         RegexConfig {
             max_unroll_states: unroll,
             merge_repetitions: merge,
-            grouped_nfa: true,
+            grouped_nfa: crate::GroupedNfaMode::Always,
             ..Default::default()
         },
     )
@@ -273,8 +273,8 @@ fn not_requested_is_reported() {
     ));
 }
 
-/// The option adds a plan; it does not change the compiled NFA or the
-/// tier selection.
+/// The grouped analysis adds a plan; it does not change the compiled NFA
+/// or tier eligibility.
 #[test]
 fn option_leaves_the_nfa_unchanged() {
     for pattern in ["x(a|aa){2,5}z", "a{2,}b", r"\b(a|aa){2,5}\b", "(a{2,3}b)*c"] {
@@ -285,6 +285,7 @@ fn option_leaves_the_nfa_unchanged() {
                 RegexConfig {
                     max_unroll_states: unroll,
                     merge_repetitions: merge,
+                    grouped_nfa: crate::GroupedNfaMode::Disabled,
                     ..Default::default()
                 },
             )
@@ -324,10 +325,7 @@ fn info_and_dump_report_the_plan() {
     let stream = GroupedStream::new(&re, &mut scratch).unwrap();
     assert_eq!(stream_bytes, stream.memory_bytes());
     assert_eq!(scratch_bytes, scratch.memory_bytes());
-    assert!(
-        info.to_string()
-            .contains("Grouped NFA (experimental): admitted")
-    );
+    assert!(info.to_string().contains("Grouped NFA: admitted"));
     assert!(re.dump(false).to_string().contains("Grouped NFA: admitted"));
 
     let re = forced("x((a|aa){2,3}){2,3}z");
@@ -1264,7 +1262,7 @@ pub(crate) fn check_match_test_build(
     let grouped = Regex::with_config(
         pattern,
         RegexConfig {
-            grouped_nfa: true,
+            grouped_nfa: crate::GroupedNfaMode::Always,
             ..config.clone()
         },
     )
