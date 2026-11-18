@@ -19,27 +19,38 @@ fn grew(bytes: usize) {
     PEAK.fetch_max(live, Relaxed);
 }
 
-// SAFETY: every call is forwarded unchanged to the system allocator.
+// SAFETY: every call is forwarded unchanged to the system allocator.  The
+// counters change only after a call succeeded: a failed allocation counts
+// nothing, and a failed `realloc` leaves the old block live and counted.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        grew(layout.size());
-        unsafe { System.alloc(layout) }
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            grew(layout.size());
+        }
+        ptr
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        grew(layout.size());
-        unsafe { System.alloc_zeroed(layout) }
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            grew(layout.size());
+        }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
         LIVE.fetch_sub(layout.size(), Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        LIVE.fetch_sub(layout.size(), Relaxed);
-        grew(new_size);
-        unsafe { System.realloc(ptr, layout, new_size) }
+        let new = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new.is_null() {
+            LIVE.fetch_sub(layout.size(), Relaxed);
+            grew(new_size);
+        }
+        new
     }
 }
 

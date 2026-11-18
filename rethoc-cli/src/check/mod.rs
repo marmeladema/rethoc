@@ -103,8 +103,8 @@ impl fmt::Display for Backend {
     }
 }
 
-/// `[0, 3, grouped, sparse]`: tiers by number, then the grouped NFA and
-/// its sparse counting variant.
+/// `[0, 3, grouped]`: tiers by number, then the grouped NFA (or its
+/// sparse counting variant, `[0, sparse]`, when that is what is checked).
 pub(crate) fn backend_list(backends: &[Backend]) -> String {
     let names: Vec<String> = backends
         .iter()
@@ -158,14 +158,13 @@ impl fmt::Display for Rejection {
 /// Which backends a check runs, next to the NFA.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum TierChoice {
-    /// Every tier the pattern is eligible for, and the grouped NFA and
-    /// its sparse counting variant, each if it admits the pattern.
+    /// Every tier the pattern is eligible for, and the grouped NFA if it
+    /// admits the pattern.
     #[default]
     All,
     /// Only this tier; a pattern not eligible for it is rejected.
     Only(u8),
-    /// Every eligible tier but this one, the grouped NFA and its sparse
-    /// counting variant.
+    /// Every eligible tier but this one, and the grouped NFA.
     Except(u8),
     /// Only the grouped NFA; a pattern it does not admit is rejected.
     Grouped,
@@ -188,9 +187,12 @@ impl TierChoice {
         }
     }
 
-    /// Whether the sparse counting variant is among the backends to check.
+    /// Whether the sparse counting variant is among the backends to check:
+    /// only when it was asked for.  It is experimental and never selected
+    /// automatically, so the other choices neither compile its analysis
+    /// nor report its rejections.
     fn wants_sparse(self) -> bool {
-        matches!(self, Self::All | Self::Except(_) | Self::Sparse)
+        self == Self::Sparse
     }
 
     /// Whether the grouped NFA is among the backends to check.
@@ -574,11 +576,11 @@ mod tests {
         let p = "(?:a|bb){2,3}c";
         assert_eq!(
             tiers(p, TierChoice::All).as_deref(),
-            Ok("[0, 3, 4, grouped, sparse]")
+            Ok("[0, 3, 4, grouped]")
         );
         assert_eq!(
             tiers(p, TierChoice::Except(3)).as_deref(),
-            Ok("[0, 4, grouped, sparse]")
+            Ok("[0, 4, grouped]")
         );
         assert_eq!(tiers(p, TierChoice::Only(3)).as_deref(), Ok("[0, 3]"));
         assert_eq!(tiers(p, TierChoice::Grouped).as_deref(), Ok("[0, grouped]"));
@@ -592,13 +594,27 @@ mod tests {
         let rejected = tiers(nested, TierChoice::Sparse).unwrap_err();
         assert!(rejected.contains("sparse counting"), "{rejected}");
         // An unbounded counter: the grouped NFA runs it, its sparse
-        // variant does not.
+        // variant does not; only a run that asks for the sparse variant
+        // analyses it or mentions it.
         let unbounded = "x(?:a|aa){2,}z";
+        let described = |choice| {
+            Subject::compile(unbounded, &config, choice, &mut new_memory())
+                .map(|s| s.describe_backends())
+                .map_err(|e| e.to_string())
+        };
         assert_eq!(
-            tiers(unbounded, TierChoice::Except(3)).as_deref(),
-            Ok("[0, 4, grouped]")
+            described(TierChoice::Except(3)).as_deref(),
+            Ok("[0, 4, grouped] auto=grouped")
         );
-        assert!(tiers(unbounded, TierChoice::Sparse).is_err());
+        assert_eq!(
+            described(TierChoice::All).as_deref(),
+            Ok("[0, 3, 4, grouped] auto=grouped")
+        );
+        assert!(
+            described(TierChoice::Sparse)
+                .unwrap_err()
+                .contains("unbounded")
+        );
         assert_eq!(
             TierChoice::new(Some(3), None, false, false),
             TierChoice::Only(3)

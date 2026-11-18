@@ -1941,3 +1941,130 @@ fn count_free_step_finds_matches() {
     assert!(!s.ismatch());
     assert!(s.finish(&re, &mut scratch));
 }
+
+/// Each rejection of a counter's bounds says what was checked: bounds the
+/// lists are not defined for, a maximum too large for a `u32`, and a row
+/// longer than a `u16` length whatever the limit asks.
+#[test]
+fn bounds_rejections_name_their_check() {
+    let re = sparse_forced("x(a|aa){2,5}z");
+    let mut structure = analysis::structure(
+        &re.states,
+        &re.byte_tables,
+        re.start,
+        re.num_counters,
+        &[],
+        &Limits::DEFAULT,
+    )
+    .unwrap();
+    let mut with_bounds = |bounds, limits: &SparseLimits| {
+        structure.bounds[0] = Some(bounds);
+        analyze(
+            &re.states,
+            &re.classes,
+            &re.byte_tables,
+            re.start,
+            Ok(&structure),
+            limits,
+        )
+        .map(|_| ())
+    };
+    let default = SparseLimits::DEFAULT;
+    assert_eq!(
+        with_bounds((3, 2), &default),
+        Err(SparseRejection::UnsupportedBounds {
+            counter: 0,
+            min: 3,
+            max: 2
+        })
+    );
+    assert_eq!(
+        with_bounds((0, 0), &default),
+        Err(SparseRejection::UnsupportedBounds {
+            counter: 0,
+            min: 0,
+            max: 0
+        })
+    );
+    let huge = u32::MAX as usize;
+    assert_eq!(
+        with_bounds((1, huge), &default),
+        Err(SparseRejection::BoundsTooLarge {
+            counter: 0,
+            max: huge
+        })
+    );
+    assert_eq!(
+        with_bounds((1, usize::MAX), &default),
+        Err(SparseRejection::UnboundedCounter { counter: 0 })
+    );
+    // The limit reported is the one that was applied.
+    let unlimited = SparseLimits {
+        max_reps: usize::MAX,
+        max_slots: usize::MAX,
+        ..default
+    };
+    assert_eq!(
+        with_bounds((70_000, 70_000), &unlimited),
+        Err(SparseRejection::TooManyRepresentatives {
+            counter: 0,
+            needed: 70_000,
+            limit: u16::MAX as usize
+        })
+    );
+    assert_eq!(with_bounds((60_000, 60_000), &unlimited), Ok(()));
+}
+
+/// The analysis budget covers the shared structure and is checked on its
+/// own, before that structure is built.
+#[test]
+fn analysis_budget_is_checked_before_the_structure() {
+    let (states, counters) = (1000, 3);
+    let bytes = sparse_analysis_bytes(states, counters);
+    assert!(bytes > analysis::analysis_bytes(states, counters));
+    let at = SparseLimits {
+        max_analysis_bytes: bytes,
+        ..SparseLimits::DEFAULT
+    };
+    assert_eq!(analysis_budget(states, counters, &at), Ok(()));
+    let below = SparseLimits {
+        max_analysis_bytes: bytes - 1,
+        ..SparseLimits::DEFAULT
+    };
+    assert_eq!(
+        analysis_budget(states, counters, &below),
+        Err(SparseRejection::AnalysisTooLarge {
+            bytes,
+            limit: bytes - 1
+        })
+    );
+}
+
+/// Rebinding to the same regex is a reset: only the active rows are
+/// cleared, and the stream is as good as new.
+#[test]
+fn rebind_to_the_same_regex_is_a_reset() {
+    let re = sparse_forced("x(a|aa|b){900,1000}z");
+    let mut scratch = SparseScratch::new();
+    let mut s = SparseStream::new(&re, &mut scratch).unwrap();
+    let fresh = format!("{}", s.display(&re));
+    let bytes = s.memory_bytes();
+    for round in 0..3 {
+        let mut input = b"qqx".to_vec();
+        input.extend(std::iter::repeat_n(b'a', 400 + round * 300));
+        s.chunk(&re, &mut scratch, &input);
+        s.check_invariants(&re, "before rebind");
+        if round == 1 {
+            s.finish(&re, &mut scratch);
+        }
+        s.rebind(&re, &mut scratch).unwrap();
+        s.check_invariants(&re, "after rebind");
+        assert_eq!(format!("{}", s.display(&re)), fresh, "round {round}");
+        assert_eq!(s.memory_bytes(), bytes);
+    }
+    let mut input = b"x".to_vec();
+    input.extend(std::iter::repeat_n(b'a', 950));
+    input.push(b'z');
+    s.chunk(&re, &mut scratch, &input);
+    assert!(s.finish(&re, &mut scratch));
+}

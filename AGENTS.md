@@ -76,8 +76,8 @@ requests the analysis; `MatcherMemory::matcher_sparse()` and
 `SparseStream` force it, and never fall back.  It must agree with the NFA
 exactly; its rows are not the NFA's configurations but stand for them
 (same answers to every future exit), which the tests check against the
-exact rows.  The tests, the checking commands, the proptests and the
-cargo-fuzz targets run it on everything it admits.
+exact rows.  The tests, the proptests and the cargo-fuzz targets run it on
+everything it admits; the checking commands do with `--sparse-counting`.
 
 Repetitions are unrolled up to `max_unroll_states` and same-body
 repetitions merged, so a pattern may need counters only with unrolling or
@@ -142,9 +142,10 @@ Options go after the command name; `rethoc <command> --help` lists them.
 `brute`, `fuzz`, `shrink` and `sweep` check rethoc against the `regex`
 crate: the NFA, every eligible tier and the grouped NFA when it admits
 the pattern (`grouped` in the backend lists, with the rejection reason
-when it does not) and its sparse counting variant likewise (`sparse`),
-each fed whole and byte by byte. `--grouped-nfa` checks only the NFA and
-the grouped NFA; `--sparse-counting` only the NFA and the sparse variant.
+when it does not), each fed whole and byte by byte. `--grouped-nfa`
+checks only the NFA and the grouped NFA. The experimental sparse counting
+variant is checked only on request: `--sparse-counting` checks the NFA and
+that variant (`sparse`), and nothing else compiles its analysis.
 Unless given `--unroll-limit` or `--no-merge`, they compile each pattern
 three ways: default, unrolling off, unrolling and merging off. Inputs are
 read and printed with byte escapes (`\n`, `\xNN`), and every mismatch

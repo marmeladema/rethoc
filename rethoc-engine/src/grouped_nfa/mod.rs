@@ -60,6 +60,7 @@
 //! boundary.
 
 mod analysis;
+mod bitmap;
 mod exact;
 pub(crate) mod sparse;
 pub mod stats;

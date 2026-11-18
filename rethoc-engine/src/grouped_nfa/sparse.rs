@@ -53,8 +53,9 @@ use std::fmt;
 
 use super::analysis::{
     CountFreeNode, MAX_COUNT_FREE_WORDS, Rejection, Scope, Structure, analysis_bytes,
-    closure_is_count_free, count_free_tables,
+    closure_is_count_free, count_free_tables, start_bytes,
 };
+use super::bitmap::{self, activate, for_each_active};
 use super::exact::{Boundary, BoundaryCtx, Sweep, accepts, by_width};
 use super::stats::stat;
 use super::{CountFreeTables, NO_NODE, NodeIdx, SparseCountingError};
@@ -101,6 +102,9 @@ pub enum SparseRejection {
     /// The counter is unbounded (`{min,}`): its saturated counts need a
     /// mapping of their own.
     UnboundedCounter { counter: u8 },
+    /// Bounds the lists are not defined for (`max == 0`, `min > max`).
+    /// The shared structure rejects them first.
+    UnsupportedBounds { counter: u8, min: usize, max: usize },
     /// Bounds whose counts do not fit the `u32` representatives.
     BoundsTooLarge { counter: u8, max: usize },
     /// The counter needs more representatives per row than the limit.
@@ -132,6 +136,12 @@ impl fmt::Display for SparseRejection {
                 f,
                 "counter {counter} is unbounded: the sparse variant admits finite counters only"
             ),
+            Self::UnsupportedBounds { counter, min, max } => {
+                write!(
+                    f,
+                    "counter {counter} has unsupported bounds {{{min},{max}}}"
+                )
+            }
             Self::BoundsTooLarge { counter, max } => {
                 write!(
                     f,
@@ -504,48 +514,30 @@ pub(crate) fn sparse_analysis_bytes(states: usize, num_counters: usize) -> usize
         + states * (size_of::<u32>() + 2 * size_of::<bool>() + size_of::<StateIdx>())
 }
 
-/// The bytes that some consuming state of the zero-width closure of
-/// `start` accepts, or `None` when that closure reaches an assertion or
-/// `Match` (it then depends on the boundary, or matches).
-fn start_bytes(
-    states: &[State],
-    classes: &[ByteClassBits],
-    byte_tables: &[ByteMap],
-    start: StateIdx,
-) -> Option<Box<[bool; 256]>> {
-    let mut starts = Box::new([false; 256]);
-    let mut seen = vec![false; states.len()];
-    let mut stack = vec![start];
-    while let Some(idx) = stack.pop() {
-        if std::mem::replace(&mut seen[idx.idx()], true) {
-            continue;
-        }
-        match states[idx] {
-            State::Assert { .. } | State::Match => return None,
-            State::Split { out, out1 } => stack.extend([out, out1]),
-            State::CounterInstance { out, .. } => stack.push(out),
-            // Not reachable without a consumed byte in an admitted graph
-            // (it would close a zero-width cycle); were it, the closure
-            // would not be the fixed set this table stands for.
-            State::CounterIncrement { .. } => return None,
-            State::ByteTable { table } => {
-                for b in 0..=255u8 {
-                    starts[b as usize] |= byte_tables[table][b] != StateIdx::NONE;
-                }
-            }
-            ref state => {
-                for b in 0..=255u8 {
-                    starts[b as usize] |= accepts(classes, state, b);
-                }
-            }
-        }
+/// Check the transient analysis budget for a state array of `states`
+/// states and `num_counters` counters.  It covers the shared
+/// [`Structure`] too, so it must be called **before** the structure is
+/// built for the sparse variant alone: a budget is checked before the
+/// arrays it bounds are allocated.
+pub(crate) fn analysis_budget(
+    states: usize,
+    num_counters: usize,
+    limits: &SparseLimits,
+) -> Result<(), SparseRejection> {
+    let bytes = sparse_analysis_bytes(states, num_counters);
+    if bytes > limits.max_analysis_bytes {
+        return Err(SparseRejection::AnalysisTooLarge {
+            bytes,
+            limit: limits.max_analysis_bytes,
+        });
     }
-    Some(starts)
+    Ok(())
 }
 
 /// Lay out the sparse rows of a proven [`Structure`] and build the plan,
 /// or say why not.  `structure` is the outcome of
-/// [`analysis::structure`](super::analysis::structure) on `states`.
+/// [`analysis::structure`](super::analysis::structure) on `states`, built
+/// after [`analysis_budget`] passed.
 pub(crate) fn analyze(
     states: &[State],
     classes: &[ByteClassBits],
@@ -560,13 +552,9 @@ pub(crate) fn analyze(
         order,
         bounds,
     } = structure;
-    let analysis = sparse_analysis_bytes(states.len(), bounds.len());
-    if analysis > limits.max_analysis_bytes {
-        return Err(SparseRejection::AnalysisTooLarge {
-            bytes: analysis,
-            limit: limits.max_analysis_bytes,
-        });
-    }
+    // The caller checked this before the structure was built
+    // ([`analysis_budget`]); here it guards the arrays of this function.
+    analysis_budget(states.len(), bounds.len(), limits)?;
 
     // Spacing and capacity of every counter with a reachable increment.
     let mut shape: Vec<Option<(u32, u32)>> = vec![None; bounds.len()];
@@ -577,14 +565,19 @@ pub(crate) fn analyze(
             return Err(SparseRejection::UnboundedCounter { counter });
         }
         let Some((k, d)) = representatives(min, max) else {
-            return Err(SparseRejection::BoundsTooLarge { counter, max });
+            return Err(if max == 0 || min > max {
+                SparseRejection::UnsupportedBounds { counter, min, max }
+            } else {
+                SparseRejection::BoundsTooLarge { counter, max }
+            });
         };
-        // A row length is a `u16`.
-        if d > limits.max_reps.min(u16::MAX as usize) {
+        // A row length is a `u16`, whatever the limit says.
+        let limit = limits.max_reps.min(u16::MAX as usize);
+        if d > limit {
             return Err(SparseRejection::TooManyRepresentatives {
                 counter,
                 needed: d,
-                limit: limits.max_reps,
+                limit,
             });
         }
         shape[c] = Some((k, d as u32));
@@ -730,8 +723,9 @@ pub(crate) fn analyze(
                 SparseOp::Split { out, out1 } => CountFreeNode::ZeroWidth([out.node, out1.node]),
                 SparseOp::Instance { out, .. } => CountFreeNode::ZeroWidth([out.node, NO_NODE]),
                 SparseOp::Match => CountFreeNode::Match,
-                SparseOp::Edge { .. } => CountFreeNode::Edge(nodes[n].state),
-                SparseOp::Table(t) => CountFreeNode::Table(t),
+                SparseOp::Edge { .. } | SparseOp::Table(_) => {
+                    CountFreeNode::Consumer(nodes[n].state)
+                }
             },
             node_of[start.idx()],
             a,
@@ -783,27 +777,6 @@ pub(crate) fn analyze(
 // bytes that cannot start anything ([`SparsePlan::idle`]), and a frontier
 // where no counter has counted yet takes the count-free step, by
 // compile-time bitmaps ([`SparsePlan::count_free`]).
-
-/// Plans of at most this many rows always take the full sweep; larger ones
-/// take it when at least an eighth of their rows are active.
-const SMALL_PLAN_ROWS: usize = 32;
-
-#[inline(always)]
-fn activate(active: &mut [u64], n: NodeIdx) {
-    active[n as usize / 64] |= 1 << (n % 64);
-}
-
-/// Call `f` for every active node, in increasing order.
-#[inline(always)]
-fn for_each_active(active: &[u64], mut f: impl FnMut(NodeIdx)) {
-    for (w, &word) in active.iter().enumerate() {
-        let mut bits = word;
-        while bits != 0 {
-            f((w * 64) as NodeIdx + bits.trailing_zeros());
-            bits &= bits - 1;
-        }
-    }
-}
 
 /// `to[dst..dst + count] = from[src..src + count]`.  Rows are a few values
 /// long: a loop, not a `memcpy` call.
@@ -1377,7 +1350,9 @@ impl SparseStream {
     /// Return to the state of a fresh stream, keeping the allocation.
     pub fn reset(&mut self, regex: &Regex, scratch: &mut SparseScratch) {
         let plan = self.plan(regex);
-        self.len.fill(0);
+        // Only the active rows hold anything.
+        let len = &mut self.len;
+        for_each_active(&self.active, |n| len[n as usize] = 0);
         self.active.fill(0);
         self.live = 0;
         self.unit = true;
@@ -1398,8 +1373,14 @@ impl SparseStream {
         scratch: &mut SparseScratch,
     ) -> Result<(), SparseCountingError> {
         let plan = regex.sparse_plan()?;
+        if regex.id == self.regex_id {
+            // Clears only the active rows.
+            self.reset(regex, scratch);
+            return Ok(());
+        }
         self.regex_id = regex.id;
-        // Exactly the plan's size when an allocation has to grow.
+        // Another plan: every length and bit is cleared, at exactly the
+        // plan's size when an allocation has to grow.
         fn fit<T: Clone + Default>(v: &mut Vec<T>, len: usize) {
             v.clear();
             v.reserve_exact(len);
@@ -1408,7 +1389,14 @@ impl SparseStream {
         fit(&mut self.len, plan.rows());
         fit(&mut self.vals, plan.slots);
         fit(&mut self.active, plan.active_words);
-        self.reset(regex, scratch);
+        self.live = 0;
+        self.unit = true;
+        self.prev = None;
+        self.at_start = true;
+        self.matched = false;
+        self.finished = false;
+        scratch.prepare(plan);
+        self.provisional(plan, scratch, Boundary::UnknownNext);
         Ok(())
     }
 
@@ -1430,7 +1418,6 @@ impl SparseStream {
             None => plan.idle.as_deref().filter(|_| auto),
         };
         let prefilter = &regex.prefilter;
-        let has_prefilter = !matches!(prefilter, crate::Prefilter::None);
         let mut i = 0;
         while i < input.len() {
             if self.live == 0
@@ -1443,22 +1430,7 @@ impl SparseStream {
                 // may reach `Match`; the stream then matched when it was
                 // made and never gets here.)
                 let from = i;
-                let found = loop {
-                    let rest = &input[i..];
-                    let off = if has_prefilter {
-                        prefilter.find(rest)
-                    } else {
-                        rest.iter().position(|&b| starts[b as usize])
-                    };
-                    match off {
-                        Some(off) if starts[rest[off] as usize] => break Some(i + off),
-                        Some(off) => i += off + 1,
-                        None => break None,
-                    }
-                    if i >= input.len() {
-                        break None;
-                    }
-                };
+                let found = bitmap::next_start(prefilter, starts, input, i);
                 let next = found.unwrap_or(input.len());
                 stat!(bytes_skipped += next - from);
                 #[cfg(test)]
@@ -1476,7 +1448,7 @@ impl SparseStream {
             }
             if let Some(tables) = tables
                 && self.unit
-                && self.all_count_free(tables)
+                && bitmap::all_count_free(&self.active, tables)
             {
                 let (next, found) = by_width!(tables.a, |A| self
                     .count_free_run::<A>(plan, tables, regex, input, i));
@@ -1498,64 +1470,23 @@ impl SparseStream {
         }
         if let Some(tables) = tables
             && self.unit
-            && self.all_count_free(tables)
+            && bitmap::all_count_free(&self.active, tables)
         {
             // The closure of such a frontier meets no assertion: it is the
             // same whatever comes next.
-            self.matched |= by_width!(tables.a, |A| self.count_free_matches::<A>(tables));
+            self.matched |= by_width!(tables.a, |A| bitmap::matches::<A>(&self.active, tables));
             return;
         }
         self.provisional(plan, scratch, Boundary::UnknownNext);
     }
 
-    /// Whether every active raw node is count-free.
-    #[inline(always)]
-    fn all_count_free(&self, tables: &CountFreeTables) -> bool {
-        self.active
-            .iter()
-            .zip(tables.statics.iter())
-            .all(|(r, s)| r & !s == 0)
-    }
-
-    /// The closure bitmap of the unit, count-free frontier `active`, of
-    /// `A` words: the union of the closures of its nodes and of the start.
-    #[inline(always)]
-    fn count_free_closure<const A: usize>(
-        closure: &[u64],
-        start: [u64; A],
-        active: &[u64; A],
-    ) -> [u64; A] {
-        let mut clos = start;
-        for (i, &word) in active.iter().enumerate() {
-            let mut bits = word;
-            while bits != 0 {
-                let n = i * 64 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let c = &closure[n * A..][..A];
-                for j in 0..A {
-                    clos[j] |= c[j];
-                }
-            }
-        }
-        clos
-    }
-
-    /// Whether the closure of a unit, count-free frontier reaches `Match`.
-    fn count_free_matches<const A: usize>(&self, tables: &CountFreeTables) -> bool {
-        let active: [u64; A] = self.active[..A].try_into().unwrap();
-        let start = tables.start_closure[..A].try_into().unwrap();
-        let clos = Self::count_free_closure::<A>(&tables.closure, start, &active);
-        (0..A).any(|i| clos[i] & tables.matches[i] != 0)
-    }
-
     /// [`step`](Self::step) on a unit, count-free frontier, by bitmaps of
-    /// `A` words, from `input[i]` while the frontier stays nonempty and
-    /// count-free (it stays unit: every row of such a closure is a unit
-    /// row, and consuming moves rows whole).  The frontier is only its
-    /// bitmap, kept in registers: the rows are written once, when the run
-    /// ends, so they are exact at every call boundary and before every
-    /// general step.  Returns the next byte's index and whether a match
-    /// was found (before the byte at that index).
+    /// `A` words ([`bitmap::run`]), from `input[i]` while the frontier
+    /// stays nonempty and count-free (it stays unit).  The rows are
+    /// written once, when the run ends, so they are exact at every call
+    /// boundary and before every general step.  Returns the next byte's
+    /// index and whether a match was found (before the byte at that
+    /// index).
     #[inline(always)]
     fn count_free_run<const A: usize>(
         &mut self,
@@ -1563,87 +1494,44 @@ impl SparseStream {
         tables: &CountFreeTables,
         regex: &Regex,
         input: &[u8],
-        mut i: usize,
+        i: usize,
     ) -> (usize, bool) {
-        debug_assert!(self.unit && self.all_count_free(tables));
-        let first = i;
+        debug_assert!(self.unit && bitmap::all_count_free(&self.active, tables));
         let nodes: &[SparseNode] = &plan.nodes;
         let node_of: &[NodeIdx] = &plan.node_of;
         let byte_tables = &regex.byte_tables;
-        let (closure, accepts): (&[u64], &[u64]) = (&tables.closure, &tables.accept);
-        let start: [u64; A] = tables.start_closure[..A].try_into().unwrap();
-        let matches: [u64; A] = tables.matches[..A].try_into().unwrap();
-        let statics: [u64; A] = tables.statics[..A].try_into().unwrap();
-        let entry: [u64; A] = self.active[..A].try_into().unwrap();
-        let mut active = entry;
-        let found = loop {
-            let b = input[i];
-            let clos = Self::count_free_closure::<A>(closure, start, &active);
-            if (0..A).any(|k| clos[k] & matches[k] != 0) {
-                break true;
-            }
-            let mut next = [0u64; A];
-            let mut set = |n: NodeIdx| {
-                // `min` folds to 0 at one word.
-                next[(n as usize / 64).min(A - 1)] |= 1 << (n % 64);
-            };
-            let accept = &accepts[b as usize * A..][..A];
-            for k in 0..A {
-                let mut fire = clos[k] & accept[k];
-                while fire != 0 {
-                    let c = k * 64 + fire.trailing_zeros() as usize;
-                    fire &= fire - 1;
-                    match nodes[c].op {
-                        SparseOp::Edge { out, out_exit } => {
-                            set(out.node);
-                            if out_exit != Succ::NONE {
-                                set(out_exit.node);
-                            }
-                        }
-                        SparseOp::Table(t) => set(node_of[byte_tables[t][b].idx()]),
-                        _ => unreachable!("only consumers accept bytes"),
+        let run = bitmap::run::<A>(tables, &self.active, input, i, |c, b, next| {
+            match nodes[c].op {
+                SparseOp::Edge { out, out_exit } => {
+                    bitmap::set(next, out.node);
+                    if out_exit != Succ::NONE {
+                        bitmap::set(next, out_exit.node);
                     }
                 }
+                SparseOp::Table(t) => bitmap::set(next, node_of[byte_tables[t][b].idx()]),
+                _ => unreachable!("only consumers accept bytes"),
             }
-
-            active = next;
-            i += 1;
-            if i == input.len()
-                || active.iter().all(|&w| w == 0)
-                || (0..A).any(|k| active[k] & !statics[k] != 0)
-            {
-                break false;
+        });
+        // A unit row is one length and, for a counted row, the value one:
+        // only the rows that changed are stored.
+        let (len, vals) = (&mut *self.len, &mut *self.vals);
+        run.for_each_change(|n, on| {
+            len[n] = u16::from(on);
+            if on && nodes[n].cap > 0 {
+                vals[nodes[n].off as usize] = 1;
             }
-        };
-        // The rows are written once per run: a unit row is one length,
-        // and for a counted row the value one, so only the rows that
-        // changed are stored.
-        for k in 0..A {
-            for (mut bits, on) in [
-                (entry[k] & !active[k], false),
-                (active[k] & !entry[k], true),
-            ] {
-                while bits != 0 {
-                    let n = k * 64 + bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    self.len[n] = u16::from(on);
-                    if on && nodes[n].cap > 0 {
-                        self.vals[nodes[n].off as usize] = 1;
-                    }
-                }
-            }
-        }
-        self.active[..A].copy_from_slice(&active);
-        self.live = active.iter().map(|w| w.count_ones()).sum();
+        });
+        self.active[..A].copy_from_slice(&run.active);
+        self.live = run.live();
         self.unit = true;
-        if i > first {
-            self.prev = Some(input[i - 1]);
+        if run.next > i {
+            self.prev = Some(input[run.next - 1]);
             self.at_start = false;
         }
-        if found {
+        if run.found {
             self.matched = true;
         }
-        (i, found)
+        (run.next, run.found)
     }
 
     /// Signal end of input and return the final result.
@@ -1705,11 +1593,7 @@ impl SparseStream {
     /// Whether this byte runs the full sweep.
     #[inline]
     fn full_sweep(&self, plan: &SparsePlan, sweep: Sweep) -> bool {
-        match sweep {
-            Sweep::Full => true,
-            Sweep::Active => false,
-            Sweep::Auto => plan.rows() <= SMALL_PLAN_ROWS || self.live as usize * 8 >= plan.rows(),
-        }
+        bitmap::full_sweep(sweep, plan.rows(), self.live)
     }
 
     /// A closure that only looks for a match: the raw frontier stays as
