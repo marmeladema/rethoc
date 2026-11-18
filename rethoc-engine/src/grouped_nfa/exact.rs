@@ -769,21 +769,24 @@ impl GroupedStream {
             .as_deref()
             .filter(|_| scratch.sweep == Sweep::Auto);
         let mut i = 0;
+        // An idle stream mostly stays idle for the whole chunk.  That case
+        // is decided here, before the loop: whatever the compiler sets up
+        // ahead of the loop for the steps inside it, a call that only
+        // skips does not pay for.
+        if let Some(tables) = tables
+            && self.live == 0
+        {
+            let Some(next) = self.skip_idle(prefilter, &tables.starts, input, 0) else {
+                return;
+            };
+            i = next;
+        }
         while i < input.len() {
             if let Some(tables) = tables {
                 if self.live == 0 {
-                    // Find the next byte that starts something: the others
-                    // leave an empty frontier empty.
-                    let found = bitmap::next_start(prefilter, &tables.starts, input, i);
-                    let next = found.unwrap_or(input.len());
-                    stat!(bytes_skipped += next - i);
-                    if next > i {
-                        self.prev = Some(input[next - 1]);
-                        self.at_start = false;
-                    }
-                    if found.is_none() {
+                    let Some(next) = self.skip_idle(prefilter, &tables.starts, input, i) else {
                         return;
-                    }
+                    };
                     i = next;
                 }
                 if self.unit && bitmap::all_count_free(&self.raw_active, tables) {
@@ -835,12 +838,38 @@ impl GroupedStream {
         self.provisional(plan, scratch, Boundary::UnknownNext);
     }
 
+    /// With an empty frontier: skip to the next byte at or after `i` that
+    /// starts something (the others leave an empty frontier empty) and
+    /// return its index, or `None` when the chunk has none.  Keeps the
+    /// boundary: the previous byte is the last one skipped.
+    #[inline(always)]
+    fn skip_idle(
+        &mut self,
+        prefilter: &crate::Prefilter,
+        starts: &[bool; 256],
+        input: &[u8],
+        i: usize,
+    ) -> Option<usize> {
+        let Some(next) = bitmap::next_start(prefilter, starts, input, i) else {
+            stat!(bytes_skipped += input.len() - i);
+            self.prev = input.last().copied();
+            self.at_start = false;
+            return None;
+        };
+        stat!(bytes_skipped += next - i);
+        if next > i {
+            self.prev = Some(input[next - 1]);
+            self.at_start = false;
+        }
+        Some(next)
+    }
+
     /// [`step`](Self::step) on a unit, count-free frontier, by bitmaps of
     /// `A` words ([`bitmap::run`]), from `input[i]` while the frontier
     /// stays nonempty and count-free (it stays unit).  The raw rows are
     /// written once, when the run ends.  Returns the next byte's index and
     /// whether a match was found (before the byte at that index).
-    #[inline(always)]
+    #[inline(never)]
     fn count_free_run<const A: usize>(
         &mut self,
         plan: &GroupedNfaPlan,

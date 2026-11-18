@@ -453,13 +453,13 @@ impl fmt::Display for DumpRegex<'_> {
         }
 
         // -- Grouped NFA (when analysed) ---------------------------------------
-        match r.grouped_nfa.as_deref() {
+        match r.grouped_plan_or_rejection() {
             None => {}
-            Some(crate::grouped_nfa::GroupedNfa::Rejected(reason)) => {
+            Some(Err(reason)) => {
                 writeln!(f, "Grouped NFA: rejected: {reason}")?;
                 writeln!(f)?;
             }
-            Some(crate::grouped_nfa::GroupedNfa::Admitted(plan)) => {
+            Some(Ok(plan)) => {
                 writeln!(f, "Grouped NFA: admitted")?;
                 write!(f, "{plan}")?;
                 writeln!(f)?;
@@ -467,13 +467,13 @@ impl fmt::Display for DumpRegex<'_> {
         }
 
         // -- Sparse counting (when requested) ----------------------------------
-        match r.sparse_counting.as_deref() {
+        match r.sparse_plan_or_rejection() {
             None => {}
-            Some(crate::grouped_nfa::SparseCounting::Rejected(reason)) => {
+            Some(Err(reason)) => {
                 writeln!(f, "Sparse counting (experimental): rejected: {reason}")?;
                 writeln!(f)?;
             }
-            Some(crate::grouped_nfa::SparseCounting::Admitted(plan)) => {
+            Some(Ok(plan)) => {
                 writeln!(f, "Sparse counting (experimental): admitted")?;
                 write!(f, "{plan}")?;
                 writeln!(f)?;

@@ -1419,31 +1419,25 @@ impl SparseStream {
         };
         let prefilter = &regex.prefilter;
         let mut i = 0;
+        // An idle stream mostly stays idle for the whole chunk.  That case
+        // is decided here, before the loop: whatever the compiler sets up
+        // ahead of the loop for the steps inside it, a call that only
+        // skips does not pay for.
+        if self.live == 0
+            && let Some(starts) = starts
+        {
+            let Some(next) = self.skip_idle(scratch, prefilter, starts, input, 0) else {
+                return;
+            };
+            i = next;
+        }
         while i < input.len() {
             if self.live == 0
                 && let Some(starts) = starts
             {
-                // The closure of an empty frontier is the start closure,
-                // the same at every boundary: find the next byte that one
-                // of its consuming states accepts.  The others leave the
-                // frontier empty.  (With the count-free tables that closure
-                // may reach `Match`; the stream then matched when it was
-                // made and never gets here.)
-                let from = i;
-                let found = bitmap::next_start(prefilter, starts, input, i);
-                let next = found.unwrap_or(input.len());
-                stat!(bytes_skipped += next - from);
-                #[cfg(test)]
-                {
-                    scratch.passes[2] += next - from;
-                }
-                if next > from {
-                    self.prev = Some(input[next - 1]);
-                    self.at_start = false;
-                }
-                if found.is_none() {
+                let Some(next) = self.skip_idle(scratch, prefilter, starts, input, i) else {
                     return;
-                }
+                };
                 i = next;
             }
             if let Some(tables) = tables
@@ -1480,6 +1474,46 @@ impl SparseStream {
         self.provisional(plan, scratch, Boundary::UnknownNext);
     }
 
+    /// With an empty frontier: skip to the next byte at or after `i` that
+    /// one of the start closure's consuming states accepts, and return its
+    /// index, or `None` when the chunk has none.  That closure is the same
+    /// at every boundary, and the other bytes leave the frontier empty.
+    /// (With the count-free tables the closure may reach `Match`; the
+    /// stream then matched when it was made and never gets here.)  Keeps
+    /// the boundary: the previous byte is the last one skipped.
+    #[inline(always)]
+    fn skip_idle(
+        &mut self,
+        scratch: &mut SparseScratch,
+        prefilter: &crate::Prefilter,
+        starts: &[bool; 256],
+        input: &[u8],
+        i: usize,
+    ) -> Option<usize> {
+        // Only the tests count the bytes skipped.
+        let _ = &scratch;
+        let Some(next) = bitmap::next_start(prefilter, starts, input, i) else {
+            stat!(bytes_skipped += input.len() - i);
+            #[cfg(test)]
+            {
+                scratch.passes[2] += input.len() - i;
+            }
+            self.prev = input.last().copied();
+            self.at_start = false;
+            return None;
+        };
+        stat!(bytes_skipped += next - i);
+        #[cfg(test)]
+        {
+            scratch.passes[2] += next - i;
+        }
+        if next > i {
+            self.prev = Some(input[next - 1]);
+            self.at_start = false;
+        }
+        Some(next)
+    }
+
     /// [`step`](Self::step) on a unit, count-free frontier, by bitmaps of
     /// `A` words ([`bitmap::run`]), from `input[i]` while the frontier
     /// stays nonempty and count-free (it stays unit).  The rows are
@@ -1487,7 +1521,7 @@ impl SparseStream {
     /// boundary and before every general step.  Returns the next byte's
     /// index and whether a match was found (before the byte at that
     /// index).
-    #[inline(always)]
+    #[inline(never)]
     fn count_free_run<const A: usize>(
         &mut self,
         plan: &SparsePlan,
