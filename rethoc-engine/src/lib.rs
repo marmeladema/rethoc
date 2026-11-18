@@ -75,6 +75,9 @@ use dfa::{
     compute_tier2_analysis, compute_tier3_analysis,
 };
 pub use dump::DumpRegex;
+/// Operation counters of the grouped NFA, for the research probes.
+#[doc(hidden)]
+pub use grouped_nfa::stats as grouped_op_stats;
 #[doc(hidden)]
 pub use grouped_nfa::{
     GroupedMatcher, GroupedNfaError, GroupedScratch, GroupedStream, Rejection as GroupedRejection,

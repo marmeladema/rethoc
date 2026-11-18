@@ -12,6 +12,11 @@ memchr = "2.8.0"
 regex-syntax = "0.8.9"
 serde = { version = "1", features = ["derive"] }
 
+[features]
+# Count the grouped NFA's row operations (`grouped_op_stats`), for the
+# research probes.  Slows matching down: never time a build with it.
+op-stats = []
+
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 gungraun = "0.20.0"
