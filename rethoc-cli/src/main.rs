@@ -10,7 +10,7 @@ use std::process;
 use std::str::FromStr;
 
 use bpaf::{Args, Bpaf};
-use rethoc_engine::{GroupedNfaMode, Regex, RegexConfig};
+use rethoc_engine::{AnyMatcher, GroupedNfaMode, MatcherMemory, Regex, RegexConfig};
 
 mod check;
 
@@ -189,6 +189,12 @@ enum Opts {
     /// Print matching lines of a file, or of stdin (exits 1 if none matches)
     #[bpaf(command)]
     Grep {
+        /// Force an execution tier (0 = NFA, 1-4 = DFA tiers)
+        #[bpaf(long, argument("TIER"))]
+        tier: Option<u8>,
+        /// Force the grouped NFA
+        #[bpaf(long)]
+        grouped_nfa: bool,
         /// Print nothing; stop at the first matching line
         #[bpaf(short, long)]
         quiet: bool,
@@ -415,9 +421,39 @@ fn run_match(
     }
 }
 
-fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig, quiet: bool) {
+fn grep_matcher<'a>(
+    memory: &'a mut MatcherMemory,
+    regex: &'a Regex,
+    tier: Option<u8>,
+    grouped: bool,
+) -> AnyMatcher<'a> {
+    let result = match tier {
+        Some(tier) => memory.matcher_for_tier(regex, tier),
+        None if grouped => memory.matcher_grouped(regex).map_err(|e| e.to_string()),
+        None => return memory.matcher(regex),
+    };
+    result.unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    })
+}
+
+fn run_grep(
+    pattern: &str,
+    file: Option<&str>,
+    mut config: RegexConfig,
+    quiet: bool,
+    tier: Option<u8>,
+    grouped: bool,
+) {
+    if grouped {
+        config.grouped_nfa = GroupedNfaMode::Always;
+    }
     let regex = parse_pattern(pattern, config);
     let mut memory = check::new_memory();
+    if tier.is_some() || grouped {
+        grep_matcher(&mut memory, &regex, tier, grouped);
+    }
 
     let reader: Box<dyn BufRead> = match file {
         Some(path) => {
@@ -439,7 +475,7 @@ fn run_grep(pattern: &str, file: Option<&str>, config: RegexConfig, quiet: bool)
             eprintln!("error: reading input: {e}");
             process::exit(1);
         });
-        let mut matcher = memory.matcher(&regex);
+        let mut matcher = grep_matcher(&mut memory, &regex, tier, grouped);
         matcher.chunk(line.as_bytes());
         if matcher.finish() {
             if !quiet {
@@ -503,11 +539,24 @@ fn main() {
             )
         }
         Opts::Grep {
+            tier,
+            grouped_nfa,
             quiet,
             compile,
             pattern,
             file,
-        } => run_grep(&pattern, file.as_deref(), compile.config(), quiet),
+        } => {
+            validate_tier(tier);
+            validate_grouped(grouped_nfa, tier, None);
+            run_grep(
+                &pattern,
+                file.as_deref(),
+                compile.config(),
+                quiet,
+                tier,
+                grouped_nfa,
+            )
+        }
         Opts::Dump {
             format,
             dfa,
