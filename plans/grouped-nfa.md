@@ -1,13 +1,15 @@
 # Exact grouped NFA implementation plan
 
-Status: P0–P4 implemented in `rethoc-engine/src/grouped_nfa/` (opt-in
-`RegexConfig::grouped_nfa`; multiword and saturating count domains within the
-8,192-word frontier budget; all assertion kinds by raw replay; CLI, checkers,
-proptests, cargo-fuzz and the probe run it; active-row scheduling and
-prefilter skipping while idle). P4's deployment measurements (allocation and
-operation counters, many rules × many streams) remain open. P5 below now
-specifies the proposed automatic-selection implementation; see "P4
-findings" and "Idle cost". Designed against main `b0bb981e8c6cba7b23df176d79f741c3b61089a7`;
+Status at `c84282e`: P0–P5 implemented in `rethoc-engine/src/grouped_nfa/`.
+Automatic selection is Tier 1 → Tier 2 → grouped → Tier 4 → NFA; Tier 3 is
+explicit-only. `GroupedNfaMode` controls analysis/participation. Multiword and
+saturating domains, raw assertion replay, active rows, idle skipping and
+count-free stepping have landed. P4's deployment measurements (allocation and
+operation counters, many rules × many streams) remain open. The next experiment
+is [sparse counting sets](sparse-counting-sets.md); it does not change the exact
+engine's semantics or default selection. See "P4 findings", "Idle cost" and
+"P5 implementation notes" for historical measurements and implementation status.
+Designed against main `b0bb981e8c6cba7b23df176d79f741c3b61089a7`;
 source references below re-checked at `d82066d`. This work does not
 investigate existing tier correctness bugs.
 
@@ -968,6 +970,10 @@ using isolated build directories, without switching another worktree's branch.
 Existing commands without grouped coverage cannot certify grouped execution.
 
 ## 9. Optional sparse extension
+
+The concrete follow-up is now [the sparse-counting experiment plan](sparse-counting-sets.md),
+including the finite positive-count mapping, profile invariant, admission limits,
+assertion gate, executable model audit and performance decision criteria.
 
 The [sparse paper](../research_notes/regex-matching-research-2020-2026/text/2026-ncma-berglund-sparse-counting-sets.md)
 separates exact grouping (Definition 12, Section 2.5) from sparse operations
