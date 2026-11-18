@@ -432,7 +432,7 @@ impl Tier4DfaCache {
             deferred_asserts: &[],
             is_match,
             is_match_at_end,
-            prev_was_word: false,
+            context: super::BoundaryContext::legacy(false),
         };
         if let Some(idx) = self.states.get_index_of(&probe) {
             return DfaStateId(idx as u32);
@@ -442,7 +442,7 @@ impl Tier4DfaCache {
             deferred_asserts: Box::new([]),
             is_match,
             is_match_at_end,
-            prev_was_word: false,
+            context: super::BoundaryContext::legacy(false),
         };
         let (idx, _) = self.states.insert_full(state);
         self.transitions.resize(

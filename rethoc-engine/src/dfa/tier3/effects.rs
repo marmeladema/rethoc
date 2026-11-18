@@ -1829,9 +1829,15 @@ mod tests {
     // Semantic tests for resolve_pending() and eval_assert_chain()
     // -----------------------------------------------------------------------
 
-    /// Build a compiled `Regex` from a pattern string (test helper).
+    /// Build a regex with the counting-tier reachability used by these
+    /// synthetic effect tests, even when the pattern has no counters.
     fn build_regex(pattern: &str) -> crate::Regex {
-        crate::Regex::new(pattern).expect("builder should accept the pattern")
+        let mut regex = crate::Regex::new(pattern).expect("builder should accept the pattern");
+        if regex.state_can_reach_match.is_empty() {
+            regex.state_can_reach_match =
+                crate::RegexBuilder::compute_can_reach_match(&regex.states.0);
+        }
+        regex
     }
 
     /// Build a compiled `Regex` with custom unroll limit (test helper).

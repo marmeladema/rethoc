@@ -68,9 +68,13 @@ cargo run --quiet -- brute --alphabet 'a' --max-len 1 'a$\B'
 
 Proposed names below are new interfaces, not existing APIs. Add a Tier 1
 analysis module, for example `dfa/tier1/analysis.rs`, analyzing the final graph
-after byte-table optimization. Store immutable metadata on `Regex` only when
-Tier 1 is eligible and assertions need it. Assertion-free patterns must not
-allocate these tables. Do not run this analysis on counter graphs.
+after byte-table optimization. Build immutable per-state metadata only when
+Tier 1 is eligible and assertions need it. Do not run this analysis on counter
+graphs. Store `Box<Tier1Assertions>` on `Regex`, with an empty entries slice
+when no analysis is needed. The outer owner is always allocated, keeping this
+field one pointer wide and avoiding optional access during matching; empty
+entries allocate no payload. Account for the boxed owner unconditionally in
+`Regex::memory_size`. A nonempty table covers every state in the compiled graph.
 
 ### One definition of context dependencies
 
@@ -142,7 +146,7 @@ can accidentally apply provisional EOF logic to the previous boundary.
 
 Given raw roots and the actual boundary context:
 
-For the mandatory assertion-free `analysis=None` path, ordinary closure Match
+For the mandatory assertion-free `analysis.is_empty()` path, ordinary closure Match
 is also the exact EOF answer: no epsilon edge depends on EOF. Use that result
 without table lookups or context-mask aggregation. The steps below describe
 the assertion-aware path.
