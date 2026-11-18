@@ -446,6 +446,12 @@ impl fmt::Display for DumpRegex<'_> {
         writeln!(f, "  tier4 (counter programs):       {}", r.tier4_eligible)?;
         writeln!(f)?;
 
+        // -- Tier 1 Assertions ------------------------------------------------
+        if !r.tier1_assertions.is_empty() {
+            write!(f, "{}", r.tier1_assertions)?;
+            writeln!(f)?;
+        }
+
         // -- Grouped NFA (when analysed) ---------------------------------------
         match r.grouped_nfa.as_deref() {
             None => {}
@@ -462,18 +468,22 @@ impl fmt::Display for DumpRegex<'_> {
 
         // -- Auxiliary Arrays --------------------------------------------------
         writeln!(f, "Auxiliary Arrays:")?;
-        write!(f, "  state_can_reach_match: [")?;
-        for (i, &v) in r.state_can_reach_match.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
+        if r.state_can_reach_match.is_empty() {
+            writeln!(f, "  state_can_reach_match: omitted (no counters)")?;
+        } else {
+            write!(f, "  state_can_reach_match: [")?;
+            for (i, &v) in r.state_can_reach_match.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                if v {
+                    write!(f, "{i}")?;
+                } else {
+                    write!(f, ".")?;
+                }
             }
-            if v {
-                write!(f, "{i}")?;
-            } else {
-                write!(f, ".")?;
-            }
+            writeln!(f, "]")?;
         }
-        writeln!(f, "]")?;
         if !r.counter_break_can_match.is_empty() {
             write!(f, "  counter_break_can_match: [")?;
             for (i, &v) in r.counter_break_can_match.iter().enumerate() {
@@ -483,6 +493,8 @@ impl fmt::Display for DumpRegex<'_> {
                 write!(f, "c{i}={v}")?;
             }
             writeln!(f, "]")?;
+        } else {
+            writeln!(f, "  counter_break_can_match: omitted (no counters)")?;
         }
 
         if !r.counter_body_states.is_empty() {

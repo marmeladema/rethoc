@@ -1,7 +1,7 @@
 //! Tier 2: DFA with differential counters for fixed-length repetition bodies.
 //!
 //! Uses the Becchi differential-counter technique for O(1) per-character
-//! counter management.  Supports the same deferred assertions as Tier 1.
+//! counter management. Supports deferred ASCII word boundaries and LF line ends.
 //!
 //! **Eligibility**: patterns with bounded repetitions where:
 //! - No counter is nested inside another counter's body.
@@ -10,8 +10,7 @@
 //! - No CRLF assertions.
 //! - No deferred assertions inside counter bodies.
 //!
-//! Counter-free patterns (Tier 1 eligible) are also Tier 2 eligible — the
-//! differential counter logic is simply dormant.
+//! Counter-free patterns dispatch to Tier 1, which also supports CRLF anchors.
 
 pub(crate) mod eligibility;
 pub(crate) mod overlap;
@@ -1167,7 +1166,7 @@ impl Tier2DfaCache {
             .collect();
         let deferred = state.deferred_asserts.clone();
         let (is_match, is_match_at_end, prev_was_word) =
-            (state.is_match, state.is_match_at_end, state.prev_was_word);
+            (state.is_match, state.is_match_at_end, state.context.0 != 0);
         if nfa.is_empty() && deferred.is_empty() && !is_match && !is_match_at_end {
             return None;
         }

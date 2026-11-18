@@ -6,7 +6,8 @@
 //! in the DFA state and resolved at the start of `populate()` when the
 //! next input byte is known.
 //!
-//! Only `StartCRLF` and `EndCRLF` remain DFA-ineligible.
+//! Tier 1 resolves all supported assertion kinds with exact boundary context.
+//! The counting tiers still exclude `StartCRLF` and `EndCRLF`.
 //!
 //! **Tier 2** (non-nested, fixed-length-body repetitions): Becchi-style
 //! differential counters.  O(1) per byte for patterns where every counter
@@ -31,7 +32,7 @@ mod tier4;
 use indexmap::Equivalent;
 use indexmap::IndexSet;
 
-pub(crate) use tier1::{DfaMatcher, Tier1DfaCache};
+pub(crate) use tier1::{DfaMatcher, Tier1Assertions, Tier1DfaCache};
 pub(crate) use tier2::{Tier2Analysis, Tier2DfaCache, Tier2DfaMatcher, compute_tier2_analysis};
 pub(crate) use tier3::{
     Tier3Analysis, Tier3DfaCache, Tier3DfaMatcher, Tier3OriginKind, compute_tier3_analysis,
@@ -76,6 +77,40 @@ impl DfaStateId {
     }
 }
 
+/// Boundary facts kept only while deferred continuations need them.
+/// Bits 0–2 are `ByteProps`; bit 3 distinguishes the initial boundary.
+/// Counting tiers retain their legacy word-only encoding (0 or 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct BoundaryContext(u8);
+
+impl BoundaryContext {
+    /// Full physical boundary, before masking by continuation requirements.
+    fn new(previous: Option<u8>) -> Self {
+        Self(previous.map_or(8, |b| crate::ByteProps::of(b).0))
+    }
+
+    /// Preserve the counting tiers' word-only state keys.
+    const fn legacy(word: bool) -> Self {
+        Self(word as u8)
+    }
+
+    /// Whether the retained context distinguishes input start.
+    fn at_start(self) -> bool {
+        self.0 & 8 != 0
+    }
+
+    /// Representative for every fact the pending continuation can read.
+    fn previous(self) -> Option<u8> {
+        (!self.at_start()).then(|| crate::ByteProps(self.0).stand_in())
+    }
+}
+
+impl std::fmt::Display for BoundaryContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "prev={:?} start={}", self.previous(), self.at_start())
+    }
+}
+
 /// A DFA state: a sorted, deduplicated set of NFA consuming/assert state
 /// indices, plus flags derived from the epsilon closure.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -86,20 +121,18 @@ pub(super) struct DfaState {
     /// Match states set the `is_match` / `is_match_at_end` flags.
     pub(super) nfa_states: Box<[StateIdx]>,
     /// NFA Assert state indices whose evaluation was deferred because the
-    /// next byte was unknown.  These are `WordAscii`, `WordAsciiNegate`,
-    /// or `EndLF` states.  Resolved in `populate()` when the next byte
-    /// arrives.
+    /// next byte was unknown. Resolved when that byte arrives; Tier 1
+    /// includes CRLF assertions as well as word boundaries and `EndLF`.
     pub(super) deferred_asserts: Box<[StateIdx]>,
     /// True if `Match` is directly reachable (no pending `$` gate).
     pub(super) is_match: bool,
-    /// True if `Match` is reachable through an `Assert(End)` gate.
-    /// Only fires when `at_end = true` (in `finish()`).
+    /// Acceptance at EOF. Tier 1 computes this exactly for every assertion;
+    /// the counting tiers use their existing `Assert(End)` gate policy.
     pub(super) is_match_at_end: bool,
-    /// Whether the previous byte (the byte that *entered* this state) was
-    /// an ASCII word character.  Only meaningful when `deferred_asserts`
-    /// is non-empty; always `false` otherwise, to avoid unnecessary state
-    /// splitting.
-    pub(super) prev_was_word: bool,
+    /// Context required by parked continuations, zero when none are pending.
+    /// Tier 1 retains only required byte/start facts; counting tiers retain
+    /// their original word-only encoding.
+    pub(super) context: BoundaryContext,
 }
 
 /// The byte a DFA state substitutes for the one that entered it, of which
@@ -110,9 +143,9 @@ pub(super) const fn prev_stand_in(prev_was_word: bool) -> u8 {
 }
 
 impl DfaState {
-    /// Return a representative previous byte for assertion resolution.
+    /// Return the legacy counting-tier previous byte for assertion resolution.
     ///
-    /// A DFA state remembers one bit about the byte that entered it: its
+    /// Counting states remember one bit about the byte that entered them: its
     /// word-ness.  That is all a parked assertion can still need.  The
     /// kinds the DFA tiers defer ([`AssertKind::is_dfa_deferrable`]) read
     /// the previous byte through `is_word_byte` only, or not at all;
@@ -126,7 +159,8 @@ impl DfaState {
     /// deferrable without this state learning to remember it.
     #[inline]
     pub(super) fn prev_byte_representative(&self) -> Option<u8> {
-        Some(prev_stand_in(self.prev_was_word))
+        debug_assert!(self.context.0 <= 1, "legacy counting-tier context only");
+        Some(prev_stand_in(self.context.0 != 0))
     }
 
     /// Resolve deferred assertions from `from_state` given that `byte` is the
@@ -283,7 +317,7 @@ pub(super) struct DfaStateRef<'a> {
     deferred_asserts: &'a [StateIdx],
     is_match: bool,
     is_match_at_end: bool,
-    prev_was_word: bool,
+    context: BoundaryContext,
 }
 
 impl Equivalent<DfaState> for DfaStateRef<'_> {
@@ -292,7 +326,7 @@ impl Equivalent<DfaState> for DfaStateRef<'_> {
             && self.deferred_asserts == &*key.deferred_asserts
             && self.is_match == key.is_match
             && self.is_match_at_end == key.is_match_at_end
-            && self.prev_was_word == key.prev_was_word
+            && self.context == key.context
     }
 }
 
@@ -767,6 +801,27 @@ impl DfaCache {
         is_match: bool,
         is_match_at_end: bool,
         prev_was_word: bool,
+        transition: impl FnMut(),
+    ) -> Option<DfaStateId> {
+        self.intern_context(
+            nfa_states,
+            deferred_asserts,
+            is_match,
+            is_match_at_end,
+            BoundaryContext::legacy(prev_was_word),
+            transition,
+        )
+    }
+
+    /// Intern a state with an already canonicalized assertion context.
+    #[inline]
+    fn intern_context(
+        &mut self,
+        nfa_states: &[StateIdx],
+        deferred_asserts: &[StateIdx],
+        is_match: bool,
+        is_match_at_end: bool,
+        context: BoundaryContext,
         mut transition: impl FnMut(),
     ) -> Option<DfaStateId> {
         let probe = DfaStateRef {
@@ -774,7 +829,7 @@ impl DfaCache {
             deferred_asserts,
             is_match,
             is_match_at_end,
-            prev_was_word,
+            context,
         };
         if let Some(idx) = self.states.get_index_of(&probe) {
             return Some(DfaStateId(idx as u32));
@@ -787,7 +842,7 @@ impl DfaCache {
             deferred_asserts: deferred_asserts.into(),
             is_match,
             is_match_at_end,
-            prev_was_word,
+            context,
         };
         let (idx, _) = self.states.insert_full(state);
         transition();
@@ -832,7 +887,7 @@ mod tests {
             deferred_asserts: deferred.iter().map(|&v| StateIdx(v)).collect(),
             is_match,
             is_match_at_end,
-            prev_was_word,
+            context: BoundaryContext::legacy(prev_was_word),
         }
     }
 
@@ -849,7 +904,7 @@ mod tests {
             deferred_asserts: deferred,
             is_match,
             is_match_at_end,
-            prev_was_word,
+            context: BoundaryContext::legacy(prev_was_word),
         }
     }
 
@@ -1324,6 +1379,33 @@ mod tests {
             set.get_index_of(&make_ref(&nfa2, &[], true, false, false)),
             None
         );
+    }
+
+    #[test]
+    fn rich_context_hash_equality_and_layout() {
+        // The new byte replaces a bool; it must not enlarge cached states.
+        type LegacyLayout = (Box<[StateIdx]>, Box<[StateIdx]>, bool, bool, bool);
+        assert_eq!(size_of::<DfaState>(), size_of::<LegacyLayout>());
+        assert_eq!(size_of::<BoundaryContext>(), size_of::<bool>());
+        let mut states = IndexSet::<DfaState>::new();
+        let pending = [StateIdx(2)];
+        for bits in [0, 1, 2, 4, 8] {
+            let mut state = make_state(&[], &[2], false, false, false);
+            state.context = BoundaryContext(bits);
+            let probe = DfaStateRef {
+                nfa_states: &[],
+                deferred_asserts: &pending,
+                is_match: false,
+                is_match_at_end: false,
+                context: BoundaryContext(bits),
+            };
+            assert_eq!(hash_of(&state), hash_of(&probe));
+            assert!(probe.equivalent(&state));
+            assert!(states.get_index_of(&probe).is_none());
+            states.insert(state);
+            assert!(states.get_index_of(&probe).is_some());
+        }
+        assert_eq!(states.len(), 5);
     }
 
     // ── Previous-byte stand-in (Bug 65) ──

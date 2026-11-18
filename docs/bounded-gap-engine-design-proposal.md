@@ -555,7 +555,9 @@ However, they widen the Version 1 correctness surface significantly:
 
 - `\b` / `\B` depend on local boundary facts
 - `$` / `EndLF` interact with end-of-input event timing
-- CRLF assertions are Tier-1/2-ineligible and would force Tier 0 anchor runners
+- CRLF assertions require exact adjacent-byte context. Counter-free Tier 1
+  now supports them; Tier 2 still excludes them. See
+  [the Tier 1 assertion plan](../plans/tier1-assertions.md).
 
 Version 1 recommendation:
 

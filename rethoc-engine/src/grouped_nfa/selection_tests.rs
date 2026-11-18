@@ -66,8 +66,13 @@ fn every_selection_branch() {
     let re = build(r"x(a|aa){2,5}\bz?", 0, Auto);
     assert_eq!(tiers(&re), [false; 4]);
     assert_eq!(re.engine(), Engine::GroupedNfa);
-    // Counter-free, but Tier 1 cannot take CRLF assertions.
+    // Counter-free CRLF now goes to Tier 1, without a grouped plan.
     let re = build(r"(?Rm)^abc$", 32, Auto);
+    assert_eq!(tiers(&re), [true, false, false, false]);
+    assert_eq!(re.engine(), Engine::Tier1);
+    assert_eq!(admitted(&re), None);
+    // CRLF with retained counters still uses the grouped fallback.
+    let re = build(r"(?Rm)^a{2,3}$", 0, Auto);
     assert_eq!(tiers(&re), [false; 4]);
     assert_eq!(re.engine(), Engine::GroupedNfa);
     // Grouped rejection (nested), then Tier 4.
