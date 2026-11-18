@@ -104,7 +104,7 @@ fn evaluator_contract_for_every_kind() {
 
 /// Every partition of `input` into nonempty chunks, with an empty call
 /// before, between and after the data calls.
-fn partitions(input: &[u8]) -> Vec<Vec<&[u8]>> {
+pub(crate) fn partitions(input: &[u8]) -> Vec<Vec<&[u8]>> {
     let n = input.len();
     let cuts = n.saturating_sub(1);
     (0..1u32 << cuts)
@@ -328,7 +328,7 @@ fn gate_assertion_only_counted_body() {
 // ---------------------------------------------------------------------------
 
 /// Pattern syntax of every assertion kind.
-const KINDS: [&str; 10] = [
+pub(crate) const KINDS: [&str; 10] = [
     r"\A",
     r"\z",
     r"(?m:^)",
@@ -344,7 +344,7 @@ const KINDS: [&str; 10] = [
 /// Positions of an assertion pair `{P}` relative to a counted repetition
 /// with bounds `{C}`, over word (`a`, `b`), non-word (`-`), NUL, 0xFF and
 /// line-break bytes.
-const POSITIONS: [&str; 5] = [
+pub(crate) const POSITIONS: [&str; 5] = [
     "{P}(?:a|b-|\\x00){C}",                // head
     "[a\\n\\r\\x00\\xff-]{P}(?:a|b-){C}",  // entry
     "(?:a{P}|-|\\xff){C}b",                // body
@@ -355,10 +355,10 @@ const POSITIONS: [&str; 5] = [
 /// Counted domains: finite, and unbounded (counts saturate at `min`).
 const COUNTERS: [&str; 2] = ["{1,3}", "{2,}"];
 
-const PAIR_ALPHABET: &[u8] = b"ab-\r\n\x00\xff";
+pub(crate) const PAIR_ALPHABET: &[u8] = b"ab-\r\n\x00\xff";
 
 /// A pattern of the pair matrix.
-fn pair_pattern(position: &str, pair: &str, counter: &str) -> String {
+pub(crate) fn pair_pattern(position: &str, pair: &str, counter: &str) -> String {
     position.replace("{P}", pair).replace("{C}", counter)
 }
 
@@ -448,7 +448,7 @@ fn assertion_patterns_every_cut() {
 /// A regex whose NFA is `states`, started at state 0, for shapes that
 /// pattern normalisation might never produce.  Every DFA tier is off: only
 /// Tier 0, the grouped NFA and the scalar interpreter run on it.
-fn fixture_regex(states: Vec<State>, num_counters: usize) -> Regex {
+pub(crate) fn fixture_regex(states: Vec<State>, num_counters: usize) -> Regex {
     let mut re = compile("a", 0, false);
     re.states = crate::StateList(states.into_boxed_slice());
     re.start = StateIdx(0);
@@ -480,10 +480,30 @@ fn fixture_regex(states: Vec<State>, num_counters: usize) -> Regex {
         Ok(plan) => super::GroupedNfa::Admitted(plan),
         Err(r) => super::GroupedNfa::Rejected(r),
     }));
+    // The sparse counting variant of the same graph, where it is admitted.
+    let structure = super::structure(
+        &re.states,
+        &re.byte_tables,
+        re.start,
+        num_counters,
+        &[],
+        &super::Limits::DEFAULT,
+    );
+    re.sparse_counting = Some(Box::new(
+        match super::sparse::analyze(
+            &re.states,
+            re.start,
+            structure.as_ref().map_err(|r| *r),
+            &super::sparse::SparseLimits::DEFAULT,
+        ) {
+            Ok(plan) => super::SparseCounting::Admitted(plan),
+            Err(r) => super::SparseCounting::Rejected(r),
+        },
+    ));
     re
 }
 
-fn by(b: u8, out: u32) -> State {
+pub(crate) fn by(b: u8, out: u32) -> State {
     State::Byte {
         byte: b,
         out: StateIdx(out),
@@ -491,28 +511,28 @@ fn by(b: u8, out: u32) -> State {
     }
 }
 
-fn split(out: u32, out1: u32) -> State {
+pub(crate) fn split(out: u32, out1: u32) -> State {
     State::Split {
         out: StateIdx(out),
         out1: StateIdx(out1),
     }
 }
 
-fn assert_(kind: AssertKind, out: u32) -> State {
+pub(crate) fn assert_(kind: AssertKind, out: u32) -> State {
     State::Assert {
         kind,
         out: StateIdx(out),
     }
 }
 
-fn ci(counter: u8, out: u32) -> State {
+pub(crate) fn ci(counter: u8, out: u32) -> State {
     State::CounterInstance {
         counter: crate::CounterIdx(counter),
         out: StateIdx(out),
     }
 }
 
-fn cinc(counter: u8, min: usize, max: usize, out: u32, out1: u32) -> State {
+pub(crate) fn cinc(counter: u8, min: usize, max: usize, out: u32, out1: u32) -> State {
     State::CounterIncrement {
         counter: crate::CounterIdx(counter),
         out: StateIdx(out),
@@ -543,7 +563,27 @@ fn check_fixture(re: &Regex, alphabet: &[u8], label: &str) {
             run_chunks(re, &parts, expected, &format!("{label} {parts:?}"));
         }
         check_against_scalar(re, input, &format!("{label} {input:?}"));
+        // The sparse counting variant, on the fixtures it admits (all but
+        // the one with an unbounded counter).
+        if re.sparse_plan().is_ok() {
+            for parts in partitions(input) {
+                super::sparse::tests::run_chunks(
+                    re,
+                    &parts,
+                    expected,
+                    &format!("{label} sparse {parts:?}"),
+                );
+            }
+            super::sparse::tests::check_profiles(re, input, &format!("{label} sparse"));
+        }
     }
+    assert_eq!(
+        re.sparse_plan().is_ok(),
+        re.states
+            .iter()
+            .all(|s| !matches!(s, State::CounterIncrement { max, .. } if *max == usize::MAX)),
+        "{label}: sparse admission"
+    );
     assert!(
         0 < matching && matching < inputs.len(),
         "{label}: {matching} of {} inputs match",

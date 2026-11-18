@@ -522,7 +522,7 @@ impl Regex {
 }
 
 #[cfg(test)]
-mod assertion_tests;
+pub(crate) mod assertion_tests;
 #[cfg(test)]
 mod selection_tests;
 #[cfg(test)]

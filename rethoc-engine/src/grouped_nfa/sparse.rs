@@ -34,6 +34,20 @@
 //! No transfer may look at counts in any other way: a guard that kept,
 //! say, the counts below some value would tell a reduced row from the set
 //! it stands for.
+//!
+//! # Assertions
+//!
+//! An assertion passes or blocks its whole row, whatever the counts: it
+//! reads only the boundary (stream start, previous byte, next byte or end
+//! of input), through the evaluator the exact grouped NFA uses, for the
+//! kinds reviewed there ([`reviewed`](super::analysis::reviewed)).  The
+//! stream keeps the frontier as it was right after the last byte and
+//! closes a copy of it at every boundary, so an assertion that failed or
+//! could not be decided blocks one edge of one closure and nothing else:
+//! the next closure, with the next byte or at end of input, evaluates it
+//! afresh from the same rows, and once a byte is consumed the blocked path
+//! is gone.  Rows merge at a state only after each incoming path has
+//! passed its own guards.
 
 use std::fmt;
 
@@ -78,8 +92,6 @@ impl SparseLimits {
 pub enum SparseRejection {
     /// The structure shared with the exact grouped NFA was not proven.
     Structure(Rejection),
-    /// An assertion is reachable; assertions are not supported yet.
-    Assertion { state: u32 },
     /// A state is inside the scope of a counter without a reachable
     /// increment, whose bounds are therefore unknown.
     ScopeWithoutIncrement { counter: u8 },
@@ -107,10 +119,6 @@ impl fmt::Display for SparseRejection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::Structure(r) => write!(f, "{r}"),
-            Self::Assertion { state } => write!(
-                f,
-                "assertion at state {state}: the sparse variant does not support assertions yet"
-            ),
             Self::ScopeWithoutIncrement { counter } => {
                 write!(
                     f,
@@ -268,8 +276,8 @@ pub(crate) enum SparseOp {
         min: u32,
         max: u32,
     },
-    /// Union into `out` iff the shared evaluator says `Pass` at the
-    /// current boundary.  Not admitted yet.
+    /// Union the whole row into `out` iff the shared evaluator says
+    /// `Pass` at the current boundary.
     Assert { kind: AssertKind, out: NodeIdx },
     /// Active: a match.
     Match,
@@ -445,12 +453,6 @@ pub(crate) fn analyze(
             bytes: analysis,
             limit: limits.max_analysis_bytes,
         });
-    }
-    if let Some(&idx) = order
-        .iter()
-        .find(|&&s| matches!(states[s], State::Assert { .. }))
-    {
-        return Err(SparseRejection::Assertion { state: idx.0 });
     }
 
     // Spacing and capacity of every counter with a reachable increment.
@@ -1102,6 +1104,12 @@ impl SparseStream {
             .then(|| row(&plan.nodes[n as usize], &self.len, &self.vals, n))
     }
 
+    /// The boundary metadata: previous byte and at-start flag (for tests).
+    #[cfg(test)]
+    pub(crate) fn boundary_state(&self) -> (Option<u8>, bool) {
+        (self.prev, self.at_start)
+    }
+
     /// Whether the raw row of `state` is active (for tests).
     #[cfg(test)]
     pub(crate) fn raw_active(&self, regex: &Regex, state: StateIdx) -> bool {
@@ -1225,3 +1233,7 @@ impl Regex {
 #[cfg(test)]
 #[path = "sparse_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "sparse_assertion_tests.rs"]
+mod assertion_tests;

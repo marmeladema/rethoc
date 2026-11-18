@@ -13,7 +13,7 @@
 use libfuzzer_sys::fuzz_target;
 
 use rethoc_engine::fuzz_gen::{generate_inputs, generate_pattern, FuzzRng};
-use rethoc_engine::{GroupedNfaMode, GroupedScratch, MatcherMemory, RegexBuilder};
+use rethoc_engine::{GroupedNfaMode, GroupedScratch, MatcherMemory, RegexBuilder, SparseScratch};
 
 use std::cell::RefCell;
 
@@ -93,6 +93,7 @@ fuzz_target!(|data: &[u8]| {
     set_phase("compilation (default unroll)");
     let mut builder = RegexBuilder::default();
     builder.config_mut().grouped_nfa = GroupedNfaMode::Always;
+    builder.config_mut().sparse_counting = true;
     let re = match builder.build(&hir) {
         Ok(r) => r,
         Err(_) => return,
@@ -122,6 +123,7 @@ fuzz_target!(|data: &[u8]| {
 
     let mut memory = MatcherMemory::default();
     let mut grouped_scratch = GroupedScratch::new();
+    let mut sparse_scratch = SparseScratch::new();
 
     for input in &inputs {
         let expected = oracle.is_match(input);
@@ -189,6 +191,18 @@ fuzz_target!(|data: &[u8]| {
                 expected
             );
         }
+        // Its sparse counting variant, when it admits the pattern.
+        if let Some(sparse) = re.sparse_is_match(&mut sparse_scratch, input) {
+            assert_eq!(
+                sparse,
+                expected,
+                "sparse counting mismatch for `{}` on input len={}: sparse={}, expected={}",
+                pattern,
+                input.len(),
+                sparse,
+                expected
+            );
+        }
     }
 
     // Second pass: recompile without unrolling.
@@ -246,6 +260,18 @@ fuzz_target!(|data: &[u8]| {
                 pattern,
                 input.len(),
                 grouped,
+                expected
+            );
+        }
+        // Its sparse counting variant, when it admits the pattern.
+        if let Some(sparse) = re_no_unroll.sparse_is_match(&mut sparse_scratch, input) {
+            assert_eq!(
+                sparse,
+                expected,
+                "sparse counting mismatch for `{}` on input len={}: sparse={}, expected={}",
+                pattern,
+                input.len(),
+                sparse,
                 expected
             );
         }

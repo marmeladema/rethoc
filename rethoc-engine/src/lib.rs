@@ -15689,6 +15689,7 @@ mod tests {
         };
         let mut builder = RegexBuilder::default();
         builder.config_mut().grouped_nfa = GroupedNfaMode::Always;
+        builder.config_mut().sparse_counting = true;
         let re = match builder.build(&hir) {
             Ok(r) => r,
             Err(_) => return,
@@ -15703,6 +15704,7 @@ mod tests {
 
         let mut memory = MatcherMemory::default();
         let mut grouped_scratch = GroupedScratch::new();
+        let mut sparse_scratch = SparseScratch::new();
 
         for input in inputs {
             let expected = oracle.is_match(input);
@@ -15768,6 +15770,15 @@ mod tests {
                     &input[..input.len().min(80)]
                 );
             }
+            // Its sparse counting variant, when it admits the pattern.
+            if let Some(sparse) = re.sparse_is_match(&mut sparse_scratch, input) {
+                assert_eq!(
+                    sparse,
+                    expected,
+                    "sparse counting mismatch for pattern `{pattern}` on input {:?}",
+                    &input[..input.len().min(80)]
+                );
+            }
         }
 
         // Second pass: recompile with unrolling disabled to exercise
@@ -15819,6 +15830,15 @@ mod tests {
                         grouped,
                         expected,
                         "grouped NFA mismatch for pattern `{pattern}` on input {:?}",
+                        &input[..input.len().min(80)]
+                    );
+                }
+                // Its sparse counting variant, when it admits the pattern.
+                if let Some(sparse) = re_no_unroll.sparse_is_match(&mut sparse_scratch, input) {
+                    assert_eq!(
+                        sparse,
+                        expected,
+                        "sparse counting mismatch for pattern `{pattern}` on input {:?}",
                         &input[..input.len().min(80)]
                     );
                 }
@@ -15883,6 +15903,7 @@ mod tests {
             };
             let mut builder = RegexBuilder::default();
             builder.config_mut().grouped_nfa = GroupedNfaMode::Always;
+            builder.config_mut().sparse_counting = true;
             let re = match builder.build(&hir) {
                 Ok(r) => r,
                 Err(_) => return Ok(()),
@@ -15890,6 +15911,7 @@ mod tests {
 
             let mut memory = MatcherMemory::default();
             let mut grouped_scratch = GroupedScratch::new();
+            let mut sparse_scratch = SparseScratch::new();
 
             for input in &inputs {
                 // NFA result is the oracle.
@@ -15914,6 +15936,14 @@ mod tests {
                     assert_eq!(
                         grouped, nfa_result,
                         "grouped NFA mismatch for pattern `{pattern}` on input {:?}",
+                        &input[..input.len().min(80)]
+                    );
+                }
+                // Its sparse counting variant, when it admits the pattern.
+                if let Some(sparse) = re.sparse_is_match(&mut sparse_scratch, input) {
+                    assert_eq!(
+                        sparse, nfa_result,
+                        "sparse counting mismatch for pattern `{pattern}` on input {:?}",
                         &input[..input.len().min(80)]
                     );
                 }

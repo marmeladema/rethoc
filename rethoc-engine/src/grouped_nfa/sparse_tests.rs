@@ -494,20 +494,20 @@ fn rejects_outside_the_admitted_class() {
         sparse_rejection(&sparse_forced("(a?){2,5}z")),
         SparseRejection::Structure(Rejection::ZeroWidthCycle { .. })
     ));
-    // Assertions anywhere, also outside the counted scope.
+    // A counted body that an assertion makes nullable is a zero-width
+    // cycle, like any other.
+    assert!(matches!(
+        sparse_rejection(&sparse_forced(r"(?:\b|a){2,3}")),
+        SparseRejection::Structure(Rejection::ZeroWidthCycle { .. })
+    ));
+    // Assertions are admitted, anywhere.
     for pattern in [
         r"x(a|aa){2,5}\bz",
         r"\bx(a|aa){2,5}z",
         r"x(a\b|aa){2,5}z",
         "^abc",
     ] {
-        assert!(
-            matches!(
-                sparse_rejection(&sparse_forced(pattern)),
-                SparseRejection::Assertion { .. }
-            ),
-            "`{pattern}`"
-        );
+        sparse_plan(&sparse_forced(pattern));
     }
 }
 
@@ -1463,7 +1463,7 @@ fn rebind_and_rejected_rebind() {
 fn matcher_memory_forces_the_sparse_variant() {
     let re = sparse_forced("x(a|aa){2,5}z");
     let other = sparse_forced("a(a|aa){1,300}z");
-    let rejected = sparse_forced(r"x(a|aa){2,5}\bz");
+    let rejected = sparse_forced("x(a|aa){2,}z");
     let mut memory = MatcherMemory::default();
     for _ in 0..2 {
         let mut m = memory.matcher_sparse(&re).unwrap();
@@ -1475,7 +1475,7 @@ fn matcher_memory_forces_the_sparse_variant() {
         assert!(matches!(
             memory.matcher_sparse(&rejected),
             Err(SparseCountingError::Rejected(
-                SparseRejection::Assertion { .. }
+                SparseRejection::UnboundedCounter { .. }
             ))
         ));
         let mut m = memory.matcher_sparse(&other).unwrap();

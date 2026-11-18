@@ -14,7 +14,7 @@
 use libfuzzer_sys::fuzz_target;
 
 use rethoc_engine::fuzz_gen::{generate_inputs, generate_pattern, FuzzRng};
-use rethoc_engine::{GroupedNfaMode, GroupedScratch, MatcherMemory, RegexBuilder};
+use rethoc_engine::{GroupedNfaMode, GroupedScratch, MatcherMemory, RegexBuilder, SparseScratch};
 
 use std::cell::RefCell;
 
@@ -89,6 +89,7 @@ fuzz_target!(|data: &[u8]| {
 
     let mut builder = RegexBuilder::default();
     builder.config_mut().grouped_nfa = GroupedNfaMode::Always;
+    builder.config_mut().sparse_counting = true;
     set_phase("compilation (default unroll)");
     let re = match builder.build(&hir) {
         Ok(r) => r,
@@ -112,6 +113,7 @@ fuzz_target!(|data: &[u8]| {
 
     let mut memory = MatcherMemory::default();
     let mut grouped_scratch = GroupedScratch::new();
+    let mut sparse_scratch = SparseScratch::new();
 
     for input in &inputs {
         set_input(input);
@@ -153,6 +155,18 @@ fuzz_target!(|data: &[u8]| {
                 pattern,
                 input.len(),
                 grouped,
+                nfa_result
+            );
+        }
+        // Its sparse counting variant, when it admits the pattern.
+        if let Some(sparse) = re.sparse_is_match(&mut sparse_scratch, input) {
+            assert_eq!(
+                sparse,
+                nfa_result,
+                "sparse counting mismatch for `{}` on input len={}: sparse={}, nfa_result={}",
+                pattern,
+                input.len(),
+                sparse,
                 nfa_result
             );
         }
@@ -215,6 +229,18 @@ fuzz_target!(|data: &[u8]| {
                 pattern,
                 input.len(),
                 grouped,
+                nfa_result
+            );
+        }
+        // Its sparse counting variant, when it admits the pattern.
+        if let Some(sparse) = re_no_unroll.sparse_is_match(&mut sparse_scratch, input) {
+            assert_eq!(
+                sparse,
+                nfa_result,
+                "sparse counting mismatch for `{}` on input len={}: sparse={}, nfa_result={}",
+                pattern,
+                input.len(),
+                sparse,
                 nfa_result
             );
         }
