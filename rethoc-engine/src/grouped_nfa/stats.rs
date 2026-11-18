@@ -3,7 +3,7 @@
 //!
 //! They count the work a scan does on count rows, so that representations
 //! can be compared by what they do and not only by wall time.  Without the
-//! feature [`stat!`] expands to nothing and its argument is not evaluated:
+//! feature `stat!` expands to nothing and its argument is not evaluated:
 //! timings must be taken from a build without the feature.
 //!
 //! The counters are per thread.  [`take`] returns and zeroes them.

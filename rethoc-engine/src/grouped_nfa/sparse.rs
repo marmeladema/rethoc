@@ -1268,7 +1268,8 @@ impl SparsePlan {
 /// A closure is never stored back.
 ///
 /// While no row is active, bytes that cannot start anything are skipped
-/// when the plan allows it ([`SparsePlan::idle`]).
+/// when the plan allows it (its start closure reaches neither an assertion
+/// nor a match).
 ///
 /// Lifecycle: [`new`](Self::new), any number of [`chunk`](Self::chunk)
 /// calls, [`finish`](Self::finish); [`reset`](Self::reset) starts over.
