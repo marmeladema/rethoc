@@ -399,7 +399,10 @@ Implemented after P4 (see "Idle cost"): with an active-row bitmap per
 frontier, an active pass costs `O(A + live rows and their transfers)` per
 byte, `A = ceil(R/64)`; the full sweep stays `O(R + W + B)`. While the raw
 frontier is empty and the start closure is static, prefilter skipping makes
-idle bytes cost the prefilter's scan.
+idle bytes cost the prefilter's scan. A frontier where no counter has
+counted yet takes the count-free step instead: `O(A)` words per live node
+plus one per firing consumer, from compile-time bitmaps (see
+"Count-free step").
 
 ## 7. Milestones
 
@@ -561,6 +564,83 @@ Tests run every check in all three modes (automatic, full, active),
 compare both closure passes with the scalar interpreter, check the bitmap
 invariant and a clean scratch after every call, and include a plan whose
 automatic choice switches pass within one chunk.
+
+### Count-free step
+
+Investigating the regression that P5 accepts on the `reengage_profile`
+gate (bounded `.{0,N}` gaps over text, where Tier 3 runs as a DFA)
+showed that the grouped NFA was not slow at counting there: in the
+`tier3_*` cases a counter is almost never in progress. The frontier is
+empty, or holds one to a few rows with count 0, and each byte paid the
+general step's fixed cost (closure pass, consumption, bookkeeping).
+
+A raw frontier is *unit* when every active row holds exactly bit 0
+(Outside, or count 0). A node is *count-free* when its zero-width
+closure reaches no assertion and no `CounterIncrement`. From a unit row
+such a closure is a fixed set of nodes, each holding bit 0, whatever the
+boundary. So the analysis builds, at compile time
+(`CountFreeTables`), when the start node is count-free and the bitmaps
+are at most 8 words (512 rows):
+
+- the closure bitmap of each count-free node, and of the start;
+- per byte, the bitmap of consumers that accept it;
+- per byte, whether it starts anything from an empty frontier.
+
+While the raw frontier is unit and all its nodes are count-free, a step
+is: closure = OR of the nodes' closure bitmaps and the start's;
+`Match` reached if that hits a match node; successors of the consumers in
+`closure AND accept[b]` become the next raw frontier, each holding bit 0.
+While the frontier is empty, the stream skips to the next byte that
+starts something (prefilter, or the per-byte table when there is none).
+One const-generic loop serves every width from one to eight words: it
+runs count-free steps back to back with the frontier as a bitmap in
+registers, and writes the raw rows once when the run ends (the rows
+that changed: cleared or set to bit 0). A run ends at the end of the
+chunk, on a match, when the frontier empties (the idle skip takes over)
+or when a node that is not count-free becomes active, so the raw rows
+are exact at every call boundary and before every general step. Anything else, and every byte where a
+counter has counted, takes the general step. Whether the next frontier
+is unit is decided exactly during consumption: it is unit when every
+consumer that moved a row moved exactly bit 0, one comparison per firing
+consumer, so no step rescans the rows. The tables count in the plan
+budget and in `memory_size()`: 256 bitmap words for acceptance plus one
+per node, so about 2.3 KiB at one word. They are optional: a plan over
+the budget only because of them is admitted without them. Acceptance
+bitmaps per byte class instead of per byte would shrink the larger
+tables (128+ nodes); not done.
+
+The count-free step runs under the automatic choice only; forcing a pass
+(`Sweep::Full`/`Active`, `grouped-full`/`grouped-active` in the probe)
+runs the general step. The tests run every check in the three modes, so
+they compare the two on every input they cover, and a dedicated test
+alternates count-free and general steps within chunks. Deliberate
+breakage (a dropped `out_exit`, no search reseeding, an assertion taken
+as count-free, a skipped unit check) fails them.
+
+Measured on the gate cases: the cases without a prefilter become an order
+of magnitude faster than Tier 3, the rule and gap text cases come within
+about 15% of it, the two dense-candidate synthetic cases (one live row,
+a step per byte) stay about 1.6x slower, and the counted-instance control
+is faster than Tier 3. Idle and counter-free probe families get faster;
+counter-heavy ones keep their median. The exception: the two families
+with five-word rows (`a(a|aa){1,256}b`, `(ab){1,256}c`) run 15-25%
+slower, with the same instruction count, fewer simulated mispredictions
+and the same cache misses, while `(ab){1,64}c` lost its earlier unexplained
+slowdown. Accepted for now as a known cost on dense multi-word workloads.
+Hardware counters (Haswell, `perf`) place it in the back end: cycles with
+the reorder buffer full rise from almost none to about 70 per byte, with
+equal L1, TLB and split-access counts and about a third more blocked store
+forwards. Precise samples put the stall on the destination load of the
+multi-word OR loop in consumption, whose instructions are identical in both
+builds: the same code stalls depending on the stores just before it
+(`memset` zeroing, earlier copies). Copying instead of OR-ing a first
+contribution, a scalar OR loop, an out-of-line general step, 64-byte loop
+alignment and heap padding did not fix it. Next leads: a top-down slot
+breakdown and `perf c2c`/`perf mem` to identify the store each load waits
+on, or consumption that never reads back a row written in the same step.
+Keeping a count-free frontier as a bare bitmap, writing rows only when the
+general step takes over, is the obvious next step for the dense-candidate
+cases.
 
 ### P1: one-word exact, assertion-free runtime
 

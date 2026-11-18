@@ -70,7 +70,7 @@ fn analyze_fixture(
     num_counters: usize,
     limits: &Limits,
 ) -> Result<GroupedNfaPlan, Rejection> {
-    analysis::analyze(states, &[], st(0), num_counters, &[], limits)
+    analysis::analyze(states, &[], &[], st(0), num_counters, &[], limits)
 }
 
 fn byte(b: u8, out: u32) -> State {
@@ -238,6 +238,7 @@ fn counted_rows_span_words() {
     assert_eq!(
         analysis::analyze(
             &re.states,
+            &re.classes,
             &re.byte_tables,
             re.start,
             1,
@@ -511,6 +512,7 @@ fn budgets_below_at_and_above() {
     let run = |limits: Limits| {
         analysis::analyze(
             states,
+            &re.classes,
             tables,
             re.start,
             n_counters,
@@ -519,7 +521,9 @@ fn budgets_below_at_and_above() {
         )
     };
     let full = run(Limits::DEFAULT).unwrap();
-    let (words, bytes) = (full.words(), full.heap_bytes());
+    // The smallest admissible plan: without the optional count-free tables.
+    let words = full.words();
+    let bytes = GroupedNfaPlan::heap_bytes_for(full.node_of.len(), full.nodes.len(), None);
     let n = states.len();
     let analysis = analysis::analysis_bytes(n, n_counters);
     let edges: usize = states
@@ -586,6 +590,51 @@ fn budgets_below_at_and_above() {
             limit: analysis - 1
         })
     );
+}
+
+/// The count-free tables are optional: a plan over the byte budget only
+/// because of them is admitted without them.
+#[test]
+fn plan_budget_drops_count_free_tables_first() {
+    let re = forced("xa{2,5}z|yb");
+    let run = |max_plan_bytes: usize| {
+        analysis::analyze(
+            &re.states,
+            &re.classes,
+            &re.byte_tables,
+            re.start,
+            re.num_counters,
+            &re.counter_info,
+            &Limits {
+                max_plan_bytes,
+                ..Limits::DEFAULT
+            },
+        )
+    };
+    let full = run(Limits::DEFAULT.max_plan_bytes).unwrap();
+    assert!(
+        full.count_free.is_some(),
+        "the fixture has count-free tables"
+    );
+    let with = full.heap_bytes();
+    let without = GroupedNfaPlan::heap_bytes_for(full.node_of.len(), full.nodes.len(), None);
+    assert!(without < with);
+    assert!(run(with).unwrap().count_free.is_some());
+    for limit in [with - 1, without] {
+        let plan = run(limit).unwrap();
+        assert!(plan.count_free.is_none());
+        assert_eq!(plan.heap_bytes(), without);
+    }
+    assert_eq!(
+        run(without - 1).err(),
+        Some(Rejection::PlanTooLarge {
+            bytes: without,
+            limit: without - 1
+        })
+    );
+    // The plan without tables runs the general step and still matches.
+    let lean = run(without).unwrap();
+    assert_eq!(lean.rows(), full.rows());
 }
 
 /// A plan-budget rejection leaves normal compilation and dispatch usable.
@@ -943,6 +992,11 @@ pub(crate) fn check_against_scalar(re: &Regex, input: &[u8], label: &str) {
                     "{label} {sweep:?}: raw after {i}"
                 );
                 check_active(plan, stream.raw(), stream.raw_active(), label);
+                assert_eq!(
+                    stream.unit(),
+                    raw.iter().all(|&(_, v)| v.is_none_or(|v| v == 0)),
+                    "{label} {sweep:?}: unit after {i}"
+                );
                 assert_eq!(
                     stream.ismatch(),
                     matched,
@@ -1336,7 +1390,7 @@ fn one_predicate_test_per_active_state() {
             .sum();
         saw_grouping |= counts as usize > consumers.len();
         let (mut next, mut next_active) = (vec![0u64; w], vec![0u64; a]);
-        let tests = exact::consume(
+        let done = exact::consume(
             plan,
             &re,
             &mut closure,
@@ -1345,7 +1399,15 @@ fn one_predicate_test_per_active_state() {
             &mut next_active,
             b,
         );
-        assert_eq!(tests, consumers.len());
+        assert_eq!(done.tests, consumers.len());
+        // Unitness is decided during consumption: every active next row
+        // is exactly bit 0.
+        let unit = (0..plan.rows()).all(|n| {
+            let r = plan.row(n as super::NodeIdx);
+            next_active[n / 64] >> (n % 64) & 1 == 0
+                || (next[r.off as usize] == 1 && next[r.range()].iter().skip(1).all(|&w| w == 0))
+        });
+        assert_eq!(done.unit, unit, "at byte {i}");
         raw = next;
         raw_active = next_active;
         prev = Some(b);
@@ -1556,4 +1618,63 @@ fn automatic_choice_switches_within_a_chunk() {
         check_input(&re, &oracle, &input, k, &format!("`{pattern}`"));
     }
     assert!(passes[0] > 0 && passes[1] > 0, "{passes:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Count-free tables
+// ---------------------------------------------------------------------------
+
+#[test]
+fn count_free_tables_where_the_start_is_count_free() {
+    let tables = |re: &Regex| plan(re).count_free.is_some();
+    assert!(tables(&forced("foo.{0,100}bar")));
+    assert!(tables(&forced("x(a|aa){2,5}z")));
+    // The start closure reaches an assertion or an increment: none.
+    assert!(!tables(&forced(r"\bfoo.{0,10}bar")));
+    assert!(!tables(&forced(r"(?m:^)a{2,3}")));
+    // More than 512 rows: none.
+    let long: String = (0..600).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+    let re = forced(&format!("{long}x{{2,3}}"));
+    assert!(plan(&re).rows() > 512, "{}", plan(&re).rows());
+    assert!(!tables(&re));
+    // The tables count in the plan's size: the acceptance bitmaps alone
+    // take 256 words.
+    let with = forced("foo.{0,100}bar");
+    assert!(
+        plan(&with).heap_bytes() > 256 * 8,
+        "{}",
+        plan(&with).heap_bytes()
+    );
+}
+
+/// A stream alternates count-free and general steps as counters start and
+/// stop, within chunks and across them; results agree with Tier 0.
+#[test]
+fn count_free_and_general_steps_alternate() {
+    let pattern = "foo.{0,5}bar|(?i)xy{2,3}z";
+    let re = compile(pattern, 0, false);
+    assert!(plan(&re).count_free.is_some());
+    let oracle = oracle(pattern);
+    let mut rng = Rng(5);
+    let pieces: [&[u8]; 7] = [b"foo", b"bar", b"--", b"fo", b"xYyz", b"xyyyyz", b"f"];
+    let mut passes = [0; 3];
+    for k in 0..300 {
+        let input: Vec<u8> = (0..1 + rng.below(10))
+            .flat_map(|_| pieces[rng.below(pieces.len())].iter().copied())
+            .collect();
+        let mut scratch = GroupedScratch::new();
+        let mut s = GroupedStream::new(&re, &mut scratch).unwrap();
+        s.chunk(&re, &mut scratch, &input);
+        assert_eq!(
+            s.finish(&re, &mut scratch),
+            oracle.is_match(&input),
+            "{input:?}"
+        );
+        for (p, n) in passes.iter_mut().zip(scratch.passes) {
+            *p += n;
+        }
+        check_input(&re, &oracle, &input, k, &format!("`{pattern}`"));
+        check_against_scalar(&re, &input, &format!("`{pattern}` {input:?}"));
+    }
+    assert!(passes[2] > 0 && passes[0] + passes[1] > 0, "{passes:?}");
 }
