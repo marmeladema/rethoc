@@ -10,7 +10,7 @@ use super::tests::{
     CONFIGS, Rng, all_strings, check_against_scalar, compile, forced, oracle, plan, run_chunks,
 };
 use super::{GroupedScratch, GroupedStream};
-use crate::{AssertEval, AssertKind, MatcherMemory, Regex, is_word_byte};
+use crate::{AssertEval, AssertKind, MatcherMemory, Regex, State, StateIdx, is_word_byte};
 
 // ---------------------------------------------------------------------------
 // The evaluator contract
@@ -341,17 +341,26 @@ const KINDS: [&str; 10] = [
     r"\b{end}",
 ];
 
-/// Positions of an assertion pair relative to a counted repetition, over
-/// word (`a`, `b`), non-word (`-`) and line-break bytes.
+/// Positions of an assertion pair `{P}` relative to a counted repetition
+/// with bounds `{C}`, over word (`a`, `b`), non-word (`-`), NUL, 0xFF and
+/// line-break bytes.
 const POSITIONS: [&str; 5] = [
-    "{P}(?:a|b-){1,3}",           // head
-    "[a\\n\\r-]{P}(?:a|b-){1,3}", // entry
-    "(?:a{P}|-){1,3}b",           // body
-    "(?:a|-b){1,3}{P}[a\\r\\n-]", // exit
-    "(?:a|-){1,3}{P}",            // tail
+    "{P}(?:a|b-|\\x00){C}",                // head
+    "[a\\n\\r\\x00\\xff-]{P}(?:a|b-){C}",  // entry
+    "(?:a{P}|-|\\xff){C}b",                // body
+    "(?:a|-b|\\x00){C}{P}[a\\r\\n\\xff-]", // exit
+    "(?:a|-|\\xff){C}{P}",                 // tail
 ];
 
-const PAIR_ALPHABET: &[u8] = b"ab-\r\n";
+/// Counted domains: finite, and unbounded (counts saturate at `min`).
+const COUNTERS: [&str; 2] = ["{1,3}", "{2,}"];
+
+const PAIR_ALPHABET: &[u8] = b"ab-\r\n\x00\xff";
+
+/// A pattern of the pair matrix.
+fn pair_pattern(position: &str, pair: &str, counter: &str) -> String {
+    position.replace("{P}", pair).replace("{C}", counter)
+}
 
 /// All ordered pairs (contradictions included) at every position, under
 /// the default and the counters-forced configurations: grouped against
@@ -374,10 +383,10 @@ fn assertion_pairs_at_every_position() {
     let inputs = all_strings(PAIR_ALPHABET, 4);
     let mut rng = Rng(7);
     let (mut admitted, mut rejected) = (0, 0);
-    for position in POSITIONS {
+    for (position, counter) in POSITIONS.iter().flat_map(|p| COUNTERS.map(|c| (p, c))) {
         for a in KINDS {
             for b in KINDS {
-                let pattern = position.replace("{P}", &format!("{a}{b}"));
+                let pattern = pair_pattern(position, &format!("{a}{b}"), counter);
                 let oracle = oracle(&pattern);
                 for (unroll, merge) in [CONFIGS[0], CONFIGS[2]] {
                     let re = compile(&pattern, unroll, merge);
@@ -387,14 +396,14 @@ fn assertion_pairs_at_every_position() {
                     }
                     admitted += 1;
                     let label = format!("`{pattern}` unroll={unroll}");
-                    for _ in 0..24 {
+                    for _ in 0..16 {
                         let input = &inputs[rng.below(inputs.len())];
                         let expected = oracle.is_match(input);
                         run_chunks(&re, &[input], expected, &label);
                         let bytes: Vec<&[u8]> = input.chunks(1).collect();
                         run_chunks(&re, &bytes, expected, &label);
                     }
-                    for _ in 0..6 {
+                    for _ in 0..4 {
                         let input = &inputs[rng.below(inputs.len())];
                         check_against_scalar(&re, input, &format!("{label} {input:?}"));
                     }
@@ -408,19 +417,237 @@ fn assertion_pairs_at_every_position() {
 }
 
 /// Short inputs over the pair alphabet, every partition and prefix, for
-/// one pattern per position with a contradiction-free mixed pair.
+/// one pattern per position and counted domain with a contradiction-free
+/// mixed pair: every input up to 3 bytes, and a sample of 4 and 5 bytes.
 #[test]
 fn assertion_patterns_every_cut() {
-    for position in POSITIONS {
+    let mut rng = Rng(11);
+    let longer: Vec<Vec<u8>> = (0..150)
+        .map(|_| {
+            (0..4 + rng.below(2))
+                .map(|_| PAIR_ALPHABET[rng.below(PAIR_ALPHABET.len())])
+                .collect()
+        })
+        .collect();
+    for (position, counter) in POSITIONS.iter().flat_map(|p| COUNTERS.map(|c| (p, c))) {
         for pair in [r"\b(?m:$)", r"(?mR:^)\B", r"\b{end}(?mR:$)", r"\z\B"] {
-            let pattern = position.replace("{P}", pair);
+            let pattern = pair_pattern(position, pair, counter);
             let oracle = oracle(&pattern);
             let re = forced(&pattern);
-            for input in all_strings(PAIR_ALPHABET, 4) {
-                check_all_cuts(&re, &oracle, &input, &format!("`{pattern}`"));
+            for input in all_strings(PAIR_ALPHABET, 3).iter().chain(&longer) {
+                check_all_cuts(&re, &oracle, input, &format!("`{pattern}`"));
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hand-built graphs
+// ---------------------------------------------------------------------------
+
+/// A regex whose NFA is `states`, started at state 0, for shapes that
+/// pattern normalisation might never produce.  Every DFA tier is off: only
+/// Tier 0, the grouped NFA and the scalar interpreter run on it.
+fn fixture_regex(states: Vec<State>, num_counters: usize) -> Regex {
+    let mut re = compile("a", 0, false);
+    re.states = crate::StateList(states.into_boxed_slice());
+    re.start = StateIdx(0);
+    re.num_counters = num_counters;
+    re.counter_info = Box::default();
+    re.start_closure = Box::default();
+    re.start_closure_matches = false;
+    re.dfa_eligible = false;
+    re.tier2_eligible = false;
+    re.tier2_overlap_proven = false;
+    re.tier2_analysis = None;
+    re.tier3_eligible = false;
+    re.tier3_analysis = None;
+    re.tier4_eligible = false;
+    re.prefilter = crate::Prefilter::None;
+    re.state_can_reach_match = vec![false; re.states.len()].into_boxed_slice();
+    re.counter_break_can_match = Box::default();
+    re.counter_body_states = Box::default();
+    let analysis = super::analyze(
+        &re.states,
+        &re.byte_tables,
+        re.start,
+        num_counters,
+        &[],
+        &super::Limits::DEFAULT,
+    );
+    re.grouped_nfa = Some(Box::new(match analysis {
+        Ok(plan) => super::GroupedNfa::Admitted(plan),
+        Err(r) => super::GroupedNfa::Rejected(r),
+    }));
+    re
+}
+
+fn by(b: u8, out: u32) -> State {
+    State::Byte {
+        byte: b,
+        out: StateIdx(out),
+        out_exit: StateIdx::NONE,
+    }
+}
+
+fn split(out: u32, out1: u32) -> State {
+    State::Split {
+        out: StateIdx(out),
+        out1: StateIdx(out1),
+    }
+}
+
+fn assert_(kind: AssertKind, out: u32) -> State {
+    State::Assert {
+        kind,
+        out: StateIdx(out),
+    }
+}
+
+fn ci(counter: u8, out: u32) -> State {
+    State::CounterInstance {
+        counter: crate::CounterIdx(counter),
+        out: StateIdx(out),
+    }
+}
+
+fn cinc(counter: u8, min: usize, max: usize, out: u32, out1: u32) -> State {
+    State::CounterIncrement {
+        counter: crate::CounterIdx(counter),
+        out: StateIdx(out),
+        out1: StateIdx(out1),
+        min,
+        max,
+    }
+}
+
+/// Run a fixture on every input up to 4 bytes over `alphabet`: every
+/// partition (with empty calls) against Tier 0 after each call, with the
+/// final answer from Tier 0 fed whole, and the scalar interpreter at every
+/// boundary.  Both references are independent of the grouped NFA, and
+/// Tier 0 parks deferred assertions where the grouped NFA replays them.
+/// Some inputs must match and some must not, so that a fixture cannot pass
+/// vacuously.
+fn check_fixture(re: &Regex, alphabet: &[u8], label: &str) {
+    plan(re);
+    let mut mem = MatcherMemory::default();
+    let mut matching = 0;
+    let inputs = all_strings(alphabet, 4);
+    for input in &inputs {
+        let mut nfa = mem.matcher_for_tier(re, 0).unwrap();
+        nfa.chunk(input);
+        let expected = nfa.finish();
+        matching += usize::from(expected);
+        for parts in partitions(input) {
+            run_chunks(re, &parts, expected, &format!("{label} {parts:?}"));
+        }
+        check_against_scalar(re, input, &format!("{label} {input:?}"));
+    }
+    assert!(
+        0 < matching && matching < inputs.len(),
+        "{label}: {matching} of {} inputs match",
+        inputs.len()
+    );
+}
+
+/// A guarded exit of the counter and a guarded bypass around it converge on
+/// one tail state: `(?:a{1,3}\b|\B)-`, with the tail shared.
+#[test]
+fn fixture_guarded_bypass_and_exit_share_the_tail() {
+    let re = fixture_regex(
+        vec![
+            split(1, 5),
+            ci(0, 2),
+            by(b'a', 3),
+            cinc(0, 1, 3, 2, 4),
+            assert_(AssertKind::WordAscii, 6),
+            assert_(AssertKind::WordAsciiNegate, 6),
+            by(b'-', 7),
+            State::Match,
+        ],
+        1,
+    );
+    check_fixture(&re, b"a- x", "shared tail");
+}
+
+/// A guarded and an unguarded body branch share the increment:
+/// `(?:a\b|b){2,3}!` with one `CounterIncrement` for both.
+#[test]
+fn fixture_body_branches_share_the_increment() {
+    let re = fixture_regex(
+        vec![
+            ci(0, 1),
+            split(2, 4),
+            by(b'a', 3),
+            assert_(AssertKind::WordAscii, 5),
+            by(b'b', 5),
+            cinc(0, 2, 3, 1, 6),
+            by(b'!', 7),
+            State::Match,
+        ],
+        1,
+    );
+    check_fixture(&re, b"ab! ", "shared increment");
+}
+
+/// Contradictory guards after a counter converge on one shared assertion:
+/// `a{1,4}(?:\b|\B)(?m:$)`, both guards feeding the same `(?m:$)` node.
+#[test]
+fn fixture_contradictory_guards_share_an_assertion() {
+    let re = fixture_regex(
+        vec![
+            ci(0, 1),
+            by(b'a', 2),
+            cinc(0, 1, 4, 1, 3),
+            split(4, 5),
+            assert_(AssertKind::WordAscii, 6),
+            assert_(AssertKind::WordAsciiNegate, 6),
+            assert_(AssertKind::EndLF, 7),
+            State::Match,
+        ],
+        1,
+    );
+    check_fixture(&re, b"a\n -", "shared assertion");
+}
+
+/// A guarded and a consuming path enter the same counter instance:
+/// `(?:(?m:^)|x)a{2}b`, one `CounterInstance` for both.
+#[test]
+fn fixture_guarded_and_consuming_entries_share_the_instance() {
+    let re = fixture_regex(
+        vec![
+            split(1, 2),
+            assert_(AssertKind::StartLF, 3),
+            by(b'x', 3),
+            ci(0, 4),
+            by(b'a', 5),
+            cinc(0, 2, 2, 4, 6),
+            by(b'b', 7),
+            State::Match,
+        ],
+        1,
+    );
+    check_fixture(&re, b"axb\n", "shared instance");
+}
+
+/// An assertion between one counter's break and the next counter's
+/// instance, with a saturating second counter: `a{1,2}\Bb{2,}`.
+#[test]
+fn fixture_guard_between_counters() {
+    let re = fixture_regex(
+        vec![
+            ci(0, 1),
+            by(b'a', 2),
+            cinc(0, 1, 2, 1, 3),
+            assert_(AssertKind::WordAsciiNegate, 4),
+            ci(1, 5),
+            by(b'b', 6),
+            cinc(1, 2, usize::MAX, 5, 7),
+            State::Match,
+        ],
+        2,
+    );
+    check_fixture(&re, b"ab- ", "guard between counters");
 }
 
 // ---------------------------------------------------------------------------
