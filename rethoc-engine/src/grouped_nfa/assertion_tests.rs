@@ -476,10 +476,6 @@ pub(crate) fn fixture_regex(states: Vec<State>, num_counters: usize) -> Regex {
         &[],
         &super::Limits::DEFAULT,
     );
-    re.grouped_nfa = Some(Box::new(match analysis {
-        Ok(plan) => super::GroupedNfa::Admitted(plan),
-        Err(r) => super::GroupedNfa::Rejected(r),
-    }));
     // The sparse counting variant of the same graph, where it is admitted.
     let structure = super::structure(
         &re.states,
@@ -489,19 +485,15 @@ pub(crate) fn fixture_regex(states: Vec<State>, num_counters: usize) -> Regex {
         &[],
         &super::Limits::DEFAULT,
     );
-    re.sparse_counting = Some(Box::new(
-        match super::sparse::analyze(
-            &re.states,
-            &re.classes,
-            &re.byte_tables,
-            re.start,
-            structure.as_ref().map_err(|r| *r),
-            &super::sparse::SparseLimits::DEFAULT,
-        ) {
-            Ok(plan) => super::SparseCounting::Admitted(plan),
-            Err(r) => super::SparseCounting::Rejected(r),
-        },
-    ));
+    let sparse = super::sparse::analyze(
+        &re.states,
+        &re.classes,
+        &re.byte_tables,
+        re.start,
+        structure.as_ref().map_err(|r| *r),
+        &super::sparse::SparseLimits::DEFAULT,
+    );
+    re.grouped_nfa = super::GroupedNfa::new(Some(analysis), Some(sparse));
     re
 }
 

@@ -3,7 +3,6 @@
 //! configuration modes; forced selection; diagnostics; and memory reuse
 //! across regexes and engines.
 
-use super::GroupedNfa;
 use super::tests::Rng;
 use crate::{
     AnyMatcher, Engine, GroupedNfaError, GroupedNfaMode, MatcherMemory, Regex, RegexConfig,
@@ -33,9 +32,7 @@ fn tiers(re: &Regex) -> [bool; 4] {
 }
 
 fn admitted(re: &Regex) -> Option<bool> {
-    re.grouped_nfa
-        .as_deref()
-        .map(|g| matches!(g, GroupedNfa::Admitted(_)))
+    re.grouped_plan_or_rejection().map(|g| g.is_ok())
 }
 
 fn oracle(pattern: &str) -> regex::bytes::Regex {

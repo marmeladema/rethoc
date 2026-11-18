@@ -57,24 +57,25 @@ pub(crate) fn next_start(
     prefilter: &Prefilter,
     starts: &[bool; 256],
     input: &[u8],
-    from: usize,
+    mut i: usize,
 ) -> Option<usize> {
-    let has_prefilter = !matches!(prefilter, Prefilter::None);
-    let mut i = from;
-    while i < input.len() {
-        let rest = &input[i..];
-        let off = if has_prefilter {
-            prefilter.find(rest)
-        } else {
-            rest.iter().position(|&b| starts[b as usize])
-        };
-        match off {
-            Some(off) if starts[rest[off] as usize] => return Some(i + off),
-            Some(off) => i += off + 1,
-            None => return None,
+    if matches!(prefilter, Prefilter::None) {
+        return input[i..]
+            .iter()
+            .position(|&b| starts[b as usize])
+            .map(|off| i + off);
+    }
+    loop {
+        // A candidate of the prefilter that starts nothing is skipped.
+        let off = prefilter.find(&input[i..])?;
+        if starts[input[i + off] as usize] {
+            return Some(i + off);
+        }
+        i += off + 1;
+        if i >= input.len() {
+            return None;
         }
     }
-    None
 }
 
 /// Whether every active node is count-free.

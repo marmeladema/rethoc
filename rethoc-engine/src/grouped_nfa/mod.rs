@@ -399,32 +399,75 @@ impl fmt::Display for GroupedNfaPlan {
 pub(crate) enum GroupedNfa {
     Admitted(GroupedNfaPlan),
     Rejected(Rejection),
+    /// Compiled with the experimental
+    /// [`RegexConfig::sparse_counting`](crate::RegexConfig::sparse_counting):
+    /// both analyses, behind one more box so that this enum, and with it
+    /// every regex compiled without the experiment, is what it is without
+    /// it.
+    WithSparse(Box<WithSparse>),
+}
+
+/// The analyses of a regex compiled with the sparse counting experiment.
+#[derive(Debug)]
+pub(crate) struct WithSparse {
+    /// The exact grouped analysis, when it ran too.
+    exact: Option<Result<GroupedNfaPlan, Rejection>>,
+    sparse: Result<sparse::SparsePlan, SparseRejection>,
 }
 
 impl GroupedNfa {
-    /// Heap bytes beyond the boxed enum itself.
-    pub(crate) fn heap_bytes(&self) -> usize {
+    /// Store the outcomes of the analyses that ran: `None` when neither
+    /// did.
+    pub(crate) fn new(
+        exact: Option<Result<GroupedNfaPlan, Rejection>>,
+        sparse: Option<Result<sparse::SparsePlan, SparseRejection>>,
+    ) -> Option<Box<Self>> {
+        Some(Box::new(match (exact, sparse) {
+            (None, None) => return None,
+            (Some(Ok(plan)), None) => GroupedNfa::Admitted(plan),
+            (Some(Err(rejection)), None) => GroupedNfa::Rejected(rejection),
+            (exact, Some(sparse)) => GroupedNfa::WithSparse(Box::new(WithSparse { exact, sparse })),
+        }))
+    }
+
+    /// The exact grouped analysis: its plan or its rejection, `None` when
+    /// it did not run.
+    pub(crate) fn exact(&self) -> Option<Result<&GroupedNfaPlan, Rejection>> {
         match self {
-            GroupedNfa::Admitted(plan) => plan.heap_bytes(),
-            GroupedNfa::Rejected(_) => 0,
+            GroupedNfa::Admitted(plan) => Some(Ok(plan)),
+            GroupedNfa::Rejected(rejection) => Some(Err(*rejection)),
+            GroupedNfa::WithSparse(both) => both.exact.as_ref().map(|e| e.as_ref().map_err(|r| *r)),
         }
     }
-}
 
-/// The outcome of the sparse counting analysis of a regex compiled with
-/// [`RegexConfig::sparse_counting`](crate::RegexConfig::sparse_counting).
-#[derive(Debug)]
-pub(crate) enum SparseCounting {
-    Admitted(sparse::SparsePlan),
-    Rejected(SparseRejection),
-}
+    /// The sparse counting analysis, likewise.
+    pub(crate) fn sparse(&self) -> Option<Result<&sparse::SparsePlan, SparseRejection>> {
+        match self {
+            GroupedNfa::WithSparse(both) => Some(both.sparse.as_ref().map_err(|r| *r)),
+            _ => None,
+        }
+    }
 
-impl SparseCounting {
     /// Heap bytes beyond the boxed enum itself.
     pub(crate) fn heap_bytes(&self) -> usize {
+        self.exact()
+            .and_then(Result::ok)
+            .map_or(0, GroupedNfaPlan::heap_bytes)
+            + self.sparse_bytes()
+    }
+
+    /// Of [`heap_bytes`](Self::heap_bytes), what the sparse counting
+    /// experiment holds: its box and its plan.
+    pub(crate) fn sparse_bytes(&self) -> usize {
         match self {
-            SparseCounting::Admitted(plan) => plan.heap_bytes(),
-            SparseCounting::Rejected(_) => 0,
+            GroupedNfa::WithSparse(both) => {
+                size_of::<WithSparse>()
+                    + both
+                        .sparse
+                        .as_ref()
+                        .map_or(0, sparse::SparsePlan::heap_bytes)
+            }
+            _ => 0,
         }
     }
 }
@@ -485,19 +528,38 @@ impl std::error::Error for GroupedNfaError {}
 impl Regex {
     /// The grouped plan of this regex, or why there is none.
     pub(crate) fn grouped_plan(&self) -> Result<&GroupedNfaPlan, GroupedNfaError> {
+        // Every `chunk` call comes through here: the plan of a regex
+        // compiled without the sparse experiment is one match away.
         match self.grouped_nfa.as_deref() {
-            None => Err(GroupedNfaError::NotRequested),
-            Some(GroupedNfa::Rejected(r)) => Err(GroupedNfaError::Rejected(*r)),
             Some(GroupedNfa::Admitted(plan)) => Ok(plan),
+            None => Err(GroupedNfaError::NotRequested),
+            Some(other) => match other.exact() {
+                None => Err(GroupedNfaError::NotRequested),
+                Some(Err(r)) => Err(GroupedNfaError::Rejected(r)),
+                Some(Ok(plan)) => Ok(plan),
+            },
         }
+    }
+
+    /// The exact grouped analysis, when it ran: its plan or its rejection.
+    pub(crate) fn grouped_plan_or_rejection(&self) -> Option<Result<&GroupedNfaPlan, Rejection>> {
+        self.grouped_nfa.as_deref().and_then(GroupedNfa::exact)
+    }
+
+    /// The sparse counting analysis, when it ran: its plan or its
+    /// rejection.
+    pub(crate) fn sparse_plan_or_rejection(
+        &self,
+    ) -> Option<Result<&sparse::SparsePlan, SparseRejection>> {
+        self.grouped_nfa.as_deref().and_then(GroupedNfa::sparse)
     }
 
     /// The sparse counting plan of this regex, or why there is none.
     pub(crate) fn sparse_plan(&self) -> Result<&sparse::SparsePlan, SparseCountingError> {
-        match self.sparse_counting.as_deref() {
+        match self.grouped_nfa.as_deref().and_then(GroupedNfa::sparse) {
             None => Err(SparseCountingError::NotRequested),
-            Some(SparseCounting::Rejected(r)) => Err(SparseCountingError::Rejected(*r)),
-            Some(SparseCounting::Admitted(plan)) => Ok(plan),
+            Some(Err(r)) => Err(SparseCountingError::Rejected(r)),
+            Some(Ok(plan)) => Ok(plan),
         }
     }
 
