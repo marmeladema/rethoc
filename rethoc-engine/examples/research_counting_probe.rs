@@ -1,9 +1,13 @@
 //! Process-isolated counting probe. See docs/research/counting-benchmark-method.md.
+//!
+//! `tier` is 0-4, or `grouped` for the experimental grouped NFA (compiled
+//! with `RegexConfig::grouped_nfa`; `ineligible` when it does not admit the
+//! pattern).
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use rethoc_engine::{MatcherMemory, Regex, RegexConfig};
+use rethoc_engine::{GroupedScratch, GroupedStream, MatcherMemory, Regex, RegexConfig};
 
 fn main() {
     let args: Vec<_> = std::env::args().collect();
@@ -15,7 +19,13 @@ fn main() {
     let family = &args[1];
     let bound: usize = args[2].parse().expect("bound");
     let bytes: usize = args[3].parse().expect("bytes");
-    let tier: u8 = args[4].parse().expect("tier");
+    let tier_arg = args[4].as_str();
+    let grouped = tier_arg == "grouped";
+    let tier: u8 = if grouped {
+        0
+    } else {
+        tier_arg.parse().expect("tier: 0-4 or grouped")
+    };
     let chunk: usize = args[5].parse().expect("chunk");
     let counters = args[6] == "counters";
     let pattern = match family.as_str() {
@@ -24,22 +34,48 @@ fn main() {
         "variable" => format!("(a|aa){{1,{bound}}}b"),
         "prefix" => format!("a(a|aa){{1,{bound}}}b"),
         "nested" => format!("((a|aa){{1,{bound}}}){{1,{bound}}}b"),
+        "exact" => format!("a(a|aa){{{bound}}}b"),
+        "mixed" => format!("x(a|aa|b){{{},{bound}}}z", bound / 2),
+        // Sparse activation: the counted body is rarely entered.
+        "sparse" => format!("a(a|aa){{1,{bound}}}b"),
+        // Counter-free control (`bound` unused).
+        "control" => "abc|abd".to_string(),
         _ => panic!("unknown family"),
     };
     let config = RegexConfig {
         max_estimated_states: 65536,
         max_unroll_states: if counters { 0 } else { 32 },
         merge_repetitions: !counters,
+        grouped_nfa: grouped,
         ..RegexConfig::default()
     };
     let start = Instant::now();
     let re = Regex::with_config(&pattern, config).expect("compile probe");
     let compile_us = start.elapsed().as_secs_f64() * 1e6;
     let mut hay = vec![b'a'; bytes];
-    if family == "phase" {
-        for byte in hay.iter_mut().skip(1).step_by(2) {
-            *byte = b'b';
+    match family.as_str() {
+        "phase" => {
+            for byte in hay.iter_mut().skip(1).step_by(2) {
+                *byte = b'b';
+            }
         }
+        // A new `x` every 7 bytes over `a`/`b`: many overlapping instances.
+        "mixed" => {
+            for (i, byte) in hay.iter_mut().enumerate() {
+                *byte = match (i % 7, i % 2) {
+                    (0, _) => b'x',
+                    (_, 0) => b'a',
+                    _ => b'b',
+                };
+            }
+        }
+        // One `a` every 512 bytes of `q`.
+        "sparse" | "control" => {
+            for (i, byte) in hay.iter_mut().enumerate() {
+                *byte = if i % 512 == 0 { b'a' } else { b'q' };
+            }
+        }
+        _ => {}
     }
     let oracle = regex::bytes::RegexBuilder::new(&pattern)
         .unicode(false)
@@ -52,14 +88,31 @@ fn main() {
         "probe must consume a complete unsuccessful stream"
     );
     let mut memory = MatcherMemory::default();
-    if memory.matcher_for_tier(&re, tier).is_err() {
+    let eligible = if grouped {
+        re.grouped_nfa_admission().is_ok()
+    } else {
+        memory.matcher_for_tier(&re, tier).is_ok()
+    };
+    if !eligible {
         println!(
-            "{family},{bound},{bytes},{tier},{chunk},{},ineligible",
+            "{family},{bound},{bytes},{tier_arg},{chunk},{},ineligible",
             args[6]
         );
         return;
     }
+    // The grouped NFA: one stream, reset between scans like a reused
+    // matcher; its scratch is kept like a `MatcherMemory`.
+    let mut scratch = GroupedScratch::new();
+    let mut stream = grouped.then(|| GroupedStream::new(&re, &mut scratch).expect("admitted"));
     let mut run = || {
+        if let Some(stream) = stream.as_mut() {
+            stream.reset(&re, &mut scratch);
+            for part in black_box(&hay).chunks(chunk) {
+                stream.chunk(&re, &mut scratch, part);
+            }
+            assert_eq!(black_box(stream.finish(&re, &mut scratch)), expected);
+            return;
+        }
         let mut matcher = memory.matcher_for_tier(&re, tier).expect("eligible");
         for part in black_box(&hay).chunks(chunk) {
             matcher.chunk(part);
@@ -80,7 +133,7 @@ fn main() {
     }
     let elapsed = start.elapsed().as_secs_f64();
     println!(
-        "{family},{bound},{bytes},{tier},{chunk},{},{},{},{compile_us:.3},{cold_us:.3},{runs},{:.3},{:.3}",
+        "{family},{bound},{bytes},{tier_arg},{chunk},{},{},{},{compile_us:.3},{cold_us:.3},{runs},{:.3},{:.3}",
         args[6],
         re.min_tier(),
         re.memory_size(),

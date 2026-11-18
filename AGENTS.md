@@ -46,6 +46,15 @@ Eligibility is decided per tier at compile time from pattern analysis.
   defect; record it (see below).
 - **4** — counter programs, nested repetitions.
 
+**Grouped NFA** (experimental, `rethoc-engine/src/grouped_nfa/`,
+`plans/grouped-nfa.md`): not a tier and never chosen by dispatch. It
+runs only when a regex is compiled with `RegexConfig::grouped_nfa` and
+driven through `GroupedStream`. It keeps one bitset of counts per NFA
+state instead of one thread per count, and admits flat counters (no
+nesting, no zero-width cycle, frontier within 8,192 words). It must
+agree with the NFA exactly. The tests, the checking commands, the
+proptests and the cargo-fuzz targets run it on everything it admits.
+
 Repetitions are unrolled up to `max_unroll_states` and same-body
 repetitions merged, so a pattern may need counters only with unrolling or
 merging disabled. Many counter-tier bugs only show up that way.
@@ -93,6 +102,8 @@ cargo run --release -- info '<pattern>'        # tier, memory, counters
 cargo run --release -- match --debug --chunk-size 1 '<pattern>' '<input>'
 cargo run --release -- match --tier 3 --unroll-limit 0 --no-merge '<pattern>' '<input>'
 cargo run --release -- dump --dfa '<pattern>'  # NFA, classes, tier analysis
+cargo run --release -- match --grouped-nfa --debug --chunk-size 1 '<pattern>' '<input>'  # grouped rows per step
+cargo run --release -- info --grouped-nfa '<pattern>'  # grouped admission, plan and stream sizes
 ```
 
 `--debug` prints matcher state after every chunk. Run the same input with
@@ -103,7 +114,10 @@ Options go after the command name; `rethoc <command> --help` lists them.
 ## Differential tools
 
 `brute`, `fuzz`, `shrink` and `sweep` check rethoc against the `regex`
-crate: the NFA and every eligible tier, each fed whole and byte by byte.
+crate: the NFA, every eligible tier and the grouped NFA when it admits
+the pattern (`grouped` in the backend lists, with the rejection reason
+when it does not), each fed whole and byte by byte. `--grouped-nfa`
+checks only the NFA and the grouped NFA.
 Unless given `--unroll-limit` or `--no-merge`, they compile each pattern
 three ways: default, unrolling off, unrolling and merging off. Inputs are
 read and printed with byte escapes (`\n`, `\xNN`), and every mismatch
@@ -129,6 +143,7 @@ rethoc sweep --max-len 4 assert-edges # shorter inputs, e.g. for a debug build
 rethoc sweep tier3-assert
 rethoc sweep --tier 3 tier3-assert    # only the NFA and Tier 3
 rethoc sweep --list tier3-assert      # print the runs instead
+rethoc fuzz --grouped-nfa --batch 250 0 9000   # only the NFA and the grouped NFA
 ```
 
 - `fuzz` seed numbers are stable: a seed is a pattern plus inputs anyone
@@ -297,10 +312,14 @@ from a seed; the oracle is the `regex` crate or the NFA.
 ```bash
 cargo test test_fuzz -- --ignored     # proptest: oracle + cross-tier
 cargo +nightly fuzz run fuzz_match         # vs regex crate
-cargo +nightly fuzz run fuzz_differential  # tiers vs NFA
+cargo +nightly fuzz run fuzz_differential  # tiers and grouped NFA vs NFA
 cargo +nightly fuzz run fuzz_compile       # compilation robustness
 cargo +nightly fuzz run fuzz_match fuzz/artifacts/fuzz_match/<artifact>   # replay
 ```
+
+cargo-fuzz builds use ASan, whose shadow reservation fails under the
+memory cap: run them with `RETHOC_CAP_MEM=0` (time cap only) and
+libFuzzer's own `-rss_limit_mb`.
 
 The cargo-fuzz targets use the first half of the input as the pattern
 seed and the second half as the input seed:

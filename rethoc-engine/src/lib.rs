@@ -15255,6 +15255,7 @@ mod tests {
             Err(_) => return,
         };
         let mut builder = RegexBuilder::default();
+        builder.config_mut().grouped_nfa = true;
         let re = match builder.build(&hir) {
             Ok(r) => r,
             Err(_) => return,
@@ -15268,6 +15269,7 @@ mod tests {
         };
 
         let mut memory = MatcherMemory::default();
+        let mut grouped_scratch = GroupedScratch::new();
 
         for input in inputs {
             let expected = oracle.is_match(input);
@@ -15324,6 +15326,15 @@ mod tests {
                     );
                 }
             }
+            // The experimental grouped NFA, when it admits the pattern.
+            if let Some(grouped) = re.grouped_is_match(&mut grouped_scratch, input) {
+                assert_eq!(
+                    grouped,
+                    expected,
+                    "grouped NFA mismatch for pattern `{pattern}` on input {:?}",
+                    &input[..input.len().min(80)]
+                );
+            }
         }
 
         // Second pass: recompile with unrolling disabled to exercise
@@ -15368,6 +15379,15 @@ mod tests {
                             expected
                         );
                     }
+                }
+                // The experimental grouped NFA, when it admits the pattern.
+                if let Some(grouped) = re_no_unroll.grouped_is_match(&mut grouped_scratch, input) {
+                    assert_eq!(
+                        grouped,
+                        expected,
+                        "grouped NFA mismatch for pattern `{pattern}` on input {:?}",
+                        &input[..input.len().min(80)]
+                    );
                 }
             }
         }
@@ -15429,12 +15449,14 @@ mod tests {
                 None => return Ok(()),
             };
             let mut builder = RegexBuilder::default();
+            builder.config_mut().grouped_nfa = true;
             let re = match builder.build(&hir) {
                 Ok(r) => r,
                 Err(_) => return Ok(()),
             };
 
             let mut memory = MatcherMemory::default();
+            let mut grouped_scratch = GroupedScratch::new();
 
             for input in &inputs {
                 // NFA result is the oracle.
@@ -15453,6 +15475,14 @@ mod tests {
                             &input[..input.len().min(80)], input.len()
                         );
                     }
+                }
+                // The experimental grouped NFA, when it admits the pattern.
+                if let Some(grouped) = re.grouped_is_match(&mut grouped_scratch, input) {
+                    assert_eq!(
+                        grouped, nfa_result,
+                        "grouped NFA mismatch for pattern `{pattern}` on input {:?}",
+                        &input[..input.len().min(80)]
+                    );
                 }
             }
         }

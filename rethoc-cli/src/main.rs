@@ -10,7 +10,7 @@ use std::process;
 use std::str::FromStr;
 
 use bpaf::{Args, Bpaf};
-use rethoc_engine::{Regex, RegexConfig};
+use rethoc_engine::{GroupedScratch, GroupedStream, Regex, RegexConfig};
 
 mod check;
 
@@ -146,6 +146,9 @@ enum Opts {
         /// Output format: text, json or debug
         #[bpaf(long, argument("FORMAT"), fallback(Format::Text))]
         format: Format,
+        /// Also analyse the pattern for the experimental grouped NFA
+        #[bpaf(long)]
+        grouped_nfa: bool,
         #[bpaf(external(compile_args))]
         compile: CompileArgs,
         #[bpaf(positional("PATTERN"))]
@@ -168,6 +171,10 @@ enum Opts {
         /// Force an execution tier (0 = NFA, 1-4 = DFA tiers)
         #[bpaf(long, argument("TIER"))]
         tier: Option<u8>,
+        /// Run the experimental grouped NFA (not a tier; never chosen by
+        /// default)
+        #[bpaf(long)]
+        grouped_nfa: bool,
         /// Print matcher state after each step
         #[bpaf(long)]
         debug: bool,
@@ -201,6 +208,9 @@ enum Opts {
         /// Include tier-specific DFA analysis
         #[bpaf(long)]
         dfa: bool,
+        /// Also analyse the pattern for the experimental grouped NFA
+        #[bpaf(long)]
+        grouped_nfa: bool,
         #[bpaf(external(compile_args))]
         compile: CompileArgs,
         #[bpaf(positional("PATTERN"))]
@@ -237,6 +247,15 @@ fn validate_tier(tier: Option<u8>) {
         && t > 4
     {
         eprintln!("error: --tier must be 0, 1, 2, 3, or 4");
+        process::exit(check::EXIT_USAGE);
+    }
+}
+
+/// Exit with a usage error if `--grouped-nfa` is combined with a tier
+/// selection: it selects a backend that is not a tier.
+fn validate_grouped(grouped: bool, tier: Option<u8>, skip_tier: Option<u8>) {
+    if grouped && (tier.is_some() || skip_tier.is_some()) {
+        eprintln!("error: --grouped-nfa cannot be combined with --tier or --skip-tier");
         process::exit(check::EXIT_USAGE);
     }
 }
@@ -297,6 +316,67 @@ fn run_dump(pattern: &str, config: RegexConfig, format: Format, dfa: bool) {
             eprintln!("error: JSON format is not supported for 'dump' (use 'info' instead)");
             process::exit(check::EXIT_USAGE);
         }
+    }
+}
+
+/// `match --grouped-nfa`: like [`run_match`], on a grouped NFA stream.
+fn run_match_grouped(
+    pattern: &str,
+    inputs: &[String],
+    chunk_size: Option<usize>,
+    mut config: RegexConfig,
+    debug: bool,
+) {
+    config.grouped_nfa = true;
+    let regex = parse_pattern(pattern, config);
+    if let Err(e) = regex.grouped_nfa_admission() {
+        eprintln!("error: {e}");
+        process::exit(1);
+    }
+    let info = regex.info();
+    let g = info.grouped_nfa.as_ref().expect("requested");
+    eprintln!("pattern: {pattern}");
+    eprintln!(
+        "grouped NFA: {} rows, {} words; plan {} bytes, stream {} bytes, scratch {} bytes",
+        g.rows, g.row_words, g.plan_bytes, g.stream_bytes, g.scratch_bytes
+    );
+    if let Some(cs) = chunk_size {
+        eprintln!("chunk_size: {cs}");
+    }
+    eprintln!();
+
+    let mut scratch = GroupedScratch::new();
+    let mut any_failed = false;
+    for input in inputs {
+        let bytes = input.as_bytes();
+        let mut stream = GroupedStream::new(&regex, &mut scratch).expect("admitted");
+        if debug {
+            eprintln!("--- input: {:?} ---", input);
+            eprintln!("[init] {}", stream.display(&regex));
+        }
+        let cs = chunk_size.unwrap_or(bytes.len().max(1));
+        for (i, chunk) in bytes.chunks(cs).enumerate() {
+            stream.chunk(&regex, &mut scratch, chunk);
+            if debug {
+                eprintln!(
+                    "[after chunk #{} {:?} (bytes {}..{})] {}",
+                    i,
+                    String::from_utf8_lossy(chunk),
+                    i * cs,
+                    i * cs + chunk.len(),
+                    stream.display(&regex)
+                );
+            }
+        }
+        if stream.finish(&regex, &mut scratch) {
+            println!("  \x1b[32mMATCH\x1b[0m  {:?}", input);
+        } else {
+            println!("  \x1b[31mNO MATCH\x1b[0m  {:?}", input);
+            any_failed = true;
+        }
+    }
+    if any_failed {
+        process::exit(1);
     }
 }
 
@@ -430,24 +510,35 @@ fn main() {
     match parse_args() {
         Opts::Info {
             format,
+            grouped_nfa,
             compile,
             pattern,
-        } => run_info(&pattern, compile.config(), format),
+        } => {
+            let mut config = compile.config();
+            config.grouped_nfa = grouped_nfa;
+            run_info(&pattern, config, format)
+        }
         Opts::Dot { compile, pattern } => run_dot(&pattern, compile.config()),
         Opts::Match {
             chunk_size,
             tier,
+            grouped_nfa,
             debug,
             compile,
             pattern,
             inputs,
         } => {
             validate_tier(tier);
+            validate_grouped(grouped_nfa, tier, None);
             if chunk_size == Some(0) {
                 eprintln!("error: --chunk-size must be > 0");
                 process::exit(check::EXIT_USAGE);
             }
-            run_match(&pattern, &inputs, chunk_size, tier, compile.config(), debug)
+            if grouped_nfa {
+                run_match_grouped(&pattern, &inputs, chunk_size, compile.config(), debug)
+            } else {
+                run_match(&pattern, &inputs, chunk_size, tier, compile.config(), debug)
+            }
         }
         Opts::Grep {
             quiet,
@@ -458,25 +549,34 @@ fn main() {
         Opts::Dump {
             format,
             dfa,
+            grouped_nfa,
             compile,
             pattern,
-        } => run_dump(&pattern, compile.config(), format, dfa),
+        } => {
+            let mut config = compile.config();
+            config.grouped_nfa = grouped_nfa;
+            run_dump(&pattern, config, format, dfa)
+        }
         Opts::Brute(args) => {
             validate_tier(args.tier);
             validate_skip_tier(args.tier, args.skip_tier);
+            validate_grouped(args.grouped_nfa, args.tier, args.skip_tier);
             process::exit(check::brute::run(&args))
         }
         Opts::Fuzz(args) => {
             validate_tier(args.tier);
+            validate_grouped(args.grouped_nfa, args.tier, None);
             process::exit(check::fuzz::run(&args))
         }
         Opts::Shrink(args) => {
             validate_tier(args.tier);
+            validate_grouped(args.grouped_nfa, args.tier, None);
             process::exit(check::shrink::run(&args))
         }
         Opts::Sweep(args) => {
             validate_tier(args.tier);
             validate_skip_tier(args.tier, args.skip_tier);
+            validate_grouped(args.grouped_nfa, args.tier, args.skip_tier);
             process::exit(check::sweep::run(&args))
         }
     }

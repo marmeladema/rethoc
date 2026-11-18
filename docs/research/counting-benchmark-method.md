@@ -17,6 +17,14 @@ rustc -Vv > target/research-counting/compiler.txt
 git rev-parse HEAD > target/research-counting/revision.txt
 ```
 
+For the grouped NFA comparison (`plans/grouped-nfa.md`, §8), run
+`python3 scripts/research_counting_probe.py --grouped` instead: every
+family and bound on tiers 0-4 and on the grouped NFA (`tier` column
+`grouped`), under forced counters and default compilation, plus the
+`exact`, `mixed`, `sparse` (rare activation) and `control` (counter-free)
+families.  The grouped NFA is timed on one stream reset between scans,
+with its scratch kept, like a reused `MatcherMemory`.
+
 Also record CPU/architecture, OS, dependency resolution, build configuration,
 CPU affinity, and relevant machine load with the results. Cargo.lock is ignored
 by this repository; retain a copy with local results to identify dependencies.

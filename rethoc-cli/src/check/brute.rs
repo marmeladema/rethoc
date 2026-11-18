@@ -6,8 +6,8 @@
 use bpaf::Bpaf;
 
 use super::{
-    EXIT_MISMATCH, EXIT_OK, EXIT_REJECTED, EXIT_USAGE, Failure, Reference, Subject, describe,
-    escape, new_memory, shrink_command, unescape,
+    Backend, EXIT_MISMATCH, EXIT_OK, EXIT_REJECTED, EXIT_USAGE, Failure, Reference, Subject,
+    describe, escape, new_memory, shrink_command, unescape,
 };
 use crate::{CompileArgs, compile_args};
 
@@ -27,6 +27,10 @@ pub(crate) struct BruteArgs {
     /// Check every eligible tier but this one
     #[bpaf(long, argument("TIER"))]
     pub(crate) skip_tier: Option<u8>,
+    /// Check only the NFA and the experimental grouped NFA; patterns it
+    /// does not admit are rejected
+    #[bpaf(long)]
+    pub(crate) grouped_nfa: bool,
     /// Mismatching inputs to print per configuration; stops after the
     /// length where this many were found
     #[bpaf(long, argument("N"), fallback(3), display_fallback)]
@@ -65,7 +69,7 @@ pub(crate) fn run(args: &BruteArgs) -> i32 {
     let mut failures: Vec<Failure> = Vec::new();
     let (mut checked, mut mismatched) = (0usize, 0usize);
     for config in args.compile.check_configs() {
-        let choice = super::TierChoice::new(args.tier, args.skip_tier);
+        let choice = super::TierChoice::new(args.tier, args.skip_tier, args.grouped_nfa);
         let subject = match Subject::compile(pattern, &config, choice, &mut memory) {
             Ok(s) => s,
             Err(e) => {
@@ -89,7 +93,7 @@ pub(crate) fn run(args: &BruteArgs) -> i32 {
                 total += 1;
                 if !failures.is_empty() {
                     bad += 1;
-                    if failures.iter().any(|f| f.tier == 0) {
+                    if failures.iter().any(|f| f.backend == Backend::NFA) {
                         nfa_bad += 1;
                     }
                     if bad as usize <= args.show {
@@ -115,10 +119,10 @@ pub(crate) fn run(args: &BruteArgs) -> i32 {
 
         let stopped = stopped_at.map_or(String::new(), |l| format!(" (stopped after length {l})"));
         println!(
-            "`{pattern}` {} min_tier={} tiers={:?}: {bad} mismatches / {total} inputs, nfa: {nfa_bad}{stopped}",
+            "`{pattern}` {} min_tier={} tiers={}: {bad} mismatches / {total} inputs, nfa: {nfa_bad}{stopped}",
             describe(&config),
             subject.regex.min_tier(),
-            subject.tiers,
+            subject.describe_backends(),
         );
         if let Some(input) = first_bad {
             mismatched += 1;

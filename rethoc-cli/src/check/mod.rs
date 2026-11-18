@@ -2,8 +2,9 @@
 //!
 //! Every command judges a pattern the same way ([`Subject::check`]): the
 //! `regex` crate (compiled with `(?s-u)`, as in the test suite) is the
-//! reference, and the NFA and every eligible DFA tier, each fed the whole
-//! input and fed one byte at a time, must agree with it.
+//! reference, and the NFA, every eligible DFA tier and, when it admits the
+//! pattern, the experimental grouped NFA, each fed the whole input and fed
+//! one byte at a time, must agree with it.
 //!
 //! Inputs are read and printed with Rust byte escapes ([`escape`],
 //! [`unescape`]), so any input a command prints can be pasted back into
@@ -15,10 +16,13 @@ pub(crate) mod fuzz;
 pub(crate) mod shrink;
 pub(crate) mod sweep;
 
+use std::cell::RefCell;
 use std::fmt;
 use std::sync::OnceLock;
 
-use rethoc_engine::{MatcherMemory, Regex, RegexConfig};
+use rethoc_engine::{
+    GroupedNfaError, GroupedScratch, GroupedStream, MatcherMemory, Regex, RegexConfig,
+};
 
 use crate::CompileArgs;
 
@@ -71,20 +75,54 @@ impl fmt::Display for Feed {
     }
 }
 
+/// An execution backend: a tier (0 = NFA), or the experimental grouped
+/// NFA, which is not a tier and is never selected by default dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Backend {
+    Tier(u8),
+    Grouped,
+}
+
+impl Backend {
+    /// The NFA, the reference among the backends.
+    pub(crate) const NFA: Backend = Backend::Tier(0);
+}
+
+impl fmt::Display for Backend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tier(t) => write!(f, "tier{t}"),
+            Self::Grouped => f.write_str("grouped"),
+        }
+    }
+}
+
+/// `[0, 3, grouped]`: tiers by number, then the grouped NFA.
+pub(crate) fn backend_list(backends: &[Backend]) -> String {
+    let names: Vec<String> = backends
+        .iter()
+        .map(|b| match b {
+            Backend::Tier(t) => t.to_string(),
+            Backend::Grouped => "grouped".into(),
+        })
+        .collect();
+    format!("[{}]", names.join(", "))
+}
+
 /// One disagreement with the reference.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Failure {
-    /// Tier that disagreed (0 = NFA).
-    pub(crate) tier: u8,
+    /// Backend that disagreed.
+    pub(crate) backend: Backend,
     /// How the input was fed.
     pub(crate) feed: Feed,
-    /// What the tier answered; the reference said the opposite.
+    /// What the backend answered; the reference said the opposite.
     pub(crate) got: bool,
 }
 
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "tier{}/{}={}", self.tier, self.feed, self.got)
+        write!(f, "{}/{}={}", self.backend, self.feed, self.got)
     }
 }
 
@@ -92,6 +130,7 @@ impl fmt::Display for Failure {
 pub(crate) enum Rejection {
     Compile(rethoc_engine::Error),
     NotEligible { tier: u8, min_tier: u8 },
+    NotAdmitted(GroupedNfaError),
 }
 
 impl fmt::Display for Rejection {
@@ -101,80 +140,124 @@ impl fmt::Display for Rejection {
             Self::NotEligible { tier, min_tier } => {
                 write!(f, "not eligible for tier {tier} (min_tier={min_tier})")
             }
+            Self::NotAdmitted(e) => write!(f, "{e}"),
         }
     }
 }
 
-/// Which tiers a check runs, next to the NFA.
+/// Which backends a check runs, next to the NFA.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum TierChoice {
-    /// Every tier the pattern is eligible for.
+    /// Every tier the pattern is eligible for, and the grouped NFA if it
+    /// admits the pattern.
     #[default]
     All,
     /// Only this tier; a pattern not eligible for it is rejected.
     Only(u8),
-    /// Every eligible tier but this one.
+    /// Every eligible tier but this one, and the grouped NFA.
     Except(u8),
+    /// Only the grouped NFA; a pattern it does not admit is rejected.
+    Grouped,
 }
 
 impl TierChoice {
-    /// From `--tier` and `--skip-tier`; `--tier` wins (the command line
-    /// is checked for both being given before this is called).
-    pub(crate) fn new(only: Option<u8>, skip: Option<u8>) -> Self {
-        match (only, skip) {
-            (Some(t), _) => Self::Only(t),
-            (None, Some(t)) => Self::Except(t),
-            (None, None) => Self::All,
+    /// From `--tier`, `--skip-tier` and `--grouped-nfa` (the command line
+    /// is checked for combining them before this is called).
+    pub(crate) fn new(only: Option<u8>, skip: Option<u8>, grouped: bool) -> Self {
+        match (only, skip, grouped) {
+            (_, _, true) => Self::Grouped,
+            (Some(t), _, _) => Self::Only(t),
+            (None, Some(t), _) => Self::Except(t),
+            (None, None, false) => Self::All,
         }
+    }
+
+    /// Whether the grouped NFA is among the backends to check.
+    fn wants_grouped(self) -> bool {
+        matches!(self, Self::All | Self::Except(_) | Self::Grouped)
     }
 }
 
-/// A pattern compiled in one configuration, with the tiers to check.
+/// A pattern compiled in one configuration, with the backends to check.
 pub(crate) struct Subject {
-    /// Configuration the pattern was compiled with.
+    /// Configuration the pattern was compiled with (without the grouped
+    /// option, which never changes the NFA the tiers run on).
     pub(crate) config: RegexConfig,
     /// The compiled pattern.
     pub(crate) regex: Regex,
-    /// Tier 0 first, then the eligible DFA tiers the [`TierChoice`] keeps.
-    pub(crate) tiers: Vec<u8>,
+    /// Tier 0 first, then the eligible DFA tiers the [`TierChoice`] keeps,
+    /// then the grouped NFA when it is kept and admits the pattern.
+    pub(crate) backends: Vec<Backend>,
+    /// Why the grouped NFA is not among the backends, when it was wanted.
+    pub(crate) grouped_rejection: Option<GroupedNfaError>,
+    /// Scratch of the grouped NFA streams.
+    scratch: RefCell<GroupedScratch>,
 }
 
 impl Subject {
-    /// Compile `pattern` and find the tiers to check: the NFA, and the
-    /// eligible tiers that `choice` keeps.
+    /// Compile `pattern` and find the backends to check: the NFA, the
+    /// eligible tiers that `choice` keeps, and the grouped NFA when
+    /// `choice` keeps it and it admits the pattern.
     pub(crate) fn compile(
         pattern: &str,
         config: &RegexConfig,
         choice: TierChoice,
         memory: &mut MatcherMemory,
     ) -> Result<Self, Rejection> {
-        let regex = Regex::with_config(pattern, config.clone()).map_err(Rejection::Compile)?;
+        let mut compiled = config.clone();
+        compiled.grouped_nfa = choice.wants_grouped();
+        let regex = Regex::with_config(pattern, compiled).map_err(Rejection::Compile)?;
         let candidates: Vec<u8> = match choice {
             TierChoice::All => (0..=4).collect(),
-            TierChoice::Only(0) => vec![0],
+            TierChoice::Only(0) | TierChoice::Grouped => vec![0],
             TierChoice::Only(t) => vec![0, t],
             TierChoice::Except(skip) => (0..=4).filter(|&t| t == 0 || t != skip).collect(),
         };
-        let tiers: Vec<u8> = candidates
+        let mut backends: Vec<Backend> = candidates
             .into_iter()
             .filter(|&t| memory.matcher_for_tier(&regex, t).is_ok())
+            .map(Backend::Tier)
             .collect();
         if let TierChoice::Only(t) = choice
-            && !tiers.contains(&t)
+            && !backends.contains(&Backend::Tier(t))
         {
             return Err(Rejection::NotEligible {
                 tier: t,
                 min_tier: regex.min_tier(),
             });
         }
+        let mut grouped_rejection = None;
+        if choice.wants_grouped() {
+            match regex.grouped_nfa_admission() {
+                Ok(()) => backends.push(Backend::Grouped),
+                Err(e) if choice == TierChoice::Grouped => {
+                    return Err(Rejection::NotAdmitted(e));
+                }
+                Err(e) => grouped_rejection = Some(e),
+            }
+        }
+        let mut config = config.clone();
+        config.grouped_nfa = false;
         Ok(Self {
-            config: config.clone(),
+            config,
             regex,
-            tiers,
+            backends,
+            grouped_rejection,
+            scratch: RefCell::new(GroupedScratch::new()),
         })
     }
 
-    /// Run `input` on every tier and feed; push each disagreement with
+    /// The backends, and why the grouped NFA is missing if it was wanted:
+    /// `[0, 3, grouped]` or `[0, 4] grouped: <reason>`.
+    pub(crate) fn describe_backends(&self) -> String {
+        let mut s = backend_list(&self.backends);
+        if let Some(e) = &self.grouped_rejection {
+            s.push_str(&format!(" ({e})"));
+        }
+        s
+    }
+
+    /// Run `input` on every backend and feed; push each disagreement with
     /// `expected` into `failures` (which is cleared first).
     pub(crate) fn check(
         &self,
@@ -184,24 +267,41 @@ impl Subject {
         failures: &mut Vec<Failure>,
     ) {
         failures.clear();
-        for &tier in &self.tiers {
+        for &backend in &self.backends {
             for feed in [Feed::Whole, Feed::Bytewise] {
-                let got = self.run(memory, tier, feed, input);
+                let got = self.run(memory, backend, feed, input);
                 if got != expected {
-                    failures.push(Failure { tier, feed, got });
+                    failures.push(Failure { backend, feed, got });
                 }
             }
         }
     }
 
-    /// Run `input` on one tier.
+    /// Run `input` on one backend.
     pub(crate) fn run(
         &self,
         memory: &mut MatcherMemory,
-        tier: u8,
+        backend: Backend,
         feed: Feed,
         input: &[u8],
     ) -> bool {
+        let tier = match backend {
+            Backend::Tier(t) => t,
+            Backend::Grouped => {
+                let scratch = &mut *self.scratch.borrow_mut();
+                let mut s = GroupedStream::new(&self.regex, scratch)
+                    .expect("the grouped NFA was checked for admission");
+                match feed {
+                    Feed::Whole => s.chunk(&self.regex, scratch, input),
+                    Feed::Bytewise => {
+                        for b in input {
+                            s.chunk(&self.regex, scratch, std::slice::from_ref(b));
+                        }
+                    }
+                }
+                return s.finish(&self.regex, scratch);
+            }
+        };
         let mut m = memory
             .matcher_for_tier(&self.regex, tier)
             .expect("tier was checked for eligibility");
@@ -426,18 +526,32 @@ mod tests {
             max_unroll_states: 0,
             ..Default::default()
         };
-        let tiers = |choice| {
-            Subject::compile("(?:a|bb){2,3}c", &config, choice, &mut new_memory())
-                .map(|s| s.tiers)
+        let tiers = |pattern, choice| {
+            Subject::compile(pattern, &config, choice, &mut new_memory())
+                .map(|s| backend_list(&s.backends))
                 .map_err(|e| e.to_string())
         };
-        assert_eq!(tiers(TierChoice::All), Ok(vec![0, 3, 4]));
-        assert_eq!(tiers(TierChoice::Except(3)), Ok(vec![0, 4]));
-        assert_eq!(tiers(TierChoice::Only(3)), Ok(vec![0, 3]));
-        assert!(tiers(TierChoice::Only(2)).is_err());
-        assert_eq!(TierChoice::new(Some(3), None), TierChoice::Only(3));
-        assert_eq!(TierChoice::new(None, Some(3)), TierChoice::Except(3));
-        assert_eq!(TierChoice::new(None, None), TierChoice::All);
+        let p = "(?:a|bb){2,3}c";
+        assert_eq!(
+            tiers(p, TierChoice::All).as_deref(),
+            Ok("[0, 3, 4, grouped]")
+        );
+        assert_eq!(
+            tiers(p, TierChoice::Except(3)).as_deref(),
+            Ok("[0, 4, grouped]")
+        );
+        assert_eq!(tiers(p, TierChoice::Only(3)).as_deref(), Ok("[0, 3]"));
+        assert_eq!(tiers(p, TierChoice::Grouped).as_deref(), Ok("[0, grouped]"));
+        assert!(tiers(p, TierChoice::Only(2)).is_err());
+        // A nested counter: not admitted by the grouped NFA.
+        let nested = "x((a|aa){2,3}){2,3}z";
+        assert_eq!(tiers(nested, TierChoice::All).as_deref(), Ok("[0, 4]"));
+        let rejected = tiers(nested, TierChoice::Grouped).unwrap_err();
+        assert!(rejected.contains("nested"), "{rejected}");
+        assert_eq!(TierChoice::new(Some(3), None, false), TierChoice::Only(3));
+        assert_eq!(TierChoice::new(None, Some(3), false), TierChoice::Except(3));
+        assert_eq!(TierChoice::new(None, None, false), TierChoice::All);
+        assert_eq!(TierChoice::new(None, None, true), TierChoice::Grouped);
     }
 
     #[test]
