@@ -3263,6 +3263,8 @@ impl RegexBuilder {
             Box::new(
                 match grouped_nfa::sparse::analyze(
                     &self.states,
+                    &classes_slice,
+                    &byte_tables_slice,
                     start,
                     structure,
                     &grouped_nfa::sparse::SparseLimits::DEFAULT,

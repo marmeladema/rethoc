@@ -4,8 +4,9 @@
 //! for a forced tier, or `grouped` for the grouped NFA forced (compiled with
 //! `GroupedNfaMode::Always`; `ineligible` when it does not admit the
 //! pattern), or `grouped-full` / `grouped-active` for the grouped NFA with
-//! one of its two passes forced.  The last column is the engine automatic
-//! selection picks.
+//! one of its two passes forced, or `sparse` for its experimental sparse
+//! counting variant (`plans/sparse-counting-sets.md`).  The last column is
+//! the engine automatic selection picks.
 //!
 //! A seventh argument `stats` prints, instead of timings, what one warm
 //! scan does: admission, sizes, allocations and the grouped NFA's operation
@@ -26,6 +27,7 @@ use std::time::{Duration, Instant};
 use rethoc_engine::grouped_op_stats::{self, OpStats};
 use rethoc_engine::{
     GroupedNfaMode, GroupedScratch, GroupedStream, GroupedSweep, MatcherMemory, Regex, RegexConfig,
+    SparseScratch, SparseStream,
 };
 
 fn main() {
@@ -50,10 +52,13 @@ fn main() {
         _ => GroupedSweep::Auto,
     };
     let auto = tier_arg == "auto";
-    let tier: u8 = if grouped || auto {
+    let sparse = tier_arg == "sparse";
+    let tier: u8 = if grouped || auto || sparse {
         0
     } else {
-        tier_arg.parse().expect("tier: auto, 0-4 or grouped")
+        tier_arg
+            .parse()
+            .expect("tier: auto, 0-4, grouped or sparse")
     };
     let chunk: usize = args[5].parse().expect("chunk");
     let counters = args[6] == "counters";
@@ -106,6 +111,7 @@ fn main() {
         } else {
             GroupedNfaMode::Auto
         },
+        sparse_counting: sparse,
         ..RegexConfig::default()
     };
     let start = Instant::now();
@@ -190,6 +196,8 @@ fn main() {
     let mut memory = MatcherMemory::default();
     let eligible = if grouped {
         re.grouped_nfa_admission().is_ok()
+    } else if sparse {
+        re.sparse_counting_admission().is_ok()
     } else if auto {
         true
     } else {
@@ -199,8 +207,9 @@ fn main() {
         println!("{}", stats_header());
     }
     if !eligible {
-        let reason = match re.grouped_nfa_admission() {
-            Err(e) if grouped && stats => format!(": {e}").replace(',', ";"),
+        let reason = match (re.grouped_nfa_admission(), re.sparse_counting_admission()) {
+            (Err(e), _) if grouped && stats => format!(": {e}").replace(',', ";"),
+            (_, Err(e)) if sparse && stats => format!(": {e}").replace(',', ";"),
             _ => String::new(),
         };
         println!(
@@ -214,7 +223,19 @@ fn main() {
     let mut scratch = GroupedScratch::new();
     scratch.set_sweep(sweep);
     let mut stream = grouped.then(|| GroupedStream::new(&re, &mut scratch).expect("admitted"));
+    // The sparse variant, likewise.
+    let mut sparse_scratch = SparseScratch::new();
+    let mut sparse_stream =
+        sparse.then(|| SparseStream::new(&re, &mut sparse_scratch).expect("admitted"));
     let mut run = || {
+        if let Some(stream) = sparse_stream.as_mut() {
+            stream.reset(&re, &mut sparse_scratch);
+            for part in black_box(&hay).chunks(chunk) {
+                stream.chunk(&re, &mut sparse_scratch, part);
+            }
+            assert_eq!(black_box(stream.finish(&re, &mut sparse_scratch)), expected);
+            return;
+        }
         if let Some(stream) = stream.as_mut() {
             stream.reset(&re, &mut scratch);
             for part in black_box(&hay).chunks(chunk) {
@@ -250,13 +271,25 @@ fn main() {
                 max => format!("{}..{max}", c.min),
             })
             .collect();
-        let (plan, stream_bytes, scratch_bytes) = match info.grouped_nfa {
-            Some(rethoc_engine::GroupedNfaInfo::Admitted {
-                plan_bytes,
-                stream_bytes,
-                scratch_bytes,
-                ..
-            }) if grouped => (plan_bytes, stream_bytes, scratch_bytes),
+        let (plan, stream_bytes, scratch_bytes) = match (info.grouped_nfa, info.sparse_counting) {
+            (
+                Some(rethoc_engine::GroupedNfaInfo::Admitted {
+                    plan_bytes,
+                    stream_bytes,
+                    scratch_bytes,
+                    ..
+                }),
+                _,
+            ) if grouped => (plan_bytes, stream_bytes, scratch_bytes),
+            (
+                _,
+                Some(rethoc_engine::SparseCountingInfo::Admitted {
+                    plan_bytes,
+                    stream_bytes,
+                    scratch_bytes,
+                    ..
+                }),
+            ) if sparse => (plan_bytes, stream_bytes, scratch_bytes),
             _ => (0, 0, 0),
         };
         let ops: Vec<String> = ops.values().iter().map(u64::to_string).collect();

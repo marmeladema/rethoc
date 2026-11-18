@@ -4,8 +4,8 @@
 //! Many patterns, each with independent state on every one of many
 //! streams, fed chunk by chunk with the streams interleaved: round `r`
 //! feeds chunk `r` of stream 0 to every pattern, then of stream 1, ...
-//! Compiled programs are shared by all streams.  The grouped NFA shares
-//! one worker scratch too; the other engines have no stream type separate
+//! Compiled programs are shared by all streams.  The grouped NFA and its
+//! sparse variant share one worker scratch too; the other engines have no stream type separate
 //! from their working memory, so each (stream, pattern) pair owns a
 //! `MatcherMemory`.
 //!
@@ -13,7 +13,8 @@
 //! research_multistream ENGINE PATTERNS STREAMS BYTES CHUNK default|counters LIMIT [check]
 //! ```
 //!
-//! `ENGINE` is `auto`, `grouped` or a tier 0-4; `BYTES` is per stream;
+//! `ENGINE` is `auto`, `grouped`, `sparse` (the experimental sparse
+//! counting variant of the grouped NFA) or a tier 0-4; `BYTES` is per stream;
 //! `LIMIT` is `RegexConfig::max_estimated_states` (2048 is the default).
 //! Patterns the compiler or the engine rejects are left out and reported.
 //! `check` compares every result with `regex` on the whole input, after
@@ -36,7 +37,7 @@ use std::time::Instant;
 
 use rethoc_engine::{
     AnyMatcher, GroupedNfaInfo, GroupedNfaMode, GroupedScratch, GroupedStream, MatcherMemory,
-    Regex, RegexConfig, grouped_op_stats,
+    Regex, RegexConfig, SparseCountingInfo, SparseScratch, SparseStream, grouped_op_stats,
 };
 
 /// The pattern families: the §10 table, its exclusions included.
@@ -133,6 +134,10 @@ enum Fleet<'a> {
         scratch: GroupedScratch,
         streams: Vec<GroupedStream>,
     },
+    Sparse {
+        scratch: SparseScratch,
+        streams: Vec<SparseStream>,
+    },
     Any(Vec<AnyMatcher<'a>>),
 }
 
@@ -144,8 +149,12 @@ fn main() {
     );
     let engine = args[1].as_str();
     let grouped = engine == "grouped";
-    let tier: Option<u8> = (!grouped && engine != "auto")
-        .then(|| engine.parse().expect("engine: auto, grouped or 0-4"));
+    let sparse = engine == "sparse";
+    let tier: Option<u8> = (!grouped && !sparse && engine != "auto").then(|| {
+        engine
+            .parse()
+            .expect("engine: auto, grouped, sparse or 0-4")
+    });
     let num_patterns: usize = args[2].parse().expect("patterns");
     let num_streams: usize = args[3].parse().expect("streams");
     let bytes: usize = args[4].parse().expect("bytes");
@@ -180,6 +189,7 @@ fn main() {
         } else {
             GroupedNfaMode::Auto
         },
+        sparse_counting: sparse,
         ..defaults
     };
     let mut excluded: BTreeMap<(&str, String), usize> = BTreeMap::new();
@@ -204,6 +214,8 @@ fn main() {
         };
         let eligible = if grouped {
             re.grouped_nfa_admission().map_err(|e| e.to_string())
+        } else if sparse {
+            re.sparse_counting_admission().map_err(|e| e.to_string())
         } else if let Some(tier) = tier {
             MatcherMemory::default()
                 .matcher_for_tier(&re, tier)
@@ -230,12 +242,16 @@ fn main() {
     let regex_bytes: usize = regexes.iter().map(Regex::memory_size).sum();
     let plan_bytes: usize = regexes
         .iter()
-        .map(|re| match re.info().grouped_nfa {
-            Some(GroupedNfaInfo::Admitted { plan_bytes, .. }) => plan_bytes,
-            _ => 0,
+        .map(|re| {
+            let info = re.info();
+            match (info.grouped_nfa, info.sparse_counting) {
+                (_, Some(SparseCountingInfo::Admitted { plan_bytes, .. })) => plan_bytes,
+                (Some(GroupedNfaInfo::Admitted { plan_bytes, .. }), _) => plan_bytes,
+                _ => 0,
+            }
         })
         .sum();
-    println!("memory programs_bytes={regex_bytes} of_which_grouped_plans={plan_bytes}");
+    println!("memory programs_bytes={regex_bytes} of_which_{engine}_plans={plan_bytes}");
 
     let inputs: Vec<Vec<u8>> = (0..num_streams).map(|s| input(s, bytes)).collect();
     println!("memory input_bytes={}", num_streams * bytes);
@@ -253,6 +269,12 @@ fn main() {
             .map(|k| GroupedStream::new(&regexes[k % e], &mut scratch).expect("admitted"))
             .collect();
         Fleet::Grouped { scratch, streams }
+    } else if sparse {
+        let mut scratch = SparseScratch::new();
+        let streams = (0..pairs)
+            .map(|k| SparseStream::new(&regexes[k % e], &mut scratch).expect("admitted"))
+            .collect();
+        Fleet::Sparse { scratch, streams }
     } else {
         memories.resize_with(pairs, MatcherMemory::default);
         Fleet::Any(
@@ -283,6 +305,14 @@ fn main() {
             scratch.memory_bytes()
         );
     }
+    if let Fleet::Sparse { scratch, streams } = &fleet {
+        let stream_bytes: usize = streams.iter().map(SparseStream::memory_bytes).sum();
+        println!(
+            "memory reported streams_bytes={stream_bytes} bytes_per_pair={:.1} scratch_bytes={}",
+            stream_bytes as f64 / pairs as f64,
+            scratch.memory_bytes()
+        );
+    }
 
     // The scan: one latency sample per chunk of one stream, fed to every
     // pattern.
@@ -295,6 +325,11 @@ fn main() {
             let t = Instant::now();
             match &mut fleet {
                 Fleet::Grouped { scratch, streams } => {
+                    for (p, stream) in streams[s * e..(s + 1) * e].iter_mut().enumerate() {
+                        stream.chunk(&regexes[p], scratch, part);
+                    }
+                }
+                Fleet::Sparse { scratch, streams } => {
                     for (p, stream) in streams[s * e..(s + 1) * e].iter_mut().enumerate() {
                         stream.chunk(&regexes[p], scratch, part);
                     }
@@ -313,6 +348,14 @@ fn main() {
     let ops = grouped_op_stats::take();
     let results: Vec<bool> = match fleet {
         Fleet::Grouped {
+            mut scratch,
+            mut streams,
+        } => streams
+            .iter_mut()
+            .enumerate()
+            .map(|(k, stream)| stream.finish(&regexes[k % e], &mut scratch))
+            .collect(),
+        Fleet::Sparse {
             mut scratch,
             mut streams,
         } => streams
@@ -347,7 +390,7 @@ fn main() {
         proc_status_kb("VmRSS:"),
         proc_status_kb("VmHWM:")
     );
-    if grouped_op_stats::ENABLED && grouped {
+    if grouped_op_stats::ENABLED && (grouped || sparse) {
         let per_byte = |v: u64| v as f64 / (total * e as f64);
         for (name, value) in grouped_op_stats::OpStats::FIELDS.iter().zip(ops.values()) {
             println!("ops {name}={value} per_pattern_byte={:.4}", per_byte(value));
