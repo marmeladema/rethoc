@@ -9,10 +9,8 @@ use crate::{AssertEval, Prefilter, Regex, State, StateIdx, byte_match_ci};
 
 use super::{BoundaryContext, DfaCache, DfaMemory, DfaStateId};
 
-mod analysis;
 #[cfg(test)]
 mod assertion_tests;
-pub(crate) use analysis::Tier1Assertions;
 
 /// Push consumption targets for NFA state `idx` when it consumes `byte`.
 ///
@@ -198,7 +196,7 @@ impl Tier1DfaCache {
         context: BoundaryContext,
         next: Option<u8>,
     ) -> (bool, bool, BoundaryContext) {
-        let assertions = &regex.tier1_assertions;
+        let assertions = &regex.dfa_assertions;
         debug_assert_eq!(ASSERTIONS, !assertions.is_empty());
         memory.closure_stack.clear();
         memory.closure_result.clear();
@@ -252,7 +250,7 @@ impl Tier1DfaCache {
         if !ASSERTIONS {
             at_end = matched;
         }
-        (matched, at_end, BoundaryContext(context.0 & needs))
+        (matched, at_end, context.masked(needs))
     }
 
     /// Compute the DFA transition for `(from_state, byte)`, using byte-class
@@ -349,7 +347,7 @@ impl Tier1DfaCache {
         byte: u8,
         regex: &Regex,
     ) -> DfaStateId {
-        if !regex.tier1_assertions.is_empty() {
+        if !regex.dfa_assertions.is_empty() {
             self.populate_inner::<true>(memory, from, byte, regex)
         } else {
             self.populate_inner::<false>(memory, from, byte, regex)
@@ -437,7 +435,7 @@ impl Tier1DfaCache {
         self.inner.regex_id = id;
 
         // Keep real start context until pending continuations are known.
-        let (is_match, is_match_at_end, context) = if !regex.tier1_assertions.is_empty() {
+        let (is_match, is_match_at_end, context) = if !regex.dfa_assertions.is_empty() {
             Self::closure::<true>(
                 memory,
                 std::iter::once(regex.start),

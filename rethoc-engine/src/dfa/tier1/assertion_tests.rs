@@ -17,8 +17,7 @@ const ASSERTIONS: [&str; 10] = [
 ];
 const ALPHABET: [u8; 5] = [b'a', b' ', b'\r', b'\n', 0xff];
 
-/// The table follows the compiled graph: unrolling can make an assertion-bearing
-/// repetition eligible, while retained counters must keep an empty analysis.
+/// The table follows the compiled graph. Either eligible DFA can request it.
 #[test]
 fn assertion_table_tracks_unrolling_and_retained_counters() {
     for max_unroll_states in [32, 0] {
@@ -26,7 +25,7 @@ fn assertion_table_tracks_unrolling_and_retained_counters() {
             ("", true, true),
             ("abc", true, true),
             (r"\babc\b", true, false),
-            (r"\ba{2}", max_unroll_states > 0, max_unroll_states == 0),
+            (r"\ba{2}", max_unroll_states > 0, false),
             ("(?Rm)^a{2}$", max_unroll_states > 0, max_unroll_states == 0),
         ] {
             let regex = Regex::with_config(
@@ -38,9 +37,9 @@ fn assertion_table_tracks_unrolling_and_retained_counters() {
             )
             .expect("analysis representation fixture must compile");
             assert_eq!(regex.dfa_eligible, eligible, "{pattern}");
-            assert_eq!(regex.tier1_assertions.is_empty(), empty, "{pattern}");
+            assert_eq!(regex.dfa_assertions.is_empty(), empty, "{pattern}");
             assert_eq!(
-                regex.tier1_assertions.memory_size(),
+                regex.dfa_assertions.memory_size(),
                 if empty { 0 } else { 2 * regex.states.len() },
                 "{pattern}",
             );
@@ -218,7 +217,7 @@ fn assertion_context_keys_keep_only_required_properties() {
             )
             .expect("context fixture must compile");
             if pattern == ".a" {
-                assert!(regex.tier1_assertions.is_empty());
+                assert!(regex.dfa_assertions.is_empty());
             }
             let mut memory = DfaMemory::default();
             let mut cache = Tier1DfaCache::new();
