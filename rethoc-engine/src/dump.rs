@@ -414,6 +414,7 @@ impl fmt::Display for DumpRegex<'_> {
                 .collect::<Vec<_>>()
                 .join(", ")
         )?;
+        writeln!(f, "  start_anchored: {}", r.start_anchored)?;
         writeln!(f, "  matches_empty: {}", r.start_closure_matches)?;
         writeln!(f, "  prefilter: {:?}", r.prefilter)?;
         writeln!(
