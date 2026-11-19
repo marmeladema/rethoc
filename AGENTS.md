@@ -319,9 +319,10 @@ configuration, and setting it skips the default one.
 ## Benchmarks
 
 Callgrind benches (`flamegraph`, `pathological_profile`,
-`reengage_profile`) need `valgrind` and `gungraun-runner` at the version
-of the `gungraun` dev-dependency. Criterion benches: `memrange`,
-`memclass`, `pathological`, `reengage`. Each bench's header describes it.
+`reengage_profile`, `tier1_assertions_profile`, `tier2_profile`) need `valgrind` and
+`gungraun-runner` at the version of the `gungraun` dev-dependency.
+Criterion benches include `memrange`, `memclass`, `pathological`,
+`reengage`, `tier1_assertions` and `tier2`. Each bench's header describes it.
 
 `reengage_profile` is the **performance gate**. Run it after any change
 to scanning loops, prefilter handling or other engine hot paths. It fails
@@ -330,6 +331,24 @@ on regressions above the thresholds set in the bench:
 ```bash
 git checkout main   && cargo bench --bench reengage_profile -- --save-baseline=main
 git checkout branch && cargo bench --bench reengage_profile -- --baseline=main
+```
+
+For local Tier 2 wall-clock comparisons, run the same Criterion fixtures
+sequentially on the base and candidate revisions on the same machine.
+The bytewise cases below are existing cross-tier controls in the
+assertion suite:
+
+```bash
+cargo bench --bench reengage -- 'tier2_word_boundary_gap_once|control_tier2_live_counter'
+cargo bench --bench tier1_assertions -- 'tier2/bytewise/(cold|warm)'
+```
+
+Repeat a large change in reverse revision order. To measure overlapping
+counters or the cost of a counter behind a parked assertion, use:
+
+```bash
+cargo bench --bench reengage -- tier2_overlap
+cargo bench --bench tier2 -- parked_boundary
 ```
 
 ## Fuzzing

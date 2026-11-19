@@ -10,7 +10,7 @@ use std::time::Duration;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use rethoc_engine::MatcherMemory;
 
-#[path = "common/tier1_assertion_cases.rs"]
+#[path = "common/assertion_cases.rs"]
 mod cases;
 
 fn benchmarks(c: &mut Criterion) {
