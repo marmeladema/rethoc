@@ -14344,6 +14344,16 @@ mod tests {
                 ("bbbbbbbbbbbbbbbbbbbac", false),
             ],
         }
+        // Bug 73: resolving the boundary can enter the counter on a
+        // space, but the line anchor after that space kills the thread.
+        // Tier 3 independently ignores this in-body guard (Bug 69).
+        test_tier2_guard_after_resolved_body_byte {
+            pattern: r"\b(?:a|[ \n](?m:^)){2,40}",
+            memory: 1081,
+            min_tier: 2,
+            tier3_broken: true,
+            inputs: [("a a", false), ("a\n", true), ("aa", true)],
+        }
         // Right before the count, tier 2 takes it (fixed-length body): the
         // anchor is settled when the transition is computed.
         test_counter_body_line_start_behind_byte_stays_tier2 {

@@ -831,7 +831,7 @@ impl Tier2DfaCache {
         // resolve_deferred_at_end().
         // Counters entered through Phase 1 resolution whose first body
         // byte was consumed on this transition (bit `i` = counter `i`).
-        // Only these get a pre-seed and are spared by `counter_reset`.
+        // Only these can need a pre-seed.
         // A counter that was entered but whose body did not take the byte
         // is speculative and must not be seeded (Bug 14).  Another
         // resolved thread taking the byte — a state after the counter's
@@ -949,6 +949,15 @@ impl Tier2DfaCache {
         seed_list.sort_by_key(|&(c, _)| c);
         seed_list.dedup();
 
+        // A deferred entry consumed its first byte during resolution, so it
+        // must be seeded before the increment and the phase clock advance.
+        // Keep it only if the body made progress: for a one-byte body the
+        // increment must be reached, including any guard after the consumed
+        // byte (Bug 73). A longer body can reach an interior state instead.
+        let counter_reset = self.compute_counter_reset(analysis, &probe.nfa_states, counting_mask);
+        let pre_seed_list = Self::pre_seeds_for(resolved_body_mask & !counter_reset);
+        let phase_reset = Self::compute_phase_reset(analysis, counting_mask, counter_reset);
+
         // Compute DFA successors.
         if counting_mask != 0 {
             let cr_nb = self.epsilon_closure(
@@ -966,38 +975,6 @@ impl Tier2DfaCache {
             let (nb_m, nb_mae) = self.match_flags(nb_id);
             let (wb_m, wb_mae) = self.match_flags(wb_id);
 
-            // For counting transitions, compute counter_reset for all
-            // counters EXCEPT those firing CInc (managed by increment logic).
-            let counter_reset =
-                self.compute_counter_reset(analysis, &probe.nfa_states, counting_mask);
-
-            // Resolved seeds from deferred assertions must be pre_seeds
-            // (applied BEFORE advance_all_phases) to get the correct
-            // Tier 2 phase alignment.  Phase 1 already consumed one
-            // body byte, so the instance must be placed one phase
-            // ahead of what seed_counter's default targeting computes.
-            // Pre-seed timing achieves this: active_phase has not yet
-            // been advanced for this byte, so the target phase is
-            // effectively shifted by -1 relative to a post-advance
-            // seed.
-            //
-            // For L=1 bodies: the seed goes to pre_seeds with value 0;
-            // the counter_increment on this transition provides the +1.
-            // For L>1 bodies: the seed goes to pre_seeds with value 0;
-            // the next CInc (after the remaining L-1 body bytes) will
-            // provide the increment.
-            //
-            // Skip reset: the counter must NOT be cleared by
-            // counter_reset, because the pre-seeded instance
-            // represents valid work from the resolved assertion path.
-            //
-            // When the body was NOT consumed (e.g. `\B {7,12}` on `!`),
-            // the resolved seeds are speculative and must be discarded
-            // to avoid false positives (Bug 14).
-            let pre_seed_list = Self::pre_seeds_for(resolved_body_mask);
-            let counter_reset = counter_reset & !resolved_body_mask;
-            let phase_reset = Self::compute_phase_reset(analysis, counting_mask, counter_reset);
-
             Transition {
                 no_break: nb_id,
                 no_break_is_match: nb_m || resolved_is_match,
@@ -1014,18 +991,6 @@ impl Tier2DfaCache {
         } else {
             let id = self.intern_closure_result(&probe, byte);
             let (m, mae) = self.match_flags(id);
-
-            // For non-counting transitions, compute counter_reset for
-            // all counters.
-            let counter_reset = self.compute_counter_reset(analysis, &probe.nfa_states, 0);
-
-            // Resolved seeds from deferred assertions go to pre_seeds
-            // for correct phase alignment (same rationale as counting
-            // transitions — see comment above).
-            let pre_seed_list = Self::pre_seeds_for(resolved_body_mask);
-            let counter_reset = counter_reset & !resolved_body_mask;
-
-            let phase_reset = Self::compute_phase_reset(analysis, 0, counter_reset);
 
             Transition {
                 no_break: id,
