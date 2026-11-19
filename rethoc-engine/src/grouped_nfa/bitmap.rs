@@ -60,10 +60,7 @@ pub(crate) fn next_start(
     mut i: usize,
 ) -> Option<usize> {
     if matches!(prefilter, Prefilter::None) {
-        return input[i..]
-            .iter()
-            .position(|&b| starts[b as usize])
-            .map(|off| i + off);
+        return find_start(starts, &input[i..]).map(|off| i + off);
     }
     loop {
         // A candidate of the prefilter that starts nothing is skipped.
@@ -76,6 +73,19 @@ pub(crate) fn next_start(
             return None;
         }
     }
+}
+
+/// The offset of the first byte of `hay` that `starts` accepts.
+///
+/// A function of its own, like the prefilter's search: it runs a byte at a
+/// time over idle stretches, and its loop is six instructions only while
+/// the input and the table stay in registers.  Inlined into a stream's
+/// `chunk`, whose steps need many registers, it had the input pointer
+/// spilled and reloaded on every byte (a sixth more instructions).  It is
+/// called once per idle stretch.
+#[inline(never)]
+fn find_start(starts: &[bool; 256], hay: &[u8]) -> Option<usize> {
+    hay.iter().position(|&b| starts[b as usize])
 }
 
 /// Whether every active node is count-free.
@@ -157,9 +167,15 @@ impl<const A: usize> Run<A> {
         }
     }
 
-    /// Active rows at the end of the run.
+    /// Active rows at the end of the run.  Most runs end on an empty
+    /// frontier, and without a `popcnt` instruction in the target a count
+    /// is a score of instructions per word: an empty frontier is not
+    /// counted.
     #[inline(always)]
     pub(crate) fn live(&self) -> u32 {
+        if self.active.iter().all(|&w| w == 0) {
+            return 0;
+        }
         self.active.iter().map(|w| w.count_ones()).sum()
     }
 }
@@ -190,11 +206,14 @@ pub(crate) fn run<const A: usize>(
     let statics: [u64; A] = tables.statics[..A].try_into().unwrap();
     let entry: [u64; A] = raw_active[..A].try_into().unwrap();
     let mut active = entry;
-    let found = loop {
-        let b = input[i];
+    // The bytes by iterator: the end of the input ends the loop, and no
+    // byte is fetched through a bounds check of its own.
+    let mut found = false;
+    for &b in &input[i..] {
         let clos = closure_of::<A>(closure, start, &active);
         if (0..A).any(|k| clos[k] & matches[k] != 0) {
-            break true;
+            found = true;
+            break;
         }
         let mut next = [0u64; A];
         let accept = &accepts[b as usize * A..][..A];
@@ -209,13 +228,10 @@ pub(crate) fn run<const A: usize>(
 
         active = next;
         i += 1;
-        if i == input.len()
-            || active.iter().all(|&w| w == 0)
-            || (0..A).any(|k| active[k] & !statics[k] != 0)
-        {
-            break false;
+        if active.iter().all(|&w| w == 0) || (0..A).any(|k| active[k] & !statics[k] != 0) {
+            break;
         }
-    };
+    }
     Run {
         next: i,
         found,

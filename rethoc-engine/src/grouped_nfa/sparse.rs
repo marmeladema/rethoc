@@ -1401,13 +1401,17 @@ impl SparseStream {
     }
 
     /// Feed the next bytes of the input.
+    ///
+    /// A small function: a stream that is idle for the whole chunk, the
+    /// common case for many streams of many patterns, only skips here.
+    /// The stepping loop is a function of its own, with the frame and the
+    /// registers its steps need.
     pub fn chunk(&mut self, regex: &Regex, scratch: &mut SparseScratch, input: &[u8]) {
         let plan = self.plan(regex);
         assert!(!self.finished, "chunk on a finished stream: reset it first");
         if self.matched || input.is_empty() {
             return;
         }
-        scratch.prepare(plan);
         // Skipping and the count-free step run under the automatic choice
         // only: forcing a pass runs the general step on every byte, which
         // the tests compare with them.
@@ -1417,32 +1421,69 @@ impl SparseStream {
             Some(tables) => Some(&tables.starts),
             None => plan.idle.as_deref().filter(|_| auto),
         };
-        let prefilter = &regex.prefilter;
-        let mut i = 0;
-        // An idle stream mostly stays idle for the whole chunk.  That case
-        // is decided here, before the loop: whatever the compiler sets up
-        // ahead of the loop for the steps inside it, a call that only
-        // skips does not pay for.
-        if self.live == 0
-            && let Some(starts) = starts
-        {
-            let Some(next) = self.skip_idle(scratch, prefilter, starts, input, 0) else {
-                return;
-            };
-            i = next;
+        // Nothing is kept across these calls, so this function needs no
+        // saved registers: a counting stream fed a byte at a time pays for
+        // little more than a call here.
+        match starts {
+            Some(starts) if self.live == 0 => self.chunk_idle(regex, scratch, input, starts),
+            _ => self.step_from(plan, regex, scratch, input, 0, tables, starts),
         }
+    }
+
+    /// [`chunk`](Self::chunk) on an idle stream: skip to the first byte
+    /// that starts something, and step from there if there is one.
+    #[inline(never)]
+    fn chunk_idle(
+        &mut self,
+        regex: &Regex,
+        scratch: &mut SparseScratch,
+        input: &[u8],
+        starts: &[bool; 256],
+    ) {
+        let Some(next) = self.skip_idle(scratch, &regex.prefilter, starts, input, 0) else {
+            return;
+        };
+        let plan = self.plan(regex);
+        let tables = plan
+            .count_free
+            .as_deref()
+            .filter(|_| scratch.sweep == Sweep::Auto);
+        self.step_from(plan, regex, scratch, input, next, tables, Some(starts));
+    }
+
+    /// The stepping loop of [`chunk`](Self::chunk), from `input[i]`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn step_from(
+        &mut self,
+        plan: &SparsePlan,
+        regex: &Regex,
+        scratch: &mut SparseScratch,
+        input: &[u8],
+        mut i: usize,
+        tables: Option<&CountFreeTables>,
+        starts: Option<&[bool; 256]>,
+    ) {
+        scratch.prepare(plan);
+        let prefilter = &regex.prefilter;
+        // A skip leads straight into the count-free step: any test between
+        // them follows the search's data-dependent loop, and costs branch
+        // mispredictions out of proportion to its size.
         while i < input.len() {
             if self.live == 0
                 && let Some(starts) = starts
             {
+                // Returns at once on the first iteration: `chunk` has
+                // skipped to `i`.
                 let Some(next) = self.skip_idle(scratch, prefilter, starts, input, i) else {
                     return;
                 };
                 i = next;
             }
+            // The count-free step applies to a unit frontier of count-free
+            // nodes.  An empty one is both.
             if let Some(tables) = tables
-                && self.unit
-                && bitmap::all_count_free(&self.active, tables)
+                && (self.live == 0 || self.unit && bitmap::all_count_free(&self.active, tables))
             {
                 let (next, found) = by_width!(tables.a, |A| self
                     .count_free_run::<A>(plan, tables, regex, input, i));
@@ -1507,10 +1548,10 @@ impl SparseStream {
         {
             scratch.passes[2] += next - i;
         }
-        if next > i {
-            self.prev = Some(input[next - 1]);
-            self.at_start = false;
-        }
+        // The byte before `next` is not recorded: the step or the run that
+        // follows starts from an empty frontier, whose closure reads no
+        // boundary (it has no assertion), and records its own byte.
+        // Recording it here costs a branch that the input decides.
         Some(next)
     }
 
@@ -1521,6 +1562,8 @@ impl SparseStream {
     /// boundary and before every general step.  Returns the next byte's
     /// index and whether a match was found (before the byte at that
     /// index).
+    // Not inlined, unlike the exact engine's: measured on the multi-stream
+    // harness, where this engine is faster with the run as a function.
     #[inline(never)]
     fn count_free_run<const A: usize>(
         &mut self,
