@@ -2840,6 +2840,19 @@ impl RegexBuilder {
         }
     }
 
+    /// Compile a pattern using custom syntax settings and the standard optimizations.
+    pub fn build_with_syntax(
+        &mut self,
+        pattern: &str,
+        syntax: &regex_syntax::ParserBuilder,
+    ) -> Result<Regex, Error> {
+        let hir = syntax
+            .build()
+            .parse(pattern)
+            .map_err(|error| Error::Parse(error.to_string()))?;
+        self.build(&hir_optimize::optimize(hir))
+    }
+
     /// Compile a `regex-syntax` HIR into a ready-to-match [`Regex`].
     pub fn build(&mut self, hir: &Hir) -> Result<Regex, Error> {
         // Complexity check: reject patterns whose fully-unrolled cost
@@ -3902,19 +3915,15 @@ impl MatcherMemory {
     /// was compiled ([`Regex::engine`]).
     #[inline]
     pub fn matcher<'a>(&'a mut self, regex: &'a Regex) -> AnyMatcher<'a> {
-        let tier = match regex.engine {
-            Engine::Tier1 => 1,
-            Engine::Tier2 => 2,
-            Engine::Tier4 => 4,
-            Engine::Nfa => 0,
-            Engine::GroupedNfa => {
-                return self
-                    .matcher_grouped(regex)
-                    .expect("a regex that selects the grouped NFA has its plan");
-            }
-        };
-        self.matcher_for_tier(regex, tier)
-            .expect("the selected tier is eligible")
+        match regex.engine {
+            Engine::Tier1 => AnyMatcher::Dfa(self.tier1_matcher(regex)),
+            Engine::Tier2 => AnyMatcher::Tier2Dfa(self.tier2_matcher(regex)),
+            Engine::Tier4 => AnyMatcher::Tier4Dfa(self.tier4_matcher(regex)),
+            Engine::Nfa => AnyMatcher::Nfa(self.nfa_matcher(regex)),
+            Engine::GroupedNfa => self
+                .matcher_grouped(regex)
+                .expect("a regex that selects the grouped NFA has its plan"),
+        }
     }
 
     /// Create a matcher forced to the grouped NFA.  Fails (it never falls
@@ -3980,20 +3989,12 @@ impl MatcherMemory {
         tier: u8,
     ) -> Result<AnyMatcher<'a>, String> {
         match tier {
-            0 => {
-                let nfa = self.nfa_matcher(regex);
-                Ok(AnyMatcher::Nfa(nfa))
-            }
+            0 => Ok(AnyMatcher::Nfa(self.nfa_matcher(regex))),
             1 => {
                 if !regex.dfa_eligible {
                     return Err("pattern is not eligible for tier 1 (pure DFA)".into());
                 }
-                let cap = self.dfa_state_cap();
-                let cache = self.dfa_cache.get_or_insert_with(Tier1DfaCache::new);
-                cache.set_max_states(cap);
-                cache.prepare(&mut self.dfa_memory, regex);
-                let dfa = DfaMatcher::new(cache, &mut self.dfa_memory, regex);
-                Ok(AnyMatcher::Dfa(dfa))
+                Ok(AnyMatcher::Dfa(self.tier1_matcher(regex)))
             }
             2 => {
                 if !regex.tier2_eligible {
@@ -4001,16 +4002,7 @@ impl MatcherMemory {
                         "pattern is not eligible for tier 2 (differential-counter DFA)".into(),
                     );
                 }
-                let analysis = regex
-                    .tier2_analysis
-                    .as_ref()
-                    .expect("tier2_analysis must be present for tier 2 patterns");
-                let cap = self.dfa_state_cap();
-                let cache = self.tier2_cache.get_or_insert_with(Tier2DfaCache::new);
-                cache.set_max_states(cap);
-                cache.prepare(&mut self.dfa_memory, regex, analysis);
-                let dfa = Tier2DfaMatcher::new(cache, &mut self.dfa_memory, regex, analysis);
-                Ok(AnyMatcher::Tier2Dfa(dfa))
+                Ok(AnyMatcher::Tier2Dfa(self.tier2_matcher(regex)))
             }
             3 => {
                 if !regex.tier3_eligible {
@@ -4033,15 +4025,47 @@ impl MatcherMemory {
                 if !regex.tier4_eligible {
                     return Err("pattern is not eligible for tier 4 (counter-program DFA)".into());
                 }
-                let cache = self
-                    .tier4_cache
-                    .get_or_insert_with(|| Tier4DfaCache::new(regex.states.len()));
-                cache.prepare(regex);
-                let dfa = Tier4DfaMatcher::new(cache, regex, &mut self.counting_pool);
-                Ok(AnyMatcher::Tier4Dfa(dfa))
+                Ok(AnyMatcher::Tier4Dfa(self.tier4_matcher(regex)))
             }
             _ => Err(format!("invalid tier {tier}: must be 0..4")),
         }
+    }
+
+    /// Prepare the lazy DFA cache and start a stream for an eligible regex.
+    #[inline]
+    fn tier1_matcher<'a>(&'a mut self, regex: &'a Regex) -> DfaMatcher<'a> {
+        debug_assert!(regex.dfa_eligible);
+        let cap = self.dfa_state_cap();
+        let cache = self.dfa_cache.get_or_insert_with(Tier1DfaCache::new);
+        cache.set_max_states(cap);
+        cache.prepare(&mut self.dfa_memory, regex);
+        DfaMatcher::new(cache, &mut self.dfa_memory, regex)
+    }
+
+    /// Prepare the differential counter cache and start a stream for an eligible regex.
+    #[inline]
+    fn tier2_matcher<'a>(&'a mut self, regex: &'a Regex) -> Tier2DfaMatcher<'a> {
+        debug_assert!(regex.tier2_eligible);
+        let analysis = regex
+            .tier2_analysis
+            .as_ref()
+            .expect("tier2_analysis must be present for tier 2 patterns");
+        let cap = self.dfa_state_cap();
+        let cache = self.tier2_cache.get_or_insert_with(Tier2DfaCache::new);
+        cache.set_max_states(cap);
+        cache.prepare(&mut self.dfa_memory, regex, analysis);
+        Tier2DfaMatcher::new(cache, &mut self.dfa_memory, regex, analysis)
+    }
+
+    /// Prepare the counter program cache and start a stream for an eligible regex.
+    #[inline]
+    fn tier4_matcher<'a>(&'a mut self, regex: &'a Regex) -> Tier4DfaMatcher<'a> {
+        debug_assert!(regex.tier4_eligible);
+        let cache = self
+            .tier4_cache
+            .get_or_insert_with(|| Tier4DfaCache::new(regex.states.len()));
+        cache.prepare(regex);
+        Tier4DfaMatcher::new(cache, regex, &mut self.counting_pool)
     }
 
     /// Create an NFA matcher (always available, used as fallback).
