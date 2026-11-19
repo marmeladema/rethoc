@@ -3088,10 +3088,6 @@ impl RegexBuilder {
             .as_ref()
             .map_or_else(|| Vec::new().into_boxed_slice(), |e| e.counter_info.clone());
 
-        let mut tier2_eligible =
-            non_nested_eligible && tier2_elig.as_ref().is_some_and(|e| e.is_eligible());
-        let mut tier2_overlap_proven = false;
-
         // Compute byte equivalence classes before moving data out.
         let classes_slice: Vec<ByteClassBits> = self.classes.iter().copied().collect();
         let byte_tables_slice: Vec<ByteMap> = self.byte_tables.to_vec();
@@ -3144,6 +3140,14 @@ impl RegexBuilder {
             Box::default()
         };
 
+        // Decide overlap admission before allocating the matcher's analysis.
+        let tier2_overlap_proven = non_nested_eligible
+            && tier2_elig
+                .as_ref()
+                .is_some_and(|elig| elig.admits_overlap(&self.states, &counter_body_states));
+        let tier2_eligible = tier2_overlap_proven
+            || (non_nested_eligible && tier2_elig.as_ref().is_some_and(|e| e.is_eligible()));
+
         // Precompute Tier 2 analysis if eligible.
         let tier2_analysis = if tier2_eligible {
             Some(compute_tier2_analysis(
@@ -3154,32 +3158,6 @@ impl RegexBuilder {
         } else {
             None
         };
-
-        // Run the binary-exactness overlap probe for patterns that pass
-        // all Tier 2 requirements except byte-disjointness.
-        if !tier2_eligible
-            && non_nested_eligible
-            && let Some(elig) = &tier2_elig
-            && let Some(analysis) = &tier2_analysis
-            && elig.base_eligible()
-            && !elig.disjoint_bytes
-        {
-            let proof = dfa::tier2::overlap::tier2_overlap_probe(
-                &self.states,
-                &classes_slice,
-                &self.byte_tables,
-                &byte_classes,
-                num_byte_classes,
-                start,
-                analysis,
-                self.counters.len(),
-            );
-            let admitted = elig.is_eligible_with_proof(proof.proof);
-            if admitted {
-                tier2_eligible = true;
-                tier2_overlap_proven = true;
-            }
-        }
 
         let dfa_assertions = Box::new(if dfa_eligible || tier2_eligible {
             dfa::DfaAssertions::build(self.states.as_slice())
@@ -10780,10 +10758,42 @@ mod tests {
         // Tier 2 overlap refinement tests (Patches 5+6)
         // -----------------------------------------------------------------
 
-        // Patch 5: Safe overlap — sequential counters with subset body bytes.
-        // Currently NOT promoted to Tier 2 (probe is too conservative for
-        // sequential overlap).  Will become Tier 2 when counter-lifecycle
-        // analysis is added.
+        // Bug 76: overlapping exits must have a single terminal action.
+        test_tier2_common_terminal_overlap {
+            pattern: r"^([ab]{5,40}|[bc]{5,40})$",
+            memory: 1202,
+            min_tier: 2,
+            inputs: [("bbbbb", true), ("bbb", false), ("abbbc", false), ("bbcbc", true)],
+        }
+
+        // With unrolling off, both counters can fire on the same byte.
+        // Only the two-byte body can complete the match on the final c.
+        test_tier2_mixed_length_overlap {
+            pattern: r"^(?:[ab]{2,3}|(?:b[bc]){2,4})$",
+            memory: 1418,
+            min_tier: 1,
+            inputs: [
+                ("bbb", true), ("bcbc", true), ("bbbc", true), ("bc", false),
+                ("bbcb", false), ("bbbbbbbb", true), ("bbbbbbbbb", false),
+            ],
+        }
+
+        // Large bounds keep both counters in the default compilation too.
+        test_tier2_mixed_length_overlap_kept_counters {
+            pattern: r"^(?:[ab]{2,40}|(?:b[bc]){2,18})$",
+            memory: 1238,
+            min_tier: 2,
+            inputs: [("bbb", true), ("bbbc", true), ("bbcb", false), ("bc", false)],
+        }
+
+        test_tier2_different_eof_exits {
+            pattern: r"^([ab]{4,40}$|[bc]{2,40}$x)",
+            memory: 2546,
+            min_tier: 3,
+            inputs: [("bb", false), ("bbbb", true), ("bcx", false)],
+        }
+
+        // The first sequential counter breaks into a second counter.
         test_tier2_overlap_safe_word_digit {
             pattern: r"^\w{300}\d{200}$",
             memory: 2080,

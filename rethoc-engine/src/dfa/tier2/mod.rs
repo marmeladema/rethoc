@@ -13,7 +13,7 @@
 //! Counter-free patterns dispatch to Tier 1, which also supports CRLF anchors.
 
 pub(crate) mod eligibility;
-pub(crate) mod overlap;
+mod overlap;
 
 use std::fmt;
 
@@ -927,10 +927,9 @@ impl Tier2DfaCache {
             0
         };
 
-        // Debug assertion for non-overlap-proven patterns: the disjoint-bytes
-        // guarantee means counting_mask should have at most 1 bit set.
-        // For overlap-proven patterns, multi-CInc is expected and was
-        // validated by the binary-exactness proof at compile time.
+        // Disjoint counter bodies can fire at most one increment per byte.
+        // Overlapping counters admitted by common_terminal_break have no
+        // body assertions and all breaks reach the same terminal action.
         debug_assert!(
             regex.tier2_overlap_proven || counting_mask.count_ones() <= 1,
             "Tier 2 disjoint-body pattern has counting_mask with {} bits set \
@@ -1148,8 +1147,8 @@ impl Tier2DfaCache {
     /// instance" argument does not carry over to them unchanged:
     ///
     /// - **Overlap-proven patterns.**  Their Tier 2 eligibility rests on a
-    ///   proof over the DFA states reachable by ordinary transitions;
-    ///   states produced by dropping body states are outside that set.
+    ///   common terminal break condition. They retain the ordinary DFA
+    ///   successor whenever several increments can fire together.
     /// - **Assertions inside a counter body.**  A thread parked on a
     ///   deferred body assertion has its instance cleared and re-seeded by
     ///   `populate()`, so instance liveness is not exact for these bodies.
@@ -2154,10 +2153,7 @@ mod tests {
 
     #[test]
     fn test_settle_disabled_for_overlap_proven_patterns() {
-        // Eligibility through the overlap proof rests on the states
-        // reachable by ordinary transitions; states without body states
-        // are not among them.  The flag is forced here: only the guard is
-        // under test, not the proof.
+        // Exercise the settling guard independently of overlap admission.
         let mut re = build("foo.{0,5}bar");
         assert!(Tier2DfaCache::can_settle(&re));
         re.tier2_overlap_proven = true;
