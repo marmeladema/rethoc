@@ -1,6 +1,6 @@
-//! Callgrind benchmarks for prefilter re-engagement in the counting tiers.
+//! Callgrind benchmarks for prefilter re-engagement and matcher setup.
 //!
-//! Deterministic counts for the cases in `common/reengage_cases.rs`, with
+//! Deterministic counts for long scans and repeated short streams, with
 //! regression limits: the run fails when a case, compared with a baseline
 //! (the previous run, or a named one),
 //!
@@ -28,10 +28,10 @@
 use std::hint::black_box;
 
 use gungraun::{
-    Callgrind, CallgrindMetrics, EventKind, LibraryBenchmarkConfig, library_benchmark,
+    Callgrind, CallgrindMetrics, EntryPoint, EventKind, LibraryBenchmarkConfig, library_benchmark,
     library_benchmark_group, main,
 };
-use rethoc_engine::{MatcherMemory, Regex};
+use rethoc_engine::{Engine, MatcherMemory, Regex, RegexConfig};
 
 #[path = "common/reengage_cases.rs"]
 mod cases;
@@ -96,16 +96,67 @@ fn bench_overlap((re, haystack): (Regex, Vec<u8>)) -> bool {
     black_box(cases::scan_overlap(&mut memory, &re, black_box(&haystack)))
 }
 
-library_benchmark_group!(name = reengage, benchmarks = [bench_scan, bench_overlap]);
+fn setup_short_streams(pattern: &str, engine: Engine) -> (Regex, MatcherMemory) {
+    let re = Regex::with_config(
+        pattern,
+        RegexConfig {
+            max_unroll_states: 0,
+            merge_repetitions: false,
+            ..RegexConfig::default()
+        },
+    )
+    .expect("short-stream pattern compiles");
+    assert_eq!(re.engine(), engine, "{pattern}");
+    let mut memory = MatcherMemory::default();
+    let mut matcher = memory.matcher(&re);
+    matcher.chunk(b"z");
+    assert!(!matcher.finish());
+    (re, memory)
+}
 
-main!(
-    config = LibraryBenchmarkConfig::default().tool(
+#[library_benchmark(config = profile_config(EntryPoint::Custom("*::measure_stream_construction*".into())))]
+#[bench::tier1(args = ("abc|abd", Engine::Tier1), setup = setup_short_streams)]
+#[bench::tier2(args = ("^.*a.{3}bc$", Engine::Tier2), setup = setup_short_streams)]
+#[bench::tier4(args = ("^((a|bc){1,2}){2,3}$", Engine::Tier4), setup = setup_short_streams)]
+#[bench::nfa(args = (r"x((a|aa){2,3}\b){2,3}", Engine::Nfa), setup = setup_short_streams)]
+fn bench_short_streams((re, mut memory): (Regex, MatcherMemory)) -> usize {
+    measure_stream_construction(&re, &mut memory)
+}
+
+// Give Callgrind a distinct entry point that excludes setup and teardown.
+#[inline(never)]
+fn measure_stream_construction(re: &Regex, memory: &mut MatcherMemory) -> usize {
+    let re = black_box(re);
+    let input = black_box(b"z");
+    let mut count = 0;
+    for _ in 0..4096 {
+        let mut matcher = memory.matcher(re);
+        matcher.chunk(input);
+        count += usize::from(matcher.finish());
+    }
+    black_box(count)
+}
+
+library_benchmark_group!(
+    name = reengage,
+    benchmarks = [bench_scan, bench_overlap, bench_short_streams]
+);
+
+fn profile_config(entry_point: EntryPoint) -> LibraryBenchmarkConfig {
+    let mut config = LibraryBenchmarkConfig::default();
+    config.tool(
         Callgrind::with_args(["--branch-sim=yes"])
+            .entry_point(entry_point)
             .format([CallgrindMetrics::Default, CallgrindMetrics::BranchSim])
             .soft_limits([
                 (EventKind::Ir, MAX_IR_INCREASE_PERCENT),
                 (EventKind::Bcm, MAX_BCM_INCREASE_PERCENT),
-            ])
+            ]),
     );
+    config
+}
+
+main!(
+    config = profile_config(EntryPoint::Default);
     library_benchmark_groups = reengage
 );

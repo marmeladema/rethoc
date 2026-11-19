@@ -25,3 +25,8 @@ per-case times and ratios, the exact rebar and rethoc revisions, the baseline
 version, the Rust toolchain, and runner details. Download the workflow artifact
 for the raw results. Account for changes in the rebar revision, baseline version,
 or runner before comparing timings across runs.
+
+The standalone adapter uses `benchmarks/rebar/Cargo.lock`. If a dependency
+change makes its locked build fail, refresh the lockfile in the generated
+`bench/rebar-integration/upstream/engines/rethoc/` directory, copy it back here,
+and run `scripts/rebar check`.

@@ -148,7 +148,16 @@ jobs:
       - name: Baseline from the base branch
         run: |
           git worktree add "$RUNNER_TEMP/base" "origin/$GITHUB_BASE_REF"
+          cp rethoc-engine/benches/reengage_profile.rs "$RUNNER_TEMP/base/rethoc-engine/benches/"
+          cp rethoc-engine/benches/common/reengage_cases.rs "$RUNNER_TEMP/base/rethoc-engine/benches/common/"
           cd "$RUNNER_TEMP/base"
+          if ! CARGO_TARGET_DIR="$RUNNER_TEMP/base-target" \
+            cargo --config "build.build-dir=\"$RUNNER_TEMP/base-build\"" \
+              bench --bench reengage_profile --no-run; then
+            echo "::warning::Candidate fixtures could not build on the base branch. Using base fixtures."
+            git restore -- rethoc-engine/benches/reengage_profile.rs \
+              rethoc-engine/benches/common/reengage_cases.rs
+          fi
           CARGO_TARGET_DIR="$RUNNER_TEMP/base-target" \
             cargo --config "build.build-dir=\"$RUNNER_TEMP/base-build\"" \
               bench --bench reengage_profile -- --save-baseline=main

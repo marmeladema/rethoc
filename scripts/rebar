@@ -51,8 +51,11 @@ def prepare():
     OVERLAY.mkdir(exist_ok=True)
     for name in ("haystacks", "regexes"):
         link = OVERLAY / name
+        target = Path("../benchmarks") / name
+        if link.is_symlink() and link.readlink() != target:
+            link.unlink()
         if not link.is_symlink():
-            link.symlink_to(fixtures / name, target_is_directory=True)
+            link.symlink_to(target, target_is_directory=True)
     (OVERLAY / "engines.toml").write_text(
         (fixtures / "engines.toml").read_text() + "\n" + (SOURCE / "engine.toml").read_text()
     )
@@ -95,6 +98,10 @@ def prepare():
         content = (SOURCE / name).read_bytes()
         if not destination.exists() or destination.read_bytes() != content:
             destination.write_bytes(content)
+    rethoc_revision = run("git", "rev-parse", "HEAD", capture=True).strip()
+    if run("git", "status", "--porcelain", capture=True):
+        rethoc_revision += "-dirty"
+    (adapter / "revision.txt").write_text(rethoc_revision)
     for directory in (UPSTREAM, UPSTREAM / "engines/rust/regex", adapter):
         run("cargo", "build", "--locked", "--release", "--target-dir", directory / "target",
             cwd=directory)
