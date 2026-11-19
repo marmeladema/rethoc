@@ -52,13 +52,29 @@ mod imp {
 
     #[inline]
     pub(super) fn memrange(lo: u8, hi: u8, haystack: &[u8]) -> Option<usize> {
-        if is_x86_feature_detected!("avx2") {
+        // Short skips are common when a range is used as a start prefilter.
+        // Check the first vector before dispatching to the long scan.
+        let Some((first, rest)) = haystack.split_first_chunk::<SSE2_WIDTH>() else {
+            return memrange_fallback(lo, hi, haystack);
+        };
+        // SAFETY: SSE2 is baseline on x86_64. The array holds a full vector
+        // and loadu does not require it to be aligned.
+        let bits = unsafe {
+            let chunk = _mm_loadu_si128(first.as_ptr().cast());
+            test_sse2(chunk, _mm_set1_epi8(lo as i8), _mm_set1_epi8(hi as i8))
+        };
+        if bits != 0 {
+            return Some(bits.trailing_zeros() as usize);
+        }
+
+        let offset = if rest.len() >= AVX2_WIDTH && is_x86_feature_detected!("avx2") {
             // SAFETY: AVX2 detected at runtime.
-            unsafe { memrange_avx2(lo, hi, haystack) }
+            unsafe { memrange_avx2(lo, hi, rest) }
         } else {
             // SAFETY: SSE2 is baseline on x86_64.
-            unsafe { memrange_sse2(lo, hi, haystack) }
-        }
+            unsafe { memrange_sse2(lo, hi, rest) }
+        };
+        offset.map(|i| SSE2_WIDTH + i)
     }
 
     // -- SSE2 (16 bytes per iteration) --
