@@ -84,7 +84,19 @@ fn bench_scan((re, haystack): (Regex, Vec<u8>)) -> bool {
     black_box(cases::scan(&mut memory, &re, black_box(&haystack)))
 }
 
-library_benchmark_group!(name = reengage, benchmarks = bench_scan);
+fn setup_overlap(case: cases::OverlapCase) -> (Regex, Vec<u8>) {
+    case.compile(HAYSTACK_SIZE)
+}
+
+#[library_benchmark]
+#[bench::tier2_overlap_expiry(args = (cases::OverlapCase::Expiry), setup = setup_overlap)]
+#[bench::tier2_overlap_mixed_lengths(args = (cases::OverlapCase::MixedLengths), setup = setup_overlap)]
+fn bench_overlap((re, haystack): (Regex, Vec<u8>)) -> bool {
+    let mut memory = MatcherMemory::default();
+    black_box(cases::scan_overlap(&mut memory, &re, black_box(&haystack)))
+}
+
+library_benchmark_group!(name = reengage, benchmarks = [bench_scan, bench_overlap]);
 
 main!(
     config = LibraryBenchmarkConfig::default().tool(
