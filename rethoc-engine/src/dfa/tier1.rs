@@ -484,6 +484,11 @@ impl Tier1DfaCache {
         self.stride = stride;
         memory.clear(num_nfa_states);
         self.transitions.clear();
+        // Room for the smallest cache a matcher can run with, so that the
+        // first states of a fresh cache do not each move the tables: a
+        // quarter of the instructions of a 32-byte scan on a fresh cache.
+        self.transitions.reserve(stride * super::DFA_MIN_STATES);
+        self.inner.states.reserve(super::DFA_MIN_STATES);
     }
 
     /// Prepare the cache for use with `regex`.
