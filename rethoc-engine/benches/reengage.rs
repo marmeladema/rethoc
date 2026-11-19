@@ -38,6 +38,16 @@ fn bench_reengage(c: &mut Criterion) {
         });
     }
 
+    for case in [cases::OverlapCase::Expiry, cases::OverlapCase::MixedLengths] {
+        let (re, haystack) = case.compile(HAYSTACK_SIZE);
+        group.throughput(Throughput::Bytes(haystack.len() as u64));
+        group.bench_function(case.name(), |b| {
+            let mut memory = MatcherMemory::default();
+            cases::scan_overlap(&mut memory, &re, &haystack);
+            b.iter(|| black_box(cases::scan_overlap(&mut memory, &re, black_box(&haystack))))
+        });
+    }
+
     group.finish();
 }
 

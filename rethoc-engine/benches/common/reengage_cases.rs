@@ -2,13 +2,13 @@
 //! Criterion bench (`reengage.rs`, wall-clock throughput) and the Callgrind
 //! bench (`reengage_profile.rs`, instruction counts).
 //!
-//! Each case pairs a pattern with a stream that never matches, so the whole
-//! stream is scanned.  The streams are the inputs on which the counting
+//! Each case scans the full stream. The overlap cases match at EOF; the
+//! other streams have no match. The streams are the inputs on which the counting
 //! tiers used to fall off the prefilter (or off the DFA fast path) for the
 //! rest of the stream, the inputs on which re-arming the prefilter is pure
 //! overhead, and a few controls on paths that must stay unaffected.
 
-use rethoc_engine::{MatcherMemory, Regex};
+use rethoc_engine::{AnyMatcher, MatcherMemory, Regex, RegexConfig};
 
 /// Chunk size used to feed the stream: the engine is a streaming matcher,
 /// and re-engagement state has to survive chunk boundaries.
@@ -222,9 +222,79 @@ impl Case {
     }
 }
 
+/// Workloads for overlapping counters admitted by Tier 2.
+#[derive(Clone, Copy)]
+pub enum OverlapCase {
+    Expiry,
+    MixedLengths,
+}
+
+impl OverlapCase {
+    /// Benchmark id shared by the two runners.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Expiry => "tier2_overlap_expiry",
+            Self::MixedLengths => "tier2_overlap_mixed_lengths",
+        }
+    }
+
+    /// Build a stream ending in a new candidate after earlier attempts fail.
+    pub fn compile(self, size: usize) -> (Regex, Vec<u8>) {
+        let (pattern, mut haystack, tail): (_, _, &[u8]) = match self {
+            Self::Expiry => {
+                // Both counters expire on the fifth b. Re-enter at the final x.
+                let mut haystack = vec![b'b'; size - 3];
+                haystack[0] = b'x';
+                (r"x(?:[ab]{2,4}|[bc]{2,4})$", haystack, b"xbb")
+            }
+            Self::MixedLengths => {
+                // b advances both branches; every second b crosses both increments.
+                // a kills the two-byte body, c kills the one-byte body, ! kills both.
+                // Only the two-byte body can accept the final bbbc.
+                let block = b"xbbbba!xbbbbbc!";
+                // Scale the live-counter stream to keep the Callgrind run short.
+                let haystack = block.repeat(size / 8 / block.len());
+                (r"x(?:[ab]{2,8}|(?:b[bc]){2,4})$", haystack, b"xbbbc")
+            }
+        };
+        let regex = Regex::with_config(
+            pattern,
+            RegexConfig {
+                max_unroll_states: 0,
+                ..Default::default()
+            },
+        )
+        .expect("valid overlap benchmark pattern");
+        let mut memory = MatcherMemory::default();
+        assert!(
+            !scan_overlap(&mut memory, &regex, &haystack),
+            "{}",
+            self.name()
+        );
+        haystack.extend_from_slice(tail);
+        assert!(
+            scan_overlap(&mut memory, &regex, &haystack),
+            "{}",
+            self.name()
+        );
+        (regex, haystack)
+    }
+}
+
+/// Scan an overlap workload through forced Tier 2.
+pub fn scan_overlap(memory: &mut MatcherMemory, re: &Regex, haystack: &[u8]) -> bool {
+    let matcher = memory
+        .matcher_for_tier(re, 2)
+        .expect("overlap must admit Tier 2");
+    scan_chunks(matcher, haystack)
+}
+
 /// Feed `haystack` to a new matcher in [`CHUNK`]-sized pieces.
 pub fn scan(memory: &mut MatcherMemory, re: &Regex, haystack: &[u8]) -> bool {
-    let mut matcher = memory.matcher(re);
+    scan_chunks(memory.matcher(re), haystack)
+}
+
+fn scan_chunks(mut matcher: AnyMatcher<'_>, haystack: &[u8]) -> bool {
     for chunk in haystack.chunks(CHUNK) {
         matcher.chunk(chunk);
     }
