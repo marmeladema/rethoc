@@ -225,6 +225,9 @@ struct Transition {
     /// Whether stepping this transition must process increments or seeds even
     /// when no counter instances were live on entry.
     counts_or_seeds: bool,
+    /// This populated edge preserves the DFA state and cannot count, seed, or match.
+    /// With no live instances, any sequence of these edges in this row is inert.
+    idle_self_loop: bool,
     /// Seeds to apply AFTER counter_increment and counter_reset.
     ///
     /// Probe seeds (initial_value = 0) that start new counter instances
@@ -255,6 +258,7 @@ impl Transition {
             counting_mask: 0,
             pre_seeds: Box::new([]),
             counts_or_seeds: false,
+            idle_self_loop: false,
             seeds: Box::new([]),
             counter_reset: 0,
             phase_reset: 0,
@@ -994,6 +998,7 @@ impl Tier2DfaCache {
                 with_break_is_match_at_end: wb_mae,
                 counting_mask,
                 counts_or_seeds,
+                idle_self_loop: false,
                 pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
                 counter_reset,
@@ -1012,6 +1017,7 @@ impl Tier2DfaCache {
                 with_break_is_match_at_end: mae,
                 counting_mask: 0,
                 counts_or_seeds,
+                idle_self_loop: id == from && !counts_or_seeds && !m && !resolved_is_match,
                 pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
                 counter_reset,
@@ -1481,29 +1487,30 @@ impl<'a> Tier2DfaMatcher<'a> {
     }
 
     #[inline(always)]
-    fn step(&mut self, byte: u8) {
+    fn step(&mut self, byte: u8) -> bool {
         if self.current == DfaStateId::DEAD {
             self.step_from_dead(byte);
-            return;
+            return false;
         }
 
         let slot = self.ensure_transition(byte);
-        self.step_inner(slot);
+        self.step_inner(slot)
     }
 
     #[inline(always)]
-    fn step_direct(&mut self, byte: u8) {
+    fn step_direct(&mut self, byte: u8) -> bool {
         if self.current == DfaStateId::DEAD {
             self.step_from_dead(byte);
-            return;
+            return false;
         }
 
         let slot = self.ensure_transition_direct(byte);
-        self.step_inner(slot);
+        self.step_inner(slot)
     }
 
+    /// Apply the cached edge and report whether further idle self-loops can be batched.
     #[inline(always)]
-    fn step_inner(&mut self, slot: usize) {
+    fn step_inner(&mut self, slot: usize) -> bool {
         let t = &self.cache.transitions[slot];
 
         // Fast path: non-counting, no seeds, no live counters.
@@ -1511,7 +1518,7 @@ impl<'a> Tier2DfaMatcher<'a> {
             self.current = t.no_break;
             self.match_at_end = t.no_break_is_match_at_end;
             self.status.record_match(t.no_break_is_match);
-            return;
+            return t.idle_self_loop;
         }
 
         let mut any_can_break = false;
@@ -1600,6 +1607,7 @@ impl<'a> Tier2DfaMatcher<'a> {
         if self.settle && !self.has_live_counters && self.current != DfaStateId::DEAD {
             self.current = self.cache.settled_state(self.current, self.regex);
         }
+        false
     }
 
     fn step_from_dead(&mut self, byte: u8) {
@@ -1701,18 +1709,41 @@ impl<'a> Tier2DfaMatcher<'a> {
     #[inline(always)]
     fn chunk_no_prefilter(&mut self, input: &[u8]) {
         if self.cache.stride == 256 {
-            for &b in input {
-                if self.status != SearchStatus::Searching {
-                    return;
-                }
-                self.step_direct(b);
-            }
+            self.scan_without_prefilter::<true>(input);
         } else {
-            for &b in input {
-                if self.status != SearchStatus::Searching {
-                    return;
-                }
-                self.step(b);
+            self.scan_without_prefilter::<false>(input);
+        }
+    }
+
+    #[inline(always)]
+    fn scan_without_prefilter<const DIRECT: bool>(&mut self, mut input: &[u8]) {
+        while let Some((&byte, rest)) = input.split_first() {
+            let looping = if DIRECT {
+                self.step_direct(byte)
+            } else {
+                self.step(byte)
+            };
+            if self.status != SearchStatus::Searching {
+                return;
+            }
+            input = rest;
+            if looping {
+                // The first step applied this state's EOF flag. Other cached
+                // idle self-loops in the row have the same successor and EOF
+                // flag. A cache miss or any observable effect ends the run.
+                let stride = if DIRECT { 256 } else { self.cache.stride };
+                let start = self.current.idx() * stride;
+                let row = &self.cache.transitions[start..start + stride];
+                let skip = input.iter().position(|&b| {
+                    let column = if DIRECT {
+                        b
+                    } else {
+                        self.regex.byte_classes[b as usize]
+                    };
+                    !row[column as usize].idle_self_loop
+                });
+                let Some(skip) = skip else { return };
+                input = &input[skip..];
             }
         }
     }

@@ -13476,6 +13476,19 @@ mod tests {
                 ("aaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxaa", false),
             ],
         }
+        // Repeated word bytes can share a cached idle state that accepts
+        // at EOF. A trailing space must still replace that EOF answer.
+        test_idle_self_loops_preserve_eof {
+            pattern: r"q{2,40}|\b$",
+            memory: 1029,
+            min_tier: 2,
+            inputs: [
+                ("xyxyxyxyxyxy", true),
+                ("xyxyxyxyxyxy ", false),
+                ("xyxyxyxyxyxy xy", true),
+                ("xyxyxyxyxyxy qq ", true),
+            ],
+        }
         // Tier 2, start state with a deferred assertion: the dead body state is
         // dropped although the result is not the start state.
         test_reengage_leading_word_boundary {
@@ -13483,6 +13496,8 @@ mod tests {
             memory: 1209,
             min_tier: 2,
             inputs: [
+                ("xxyyxyxyxyxyxyxy foobar", true),
+                ("xxyyxyxyxyxyxyxyfoobar", false),
                 ("foobar", true),
                 ("fooxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxbar", true),
                 ("fooxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxbar", false),
