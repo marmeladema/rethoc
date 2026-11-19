@@ -13208,6 +13208,8 @@ mod tests {
             memory: 1151,
             min_tier: 2,
             inputs: [
+                ("fxfxffffxfxfooxbar", true), // dense failed prefixes before a valid candidate
+                ("fxfxffffxfxfooxba", false),
                 ("foobar", true),
                 ("fooxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxbar", true),
                 ("fooxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxbar", false),

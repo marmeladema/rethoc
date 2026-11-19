@@ -68,6 +68,8 @@ pub(crate) const DFA_MIN_STATES: usize = 1 + MAX_KEPT_STATES + 4;
 pub(crate) struct DfaStateId(u32);
 
 impl DfaStateId {
+    /// First state interned into a prepared cache; preserved by eviction.
+    pub(super) const START: Self = Self(0);
     /// Sentinel: the "dead" state (no NFA states, no match possible).
     pub(crate) const DEAD: Self = Self(u32::MAX);
     /// Sentinel for unpopulated flat-table slots.
@@ -751,7 +753,11 @@ impl DfaCache {
     #[cold]
     fn evict(&mut self, keep: &mut [DfaStateId], mut new_row: impl FnMut()) {
         debug_assert!(self.start_id != DfaStateId::DEAD, "cache not prepared");
-        debug_assert_eq!(self.start_id, DfaStateId(0), "the start state is state 0");
+        debug_assert_eq!(
+            self.start_id,
+            DfaStateId::START,
+            "the start state is state 0"
+        );
         debug_assert!(keep.len() <= MAX_KEPT_STATES);
         let start_idx = self.start_id.idx();
         let mut old = [DfaStateId::DEAD; MAX_KEPT_STATES];
