@@ -14,8 +14,8 @@
 //! 3. If any counter body contains such an assertion, there is exactly
 //!    one counter.
 //! 4. The number of counters is ≤ [`MAX_TIER2_COUNTERS`](super::MAX_TIER2_COUNTERS) (64).
-//! 5. Counter body byte sets are **pairwise disjoint** (so at most one
-//!    counter fires `CInc` on any DFA transition).
+//! 5. Counter body byte sets are pairwise disjoint, or their overlapping
+//!    increments pass the common-terminal-break check in `overlap`.
 //! 6. Every increment **directly follows a consumed byte**: no assertion
 //!    that looks ahead sits between the last byte of a body and its
 //!    `CInc` (see [`BodyAssertions::increment_behind_lookahead`]).
@@ -27,10 +27,6 @@
 //! transition may consume a byte and reach the increment again.  An
 //! assertion *before* the body's byte, as in `(?:\Ba){2,3}`, is fine: a
 //! thread waiting there has not counted anything yet.
-//!
-//! Requirement 5 will be relaxed in a later patch via a reachability probe
-//! that proves `counting_mask.count_ones() <= 1` for all reachable
-//! transitions even when raw byte sets overlap.
 
 use crate::{ByteClassBits, ByteMap, CounterIdx, State, StateIdx};
 
@@ -85,16 +81,12 @@ impl Tier2Eligibility {
         self.base_eligible() && self.disjoint_bytes
     }
 
-    /// Returns true under the relaxed rule: either disjoint bytes
-    /// (fast path) or a proven binary-exact overlap proof.
-    pub(crate) fn is_eligible_with_proof(&self, proof: super::overlap::Tier2OverlapProof) -> bool {
+    /// Whether multiple counters may break together with the same effect.
+    pub(crate) fn admits_overlap(&self, states: &[State], counter_body_states: &[bool]) -> bool {
         self.base_eligible()
+            && !self.disjoint_bytes
             && !self.has_identical_body_bytes
-            && matches!(
-                proof,
-                super::overlap::Tier2OverlapProof::DisjointFastPath
-                    | super::overlap::Tier2OverlapProof::ProvenBinaryExact
-            )
+            && super::overlap::common_terminal_break(states, counter_body_states)
     }
 }
 
