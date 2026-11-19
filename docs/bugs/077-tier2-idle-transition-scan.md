@@ -26,3 +26,18 @@ lets the two measurements catch different changes.
 Tested separately, caching the flag brought this case to 1.39 ms in a
 paired Criterion run against 2.27 ms on main. The existing live-counter
 and prefilter cases also passed the Callgrind gate.
+
+## PR 27 instruction-count regression
+
+On the x86-64 CI runner the word-boundary control reached 12,395,444
+instructions against 10,560,551 on main. The same comparison passed on
+AArch64. After the gap expires, the remaining word bytes repeatedly
+traverse a cached transition to the same state.
+
+The cache now marks self-loops that neither count, seed, nor match.
+After processing one of these transitions with no live counters, the
+scanner can inspect successive bytes against the same row. Every marked
+edge preserves the state, including its EOF flag. An unpopulated edge
+ends the batch before normal lookup and possible eviction. A match
+reported by a resolved assertion also ends the batch, even when the
+successor state's own match flag is clear.
