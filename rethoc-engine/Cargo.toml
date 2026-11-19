@@ -68,3 +68,11 @@ harness = false
 [[bench]]
 name = "tier1_assertions_compile_limits"
 harness = false
+
+[[bench]]
+name = "tier2"
+harness = false
+
+[[bench]]
+name = "tier2_profile"
+harness = false

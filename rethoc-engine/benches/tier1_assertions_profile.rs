@@ -4,6 +4,8 @@
 //! on an isolated base worktree containing identical fixtures, then compare with
 //! `--baseline=main`. Requires the matching gungraun-runner and valgrind.
 //! Setup validates results against regex and primes only warm measurements.
+//! The Tier 2–4 compile and short cold-scan cases are controls for changes
+//! to shared regex compilation and matcher preparation.
 
 use std::hint::black_box;
 
@@ -12,7 +14,7 @@ use gungraun::{
     library_benchmark_group, main,
 };
 
-#[path = "common/tier1_assertion_cases.rs"]
+#[path = "common/assertion_cases.rs"]
 mod cases;
 
 fn setup(name: &str, mode: &str, warm: bool) -> cases::Prepared {
