@@ -222,6 +222,9 @@ struct Transition {
     /// (initial_value > 0).  The seed must be visible to the increment
     /// so the counter can break on this very transition.
     pre_seeds: Box<[(CounterIdx, u32)]>,
+    /// Whether stepping this transition must process increments or seeds even
+    /// when no counter instances were live on entry.
+    counts_or_seeds: bool,
     /// Seeds to apply AFTER counter_increment and counter_reset.
     ///
     /// Probe seeds (initial_value = 0) that start new counter instances
@@ -251,6 +254,7 @@ impl Transition {
             with_break_is_match_at_end: false,
             counting_mask: 0,
             pre_seeds: Box::new([]),
+            counts_or_seeds: false,
             seeds: Box::new([]),
             counter_reset: 0,
             phase_reset: 0,
@@ -961,6 +965,9 @@ impl Tier2DfaCache {
         let pre_seed_list = Self::pre_seeds_for(resolved_body_mask & !counter_reset);
         let phase_reset = Self::compute_phase_reset(analysis, counting_mask, counter_reset);
 
+        let counts_or_seeds =
+            counting_mask != 0 || !pre_seed_list.is_empty() || !seed_list.is_empty();
+
         // Compute DFA successors.
         if counting_mask != 0 {
             let cr_nb = self.epsilon_closure(
@@ -986,6 +993,7 @@ impl Tier2DfaCache {
                 with_break_is_match: wb_m || resolved_is_match,
                 with_break_is_match_at_end: wb_mae,
                 counting_mask,
+                counts_or_seeds,
                 pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
                 counter_reset,
@@ -1003,6 +1011,7 @@ impl Tier2DfaCache {
                 with_break_is_match: m || resolved_is_match,
                 with_break_is_match_at_end: mae,
                 counting_mask: 0,
+                counts_or_seeds,
                 pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
                 counter_reset,
@@ -1469,11 +1478,7 @@ impl<'a> Tier2DfaMatcher<'a> {
         let t = &self.cache.transitions[slot];
 
         // Fast path: non-counting, no seeds, no live counters.
-        if t.counting_mask == 0
-            && t.pre_seeds.is_empty()
-            && t.seeds.is_empty()
-            && !self.has_live_counters
-        {
+        if !t.counts_or_seeds && !self.has_live_counters {
             self.current = t.no_break;
             self.match_at_end = t.no_break_is_match_at_end;
             self.ever_matched = self.ever_matched || t.no_break_is_match;
