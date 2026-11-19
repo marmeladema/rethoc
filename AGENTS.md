@@ -340,6 +340,7 @@ assertion suite:
 
 ```bash
 cargo bench --bench reengage -- 'tier2_word_boundary_gap_once|control_tier2_live_counter'
+cargo bench --bench reengage -- 'tier2_anchored_gap_once_bytewise|tier2_dense_candidates'
 cargo bench --bench tier1_assertions -- 'tier2/bytewise/(cold|warm)'
 ```
 
