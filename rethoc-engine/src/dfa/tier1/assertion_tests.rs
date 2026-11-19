@@ -279,11 +279,12 @@ fn eviction_preserves_pending_assertion_context_and_eof() {
                 cache
                     .transitions
                     .iter()
-                    .all(|&next| next == DfaStateId::UNPOPULATED)
+                    .all(|&next| next == super::Tier1StateId::UNKNOWN)
             );
             // The current EOF answer must survive eviction without seeing a
             // next byte; each next-byte answer then rebuilds one transition.
             for next in std::iter::once(None).chain(ALPHABET.map(Some)) {
+                let remapped = cache.tagged(remapped);
                 let mut matcher = DfaMatcher::new(&mut cache, &mut memory, &regex);
                 matcher.current = remapped;
                 matcher.ever_matched = saved.is_match;
@@ -336,7 +337,7 @@ fn dead_transition_ids_clear_on_eviction_and_regex_change() {
         assert_ne!(pending, cache.inner.start_id);
         let saved = cache.inner.states[pending.idx()].clone();
         assert!(!saved.deferred_asserts.is_empty());
-        assert!(cache.dead_transitions.contains(&pending));
+        assert!(cache.dead_transitions.contains(&cache.tagged(pending)));
 
         let remapped = cache.evict(pending);
         assert_eq!(cache.inner.states[remapped.idx()], saved);
@@ -345,7 +346,7 @@ fn dead_transition_ids_clear_on_eviction_and_regex_change() {
             cache.transition(&mut memory, DfaStateId::DEAD, b'\r', &crlf),
             remapped
         );
-        assert!(cache.dead_transitions.contains(&remapped));
+        assert!(cache.dead_transitions.contains(&cache.tagged(remapped)));
 
         cache.prepare(&mut memory, &lf);
         assert!(cache.dead_transitions.is_empty());

@@ -75,15 +75,71 @@ fn push_consume_targets(state: &State, byte: u8, regex: &Regex, targets: &mut Ve
 }
 
 // ---------------------------------------------------------------------------
+// Tagged state ids (Tier 1)
+// ---------------------------------------------------------------------------
+
+/// A Tier 1 transition-table entry: a state index with tag bits on top.
+///
+/// The low bits index [`DfaCache::states`].  The tags say everything the
+/// scanning loop has to know about the entry, so that one comparison
+/// ([`is_tagged`](Self::is_tagged)) tells an ordinary transition from the
+/// three special ones: a slot that is not computed yet, the dead state and
+/// a match state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Tier1StateId(u32);
+
+impl Tier1StateId {
+    /// Tag of a state whose `is_match` flag is set; the index is kept.
+    const MATCH: u32 = 1 << 29;
+    /// The dead state: no NFA state is live.
+    const DEAD: Self = Self(1 << 30);
+    /// A transition that is not computed yet.
+    const UNKNOWN: Self = Self(1 << 31);
+    /// Largest untagged value, and the mask of the index bits.
+    const MAX: u32 = Self::MATCH - 1;
+
+    /// Whether any tag is set: unknown, dead or match.
+    #[inline(always)]
+    fn is_tagged(self) -> bool {
+        self.0 > Self::MAX
+    }
+
+    #[inline(always)]
+    fn is_match(self) -> bool {
+        self.0 & Self::MATCH != 0
+    }
+
+    /// Index into the state table.  Not for `DEAD` or `UNKNOWN`.
+    #[inline(always)]
+    fn idx(self) -> usize {
+        (self.0 & Self::MAX) as usize
+    }
+
+    /// The untagged id of the state, for the shared state table.
+    #[inline]
+    fn state(self) -> DfaStateId {
+        if self == Self::DEAD {
+            DfaStateId::DEAD
+        } else {
+            DfaStateId(self.0 & Self::MAX)
+        }
+    }
+}
+
+/// Most states a Tier 1 cache can be asked to hold: every state index has
+/// to fit below the tag bits.
+pub(crate) const TIER1_MAX_STATES: usize = Tier1StateId::MAX as usize;
+
+// ---------------------------------------------------------------------------
 // DFA cache (Tier 1)
 // ---------------------------------------------------------------------------
 
 /// Lazy DFA cache: append-only state table + flat transition table.
 ///
-/// The transition table is a flat `Vec<DfaStateId>` indexed by
-/// `state.0 * stride + byte_class`, where `stride` is the number
+/// The transition table is a flat `Vec<Tier1StateId>` indexed by
+/// `state index * stride + byte_class`, where `stride` is the number
 /// of byte equivalence classes ([`Regex::num_byte_classes`]).
-/// Unpopulated slots contain `DfaStateId::UNPOPULATED`.  When the
+/// Unpopulated slots contain `Tier1StateId::UNKNOWN`.  When the
 /// state count reaches the cap, the cache is emptied and refilled on
 /// demand (see [`DfaCache`]); answers do not depend on what is cached.
 ///
@@ -96,12 +152,12 @@ fn push_consume_targets(state: &State, byte: u8, regex: &Regex, targets: &mut Ve
 #[repr(C)]
 pub(crate) struct Tier1DfaCache {
     inner: DfaCache,
-    /// Flat transition table: `transitions[state.0 * stride + byte_class]`.
-    /// Unpopulated slots contain `DfaStateId::UNPOPULATED`.
-    transitions: Vec<DfaStateId>,
+    /// Flat transition table: `transitions[index * stride + byte_class]`.
+    /// Unpopulated slots contain `Tier1StateId::UNKNOWN`.
+    transitions: Vec<Tier1StateId>,
     stride: usize,
     /// Lazily allocated restart transitions from DEAD; ids expire on eviction.
-    dead_transitions: Vec<DfaStateId>,
+    dead_transitions: Vec<Tier1StateId>,
     /// Reusable post-consumption roots, used only on cache misses.
     targets: Vec<StateIdx>,
 }
@@ -119,7 +175,19 @@ impl Tier1DfaCache {
 
     /// Set the state cap (see [`DfaCache::set_max_states`]).
     pub(crate) fn set_max_states(&mut self, max_states: usize) {
-        self.inner.set_max_states(max_states);
+        self.inner.set_max_states(max_states.min(TIER1_MAX_STATES));
+    }
+
+    /// The table entry for a state: its index, tagged when it is a match.
+    #[inline]
+    fn tagged(&self, id: DfaStateId) -> Tier1StateId {
+        if id == DfaStateId::DEAD {
+            Tier1StateId::DEAD
+        } else if self.inner.states[id.idx()].is_match {
+            Tier1StateId(id.0 | Tier1StateId::MATCH)
+        } else {
+            Tier1StateId(id.0)
+        }
     }
 
     /// Number of times the cache was emptied because it was full.
@@ -154,7 +222,7 @@ impl Tier1DfaCache {
         self.dead_transitions.clear();
         self.inner.evict(&mut keep, || {
             self.transitions
-                .extend(std::iter::repeat_n(DfaStateId::UNPOPULATED, stride));
+                .extend(std::iter::repeat_n(Tier1StateId::UNKNOWN, stride));
         });
         keep[0]
     }
@@ -180,7 +248,7 @@ impl Tier1DfaCache {
                 context,
                 || {
                     self.transitions
-                        .extend(std::iter::repeat_n(DfaStateId::UNPOPULATED, stride));
+                        .extend(std::iter::repeat_n(Tier1StateId::UNKNOWN, stride));
                 },
             )
             .expect("DFA state cap reached although room was made")
@@ -253,9 +321,29 @@ impl Tier1DfaCache {
         (matched, at_end, context.masked(needs))
     }
 
-    /// Compute the DFA transition for `(from_state, byte)`, using byte-class
-    /// compression (stride < 256).
+    /// The transition out of `from` on `byte`, computed if it is missing.
+    /// `from` is a state or `DEAD`; the result is never `UNKNOWN`.
     #[inline(always)]
+    fn transition_tagged(
+        &mut self,
+        memory: &mut DfaMemory,
+        from: Tier1StateId,
+        byte: u8,
+        regex: &Regex,
+    ) -> Tier1StateId {
+        if from == Tier1StateId::DEAD {
+            return self.transition_from_dead(memory, byte, regex);
+        }
+        let class = regex.byte_classes[byte as usize] as usize;
+        let cached = self.transitions[from.idx() * self.stride + class];
+        if cached != Tier1StateId::UNKNOWN {
+            return cached;
+        }
+        self.transition_miss(memory, from, byte, class, regex)
+    }
+
+    /// [`transition_tagged`](Self::transition_tagged) on plain state ids.
+    #[cfg(test)]
     fn transition(
         &mut self,
         memory: &mut DfaMemory,
@@ -263,78 +351,51 @@ impl Tier1DfaCache {
         byte: u8,
         regex: &Regex,
     ) -> DfaStateId {
-        if from == DfaStateId::DEAD {
-            return self.transition_from_dead(memory, byte, regex);
-        }
-        let class = regex.byte_classes[byte as usize] as usize;
-        let slot = from.idx() * self.stride + class;
-        let cached = self.transitions[slot];
-        if cached != DfaStateId::UNPOPULATED {
-            return cached;
-        }
-        self.transition_miss(memory, from, byte, class, regex)
-    }
-
-    /// Compute the DFA transition for `(from_state, byte)`, using the
-    /// identity mapping (stride=256, no byte-class indirection).
-    #[inline(always)]
-    fn transition_direct(
-        &mut self,
-        memory: &mut DfaMemory,
-        from: DfaStateId,
-        byte: u8,
-        regex: &Regex,
-    ) -> DfaStateId {
-        if from == DfaStateId::DEAD {
-            return self.transition_from_dead(memory, byte, regex);
-        }
-        let slot = from.idx() * 256 + byte as usize;
-        let cached = self.transitions[slot];
-        if cached != DfaStateId::UNPOPULATED {
-            return cached;
-        }
-        self.transition_miss(memory, from, byte, byte as usize, regex)
+        let from = self.tagged(from);
+        self.transition_tagged(memory, from, byte, regex).state()
     }
 
     /// Cache miss: compute the transition out of `from` on `byte` (whose
     /// column in the table is `class`) and store it.  Kept out of line so
-    /// the lookup above stays small.
+    /// the lookup stays small.
     #[cold]
     #[inline(never)]
     fn transition_miss(
         &mut self,
         memory: &mut DfaMemory,
-        from: DfaStateId,
+        from: Tier1StateId,
         byte: u8,
         class: usize,
         regex: &Regex,
-    ) -> DfaStateId {
+    ) -> Tier1StateId {
         // `from` gets a new id if the cache has to be emptied.
-        let from = self.make_room(from);
+        let from = self.make_room(from.state());
         let to = self.populate(memory, from, byte, regex);
+        let to = self.tagged(to);
         self.transitions[from.idx() * self.stride + class] = to;
         to
     }
 
     /// Transition from the DEAD state (re-seed from start).
-    /// Separated to keep the hot path of `transition()` small.
+    /// Separated to keep the scanning loop small.
     #[inline(never)]
     fn transition_from_dead(
         &mut self,
         memory: &mut DfaMemory,
         byte: u8,
         regex: &Regex,
-    ) -> DfaStateId {
+    ) -> Tier1StateId {
         let class = regex.byte_classes[byte as usize] as usize;
         if let Some(&cached) = self.dead_transitions.get(class)
-            && cached != DfaStateId::UNPOPULATED
+            && cached != Tier1StateId::UNKNOWN
         {
             return cached;
         }
         self.make_room(DfaStateId::DEAD);
         let next = self.populate(memory, DfaStateId::DEAD, byte, regex);
+        let next = self.tagged(next);
         self.dead_transitions
-            .resize(self.stride, DfaStateId::UNPOPULATED);
+            .resize(self.stride, Tier1StateId::UNKNOWN);
         self.dead_transitions[class] = next;
         next
     }
@@ -489,9 +550,60 @@ pub struct DfaMatcher<'a> {
     cache: &'a mut Tier1DfaCache,
     memory: &'a mut DfaMemory,
     regex: &'a Regex,
-    current: DfaStateId,
+    /// The current state or `DEAD`; carries the match tag once
+    /// `ever_matched` is set by a transition.
+    current: Tier1StateId,
     ever_matched: bool,
     prefilter: Prefilter,
+}
+
+/// Scan `$input` from `$self.current`, stopping at the first match state.
+///
+/// `$class` maps a byte to its column and `$stride` is the row width; both
+/// are spelled out by the caller so that the identity mapping costs
+/// nothing.  `$at_start` runs before each byte with the position and the
+/// current state; it may move the position forward or leave the loop.
+///
+/// The current state lives in a local for the whole scan.  One test of the
+/// table entry tells an ordinary transition from a missing one, the dead
+/// state and a match.
+macro_rules! scan {
+    ($self:ident, $input:ident, $stride:expr, |$b:ident| $class:expr,
+     |$i:ident, $cur:ident| $at_start:block) => {{
+        let mut $cur = $self.current;
+        let mut $i = 0;
+        while $i < $input.len() {
+            $at_start
+            let $b = $input[$i];
+            let mut next = if $cur.is_tagged() {
+                // Only the dead state: a match ends the scan.
+                $self
+                    .cache
+                    .transition_from_dead($self.memory, $b, $self.regex)
+            } else {
+                $self.cache.transitions[$cur.0 as usize * $stride + $class]
+            };
+            if next.is_tagged() {
+                if next == Tier1StateId::UNKNOWN {
+                    next = $self.cache.transition_miss(
+                        $self.memory,
+                        $cur,
+                        $b,
+                        $class,
+                        $self.regex,
+                    );
+                }
+                if next.is_match() {
+                    $self.current = next;
+                    $self.ever_matched = true;
+                    return;
+                }
+            }
+            $cur = next;
+            $i += 1;
+        }
+        $self.current = $cur;
+    }};
 }
 
 impl<'a> DfaMatcher<'a> {
@@ -501,9 +613,16 @@ impl<'a> DfaMatcher<'a> {
         memory: &'a mut DfaMemory,
         regex: &'a Regex,
     ) -> Self {
+        // The start state's tag from the cached flag: no table access here.
+        let start_is_match = cache.inner.start_is_match;
+        let tag = if start_is_match {
+            Tier1StateId::MATCH
+        } else {
+            0
+        };
         DfaMatcher {
-            current: cache.inner.start_id,
-            ever_matched: cache.inner.start_is_match,
+            current: Tier1StateId(cache.inner.start_id.0 | tag),
+            ever_matched: start_is_match,
             cache,
             memory,
             regex,
@@ -513,17 +632,10 @@ impl<'a> DfaMatcher<'a> {
 
     #[inline(always)]
     pub fn step(&mut self, byte: u8) {
-        if self.cache.stride == 256 {
-            self.current =
-                self.cache
-                    .transition_direct(self.memory, self.current, byte, self.regex);
-        } else {
-            self.current = self
-                .cache
-                .transition(self.memory, self.current, byte, self.regex);
-        }
-        if self.current != DfaStateId::DEAD && self.cache.inner.states[self.current.idx()].is_match
-        {
+        self.current = self
+            .cache
+            .transition_tagged(self.memory, self.current, byte, self.regex);
+        if self.current.is_match() {
             self.ever_matched = true;
         }
     }
@@ -533,94 +645,76 @@ impl<'a> DfaMatcher<'a> {
         if self.ever_matched {
             return;
         }
-        let start_id = self.cache.inner.start_id;
-
         // Prefilter-aware scanning: when the DFA is in the start state and
         // a prefilter is available, use memchr to skip ahead to the next
         // candidate byte instead of stepping byte-by-byte.  This is
         // re-engaged every time the DFA returns to the start state, not
         // just once at chunk entry.
         crate::prefilter::with_prefilter!(self.prefilter, self.chunk_no_prefilter(input), |find| {
-            self.chunk_prefilter(input, start_id, find)
+            self.chunk_prefilter(input, find)
         })
     }
 
     #[inline(always)]
     fn chunk_no_prefilter(&mut self, input: &[u8]) {
         if self.cache.stride == 256 {
-            for &b in input {
-                if self.ever_matched {
-                    return;
-                }
-                self.current =
-                    self.cache
-                        .transition_direct(self.memory, self.current, b, self.regex);
-                if self.current != DfaStateId::DEAD
-                    && self.cache.inner.states[self.current.idx()].is_match
-                {
-                    self.ever_matched = true;
-                }
-            }
+            scan!(self, input, 256, |b| b as usize, |i, cur| {});
         } else {
-            for &b in input {
-                if self.ever_matched {
-                    return;
-                }
-                self.current = self
-                    .cache
-                    .transition(self.memory, self.current, b, self.regex);
-                if self.current != DfaStateId::DEAD
-                    && self.cache.inner.states[self.current.idx()].is_match
-                {
-                    self.ever_matched = true;
-                }
-            }
+            let stride = self.cache.stride;
+            let classes = &self.regex.byte_classes;
+            scan!(
+                self,
+                input,
+                stride,
+                |b| classes[b as usize] as usize,
+                |i, cur| {}
+            );
         }
     }
 
     /// Prefilter-integrated scanning loop.
     ///
-    /// When `current == start_id`, the DFA is in its start state where
-    /// non-matching bytes loop back to start.  Instead of stepping through
-    /// those bytes one by one, we use the `finder` (memchr) to skip ahead
-    /// to the next candidate byte.  Once a candidate is found, we step
-    /// through the DFA normally until it returns to the start state (or
-    /// matches / reaches end of input).
+    /// In the start state, bytes that cannot start a match loop back to
+    /// it.  Instead of stepping through those bytes one by one, the
+    /// `finder` (memchr) skips ahead to the next candidate byte.  From
+    /// there the DFA steps normally until it returns to the start state
+    /// (or matches / reaches end of input).
     #[inline(always)]
-    fn chunk_prefilter(
-        &mut self,
-        input: &[u8],
-        start_id: DfaStateId,
-        finder: impl Fn(&[u8]) -> Option<usize>,
-    ) {
-        let mut i = 0;
-        while i < input.len() {
-            if self.ever_matched {
-                return;
-            }
-            // When at the start state, skip ahead with memchr.
-            if self.current == start_id {
-                if let Some(offset) = finder(&input[i..]) {
-                    i += offset;
-                } else {
-                    return;
+    fn chunk_prefilter(&mut self, input: &[u8], finder: impl Fn(&[u8]) -> Option<usize>) {
+        // The start state keeps its id when the cache is emptied.
+        let start = Tier1StateId(self.cache.inner.start_id.0);
+        if self.cache.stride == 256 {
+            scan!(self, input, 256, |b| b as usize, |i, cur| {
+                if cur == start {
+                    match finder(&input[i..]) {
+                        Some(offset) => i += offset,
+                        None => {
+                            self.current = cur;
+                            return;
+                        }
+                    }
                 }
-            }
-            if self.cache.stride == 256 {
-                self.current =
-                    self.cache
-                        .transition_direct(self.memory, self.current, input[i], self.regex);
-            } else {
-                self.current =
-                    self.cache
-                        .transition(self.memory, self.current, input[i], self.regex);
-            }
-            if self.current != DfaStateId::DEAD
-                && self.cache.inner.states[self.current.idx()].is_match
-            {
-                self.ever_matched = true;
-            }
-            i += 1;
+            });
+        } else {
+            let stride = self.cache.stride;
+            let classes = &self.regex.byte_classes;
+            scan!(
+                self,
+                input,
+                stride,
+                |b| classes[b as usize] as usize,
+                |i, cur| {
+                    if cur == start {
+                        match finder(&input[i..]) {
+                            Some(offset) => i += offset,
+                            None => {
+                                self.current = cur;
+                                return;
+                            }
+                        }
+                    }
+                }
+            );
         }
     }
 
@@ -629,13 +723,8 @@ impl<'a> DfaMatcher<'a> {
         if self.ever_matched {
             return true;
         }
-        if self.current != DfaStateId::DEAD {
-            let state = &self.cache.inner.states[self.current.idx()];
-            if state.is_match_at_end {
-                return true;
-            }
-        }
-        false
+        self.current != Tier1StateId::DEAD
+            && self.cache.inner.states[self.current.idx()].is_match_at_end
     }
 
     #[allow(dead_code)]
@@ -647,8 +736,8 @@ impl<'a> DfaMatcher<'a> {
 impl fmt::Debug for DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("DfaMatcher");
-        s.field("current", &self.current);
-        if self.current != DfaStateId::DEAD {
+        s.field("current", &self.current.state());
+        if self.current != Tier1StateId::DEAD {
             let state = &self.cache.inner.states[self.current.idx()];
             s.field("nfa_states", &state.nfa_states);
             s.field("is_match", &state.is_match);
@@ -665,14 +754,14 @@ impl fmt::Debug for DfaMatcher<'_> {
 
 impl fmt::Display for DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.current == DfaStateId::DEAD {
+        if self.current == Tier1StateId::DEAD {
             return write!(f, "DFA[T1] state=DEAD matched={}", self.ever_matched);
         }
         let state = &self.cache.inner.states[self.current.idx()];
         write!(
             f,
             "DFA[T1] state={} nfa={{{}}} matched={}",
-            self.current.0,
+            self.current.idx(),
             state
                 .nfa_states
                 .iter()
@@ -719,7 +808,7 @@ mod tests {
         cache.prepare(&mut memory, &re);
         let mut m = DfaMatcher::new(&mut cache, &mut memory, &re);
         m.chunk(b"abab");
-        let current = m.current;
+        let current = m.current.state();
         assert_ne!(current, DfaStateId::DEAD);
         assert_ne!(current, cache.inner.start_id);
         let state = cache.inner.states[current.idx()].clone();
@@ -735,7 +824,7 @@ mod tests {
             cache
                 .transitions
                 .iter()
-                .all(|&t| t == DfaStateId::UNPOPULATED)
+                .all(|&t| t == Tier1StateId::UNKNOWN)
         );
         assert_eq!(cache.evictions(), 1);
 
