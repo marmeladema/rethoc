@@ -122,6 +122,23 @@ impl Prefilter {
         }
     }
 
+    /// Identify an immediate candidate before starting a bulk search.
+    /// Single literals use a word-wide comparison; the other filters check
+    /// the first byte. A miss leaves the remaining search to the caller.
+    #[inline]
+    pub(crate) fn find_in_prefix(&self, hay: &[u8]) -> Option<usize> {
+        if let Self::Memchr1(byte) = *self
+            && let Some(word) = hay.first_chunk::<8>()
+        {
+            // The first zero byte is the first literal in input order.
+            // A borrow can flag a later byte as well; only the first bit is used.
+            let diff = u64::from_le_bytes(*word) ^ u64::from_le_bytes([byte; 8]);
+            let zeros = diff.wrapping_sub(0x0101_0101_0101_0101) & !diff & 0x8080_8080_8080_8080;
+            return (zeros != 0).then(|| zeros.trailing_zeros() as usize / 8);
+        }
+        hay.first().filter(|&&byte| self.accepts(byte)).map(|_| 0)
+    }
+
     /// Offset of the first byte of `hay` that can start a match, or `None`
     /// if there is none.  Every byte is a candidate for [`Prefilter::None`].
     pub(crate) fn find(&self, hay: &[u8]) -> Option<usize> {
@@ -283,6 +300,28 @@ mod tests {
         )
         .unwrap();
         re.prefilter
+    }
+
+    #[test]
+    fn word_prefix_finds_the_first_literal_in_input_order() {
+        for literal in 0..=255 {
+            let filter = Prefilter::Memchr1(literal);
+            for bits in 0_u16..256 {
+                // XOR 1 in every other position exercises borrow propagation
+                // beyond each true equality. Check every eight-byte hit mask.
+                let word: [u8; 8] = std::array::from_fn(|i| {
+                    if bits & (1 << i) != 0 {
+                        literal
+                    } else {
+                        literal ^ 1
+                    }
+                });
+                assert_eq!(
+                    filter.find_in_prefix(&word),
+                    word.iter().position(|&b| b == literal)
+                );
+            }
+        }
     }
 
     #[test]

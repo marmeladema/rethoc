@@ -1241,6 +1241,7 @@ impl Tier2DfaCache {
                 regex,
             )
             .expect("an empty cache has room for the start state");
+        debug_assert_eq!(self.inner.start_id, DfaStateId::START);
         self.inner.start_is_match = self.inner.states[self.inner.start_id.idx()].is_match;
         self.inner.start_is_match_at_end =
             self.inner.states[self.inner.start_id.idx()].is_match_at_end;
@@ -1675,9 +1676,8 @@ impl<'a> Tier2DfaMatcher<'a> {
             return;
         }
 
-        let start_id = self.cache.inner.start_id;
         if let [byte] = input
-            && self.current == start_id
+            && self.current == DfaStateId::START
             && !self.has_live_counters
             && !self.prefilter.accepts(*byte)
         {
@@ -1690,8 +1690,11 @@ impl<'a> Tier2DfaMatcher<'a> {
         // candidate byte instead of stepping byte-by-byte.  This is
         // re-engaged every time the DFA returns to the start state, not
         // just once at chunk entry.
-        crate::prefilter::with_prefilter!(self.prefilter, self.chunk_no_prefilter(input), |find| {
-            self.chunk_prefilter(input, start_id, find)
+        let prefilter = self.prefilter;
+        crate::prefilter::with_prefilter!(prefilter, self.chunk_no_prefilter(input), |find| {
+            self.chunk_prefilter(input, |bytes| {
+                prefilter.find_in_prefix(bytes).or_else(|| find(bytes))
+            })
         })
     }
 
@@ -1714,28 +1717,20 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
     }
 
-    /// Prefilter-integrated scanning loop.
-    ///
-    /// When `current == start_id`, the DFA is in its start state where
-    /// non-matching bytes loop back to start.  Instead of stepping through
-    /// those bytes one by one, we use the `finder` (memchr) to skip ahead
-    /// to the next candidate byte.  Once a candidate is found, we step
-    /// through the DFA normally until it returns to the start state (or
-    /// matches / reaches end of input).
-    #[inline(always)]
-    fn chunk_prefilter(
-        &mut self,
-        input: &[u8],
-        start_id: DfaStateId,
-        finder: impl Fn(&[u8]) -> Option<usize>,
-    ) {
+    /// Bulk scan with the prefilter. At [`DfaStateId::START`] (state zero)
+    /// with no live counters, the finder may skip to the next candidate.
+    /// The cache interns the start state first and preserves its id on eviction.
+    /// Keeping this loop out of line keeps its specializations out of the
+    /// common chunk dispatcher.
+    #[inline(never)]
+    fn chunk_prefilter(&mut self, input: &[u8], finder: impl Fn(&[u8]) -> Option<usize>) {
         let mut i = 0;
         while i < input.len() {
             if self.status != SearchStatus::Searching {
                 return;
             }
-            // When at the start state, skip ahead with memchr.
-            if self.current == start_id && !self.has_live_counters {
+            // chunk() already checked an idle singleton against the prefilter.
+            if self.current == DfaStateId::START && !self.has_live_counters && input.len() > 1 {
                 if let Some(offset) = finder(&input[i..]) {
                     i += offset;
                 } else {
