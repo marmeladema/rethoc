@@ -86,12 +86,19 @@ fn push_consume_targets(state: &State, byte: u8, regex: &Regex, targets: &mut Ve
 /// and nothing else.  The tags say everything the
 /// scanning loop has to know about the entry, so that one comparison
 /// ([`is_tagged`](Self::is_tagged)) tells an ordinary transition from the
-/// three special ones: a slot that is not computed yet, the dead state and
-/// a match state.
+/// special ones: a slot that is not computed yet, the dead state, a match
+/// state and, when the regex has a prefilter, the start state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Tier1StateId(u32);
 
 impl Tier1StateId {
+    /// Tag of the start state in the table of a regex with a prefilter:
+    /// entering it hands the input over to the prefilter.  The matcher's
+    /// current state never carries it.
+    const START_TAG: u32 = 1 << 28;
+    /// The start state as a current state: state 0, so row offset 0, also
+    /// after the cache is emptied.
+    const START: Self = Self(0);
     /// Tag of a state whose `is_match` flag is set; the offset is kept.
     const MATCH: u32 = 1 << 29;
     /// The dead state: no NFA state is live.
@@ -99,9 +106,9 @@ impl Tier1StateId {
     /// A transition that is not computed yet.
     const UNKNOWN: Self = Self(1 << 31);
     /// Largest untagged value, and the mask of the offset bits.
-    const MAX: u32 = Self::MATCH - 1;
+    const MAX: u32 = Self::START_TAG - 1;
 
-    /// Whether any tag is set: unknown, dead or match.
+    /// Whether any tag is set: unknown, dead, match or start.
     #[inline(always)]
     fn is_tagged(self) -> bool {
         self.0 > Self::MAX
@@ -110,6 +117,17 @@ impl Tier1StateId {
     #[inline(always)]
     fn is_match(self) -> bool {
         self.0 & Self::MATCH != 0
+    }
+
+    #[inline(always)]
+    fn is_start(self) -> bool {
+        self.0 & Self::START_TAG != 0
+    }
+
+    /// The entry as a current state: without the start tag.
+    #[inline(always)]
+    fn current(self) -> Self {
+        Self(self.0 & !Self::START_TAG)
     }
 
     /// Offset of the state's row in the transition table.  Not for `DEAD`
@@ -152,6 +170,9 @@ pub(crate) struct Tier1DfaCache {
     transitions: Vec<Tier1StateId>,
     /// Row width: a power of two, at least the number of byte classes.
     stride: usize,
+    /// Whether transitions into the start state carry
+    /// [`Tier1StateId::START_TAG`]: the regex has a prefilter.
+    tag_start: bool,
     /// Lazily allocated restart transitions from DEAD; ids expire on eviction.
     dead_transitions: Vec<Tier1StateId>,
     /// Reusable post-consumption roots, used only on cache misses.
@@ -164,6 +185,7 @@ impl Tier1DfaCache {
             inner: DfaCache::new(),
             transitions: Vec::new(),
             stride: 256,
+            tag_start: false,
             dead_transitions: Vec::new(),
             targets: Vec::new(),
         }
@@ -181,13 +203,15 @@ impl Tier1DfaCache {
         if id == DfaStateId::DEAD {
             return Tier1StateId::DEAD;
         }
-        let row = id.0 << self.stride.trailing_zeros();
+        let mut row = id.0 << self.stride.trailing_zeros();
         debug_assert!(row <= Tier1StateId::MAX);
-        if self.inner.states[id.idx()].is_match {
-            Tier1StateId(row | Tier1StateId::MATCH)
-        } else {
-            Tier1StateId(row)
+        if self.tag_start && id == DfaStateId::START {
+            row |= Tier1StateId::START_TAG;
         }
+        if self.inner.states[id.idx()].is_match {
+            row |= Tier1StateId::MATCH;
+        }
+        Tier1StateId(row)
     }
 
     /// The plain id of the state behind a table entry.
@@ -515,6 +539,7 @@ impl Tier1DfaCache {
             regex.num_byte_classes.next_power_of_two(),
         );
         self.inner.regex_id = id;
+        self.tag_start = !matches!(regex.prefilter, Prefilter::None);
 
         // Keep real start context until pending continuations are known.
         let (is_match, is_match_at_end, context) = if !regex.dfa_assertions.is_empty() {
@@ -578,61 +603,6 @@ pub struct DfaMatcher<'a> {
     prefilter: Prefilter,
 }
 
-/// Scan `$input` from `$self.current`, stopping at the first match state.
-///
-/// `$class` maps a byte to its column; the caller spells it out so that
-/// the identity mapping costs nothing.  `$at_start` runs before each byte
-/// with the position and the current state; it may move the position
-/// forward or leave the loop.
-///
-/// The current state and the table live in locals for the whole scan; the
-/// table is borrowed again after a miss, which can move or empty it.  A
-/// lookup is the entry at the current row offset plus the column, and one
-/// test of that entry tells an ordinary transition from a missing one, the
-/// dead state and a match.
-macro_rules! scan {
-    ($self:ident, $input:ident, |$b:ident| $class:expr,
-     |$i:ident, $cur:ident| $at_start:block) => {{
-        let mut $cur = $self.current;
-        let mut table = &$self.cache.transitions[..];
-        let mut $i = 0;
-        while $i < $input.len() {
-            $at_start
-            let $b = $input[$i];
-            let mut next = if $cur.is_tagged() {
-                // Only the dead state: a match ends the scan.
-                let next = $self
-                    .cache
-                    .transition_from_dead($self.memory, $b, $self.regex);
-                table = &$self.cache.transitions[..];
-                next
-            } else {
-                table[$cur.0 as usize + $class]
-            };
-            if next.is_tagged() {
-                if next == Tier1StateId::UNKNOWN {
-                    next = $self.cache.transition_miss(
-                        $self.memory,
-                        $cur,
-                        $b,
-                        $class,
-                        $self.regex,
-                    );
-                    table = &$self.cache.transitions[..];
-                }
-                if next.is_match() {
-                    $self.current = next;
-                    $self.ever_matched = true;
-                    return;
-                }
-            }
-            $cur = next;
-            $i += 1;
-        }
-        $self.current = $cur;
-    }};
-}
-
 impl<'a> DfaMatcher<'a> {
     #[inline]
     pub(crate) fn new(
@@ -640,8 +610,7 @@ impl<'a> DfaMatcher<'a> {
         memory: &'a mut DfaMemory,
         regex: &'a Regex,
     ) -> Self {
-        // The start state is state 0, so its row offset is 0; its tag comes
-        // from the cached flag.  No table access here.
+        // The start state's tag comes from the cached flag: no table access.
         debug_assert_eq!(cache.inner.start_id, DfaStateId::START);
         let start_is_match = cache.inner.start_is_match;
         let tag = if start_is_match {
@@ -650,7 +619,7 @@ impl<'a> DfaMatcher<'a> {
             0
         };
         DfaMatcher {
-            current: Tier1StateId(tag),
+            current: Tier1StateId(Tier1StateId::START.0 | tag),
             ever_matched: start_is_match,
             cache,
             memory,
@@ -663,7 +632,8 @@ impl<'a> DfaMatcher<'a> {
     pub fn step(&mut self, byte: u8) {
         self.current = self
             .cache
-            .transition_tagged(self.memory, self.current, byte, self.regex);
+            .transition_tagged(self.memory, self.current, byte, self.regex)
+            .current();
         if self.current.is_match() {
             self.ever_matched = true;
         }
@@ -674,64 +644,119 @@ impl<'a> DfaMatcher<'a> {
         if self.ever_matched {
             return;
         }
-        // Prefilter-aware scanning: when the DFA is in the start state and
-        // a prefilter is available, use memchr to skip ahead to the next
-        // candidate byte instead of stepping byte-by-byte.  This is
-        // re-engaged every time the DFA returns to the start state, not
-        // just once at chunk entry.
-        crate::prefilter::with_prefilter!(self.prefilter, self.chunk_no_prefilter(input), |find| {
-            self.chunk_prefilter(input, find)
-        })
-    }
-
-    #[inline(always)]
-    fn chunk_no_prefilter(&mut self, input: &[u8]) {
+        let regex = self.regex;
+        let no_finder = |_: &[u8]| None;
+        // With a prefilter, the start state hands the input over to it:
+        // bytes that cannot start a match loop back to the start state, so
+        // memchr skips to the next candidate instead.  This happens every
+        // time the DFA returns to the start state, not only at chunk entry.
         if self.cache.stride == 256 {
-            scan!(self, input, |b| b as usize, |i, cur| {});
+            crate::prefilter::with_prefilter!(
+                self.prefilter,
+                self.scan::<false>(input, |b| b as usize, no_finder),
+                |find| self.scan::<true>(input, |b| b as usize, find)
+            )
         } else {
-            let classes = &self.regex.byte_classes;
-            scan!(self, input, |b| classes[b as usize] as usize, |i, cur| {});
+            let class = |b: u8| regex.byte_classes[b as usize] as usize;
+            crate::prefilter::with_prefilter!(
+                self.prefilter,
+                self.scan::<false>(input, class, no_finder),
+                |find| self.scan::<true>(input, class, find)
+            )
         }
     }
 
-    /// Prefilter-integrated scanning loop.
+    /// Scan `input` from the current state, stopping at the first match
+    /// state.  `class` maps a byte to its column; `finder` is the prefilter
+    /// when `PREFILTER` is set, and unused otherwise.
     ///
-    /// In the start state, bytes that cannot start a match loop back to
-    /// it.  Instead of stepping through those bytes one by one, the
-    /// `finder` (memchr) skips ahead to the next candidate byte.  From
-    /// there the DFA steps normally until it returns to the start state
-    /// (or matches / reaches end of input).
+    /// The current state and the table live in locals; the table is
+    /// borrowed again after anything that can move or empty it.
+    ///
+    /// Almost every transition leads to an ordinary state, so those are
+    /// followed in a run that does nothing else: the entry at the current
+    /// row offset plus the column, and one test that the entry has no tag.
+    /// A tagged entry ends the run and is dealt with below it: a transition
+    /// to compute, a match, the dead state or, with a prefilter, the start
+    /// state.
+    ///
+    /// The run is not unrolled.  It waits on the chain of table loads, so
+    /// four bytes per iteration saved instructions but no time on 2 KiB
+    /// lines, and cost 4% on 35-byte lines, where the leftover bytes of
+    /// each line mispredict (rebar `imported/lh3lh3-reb/uri-or-email`).
     #[inline(always)]
-    fn chunk_prefilter(&mut self, input: &[u8], finder: impl Fn(&[u8]) -> Option<usize>) {
-        // The start state is state 0, also after the cache is emptied.
-        debug_assert_eq!(self.cache.inner.start_id, DfaStateId::START);
-        let start = Tier1StateId(0);
-        if self.cache.stride == 256 {
-            scan!(self, input, |b| b as usize, |i, cur| {
-                if cur == start {
-                    match finder(&input[i..]) {
-                        Some(offset) => i += offset,
-                        None => {
-                            self.current = cur;
-                            return;
-                        }
-                    }
-                }
-            });
-        } else {
-            let classes = &self.regex.byte_classes;
-            scan!(self, input, |b| classes[b as usize] as usize, |i, cur| {
-                if cur == start {
-                    match finder(&input[i..]) {
-                        Some(offset) => i += offset,
-                        None => {
-                            self.current = cur;
-                            return;
-                        }
-                    }
-                }
-            });
+    fn scan<const PREFILTER: bool>(
+        &mut self,
+        input: &[u8],
+        class: impl Fn(u8) -> usize,
+        finder: impl Fn(&[u8]) -> Option<usize>,
+    ) {
+        let len = input.len();
+        let mut i = 0;
+        let mut cur = self.current;
+        if PREFILTER && cur == Tier1StateId::START {
+            match finder(input) {
+                Some(offset) => i = offset,
+                None => return,
+            }
         }
+        let mut table = &self.cache.transitions[..];
+        let lookup = |table: &[Tier1StateId], from: Tier1StateId, byte: u8| {
+            table[from.0 as usize + class(byte)]
+        };
+        while i < len {
+            // `next` is the tagged entry out of `from` on `input[i]`.
+            let (from, mut next) = if cur.is_tagged() {
+                // The dead state has no row.
+                let next = self
+                    .cache
+                    .transition_from_dead(self.memory, input[i], self.regex);
+                table = &self.cache.transitions[..];
+                if !next.is_tagged() {
+                    cur = next;
+                    i += 1;
+                    continue;
+                }
+                (cur, next)
+            } else {
+                'run: {
+                    while i < len {
+                        let next = lookup(table, cur, input[i]);
+                        if next.is_tagged() {
+                            break 'run (cur, next);
+                        }
+                        cur = next;
+                        i += 1;
+                    }
+                    self.current = cur;
+                    return;
+                }
+            };
+            if next == Tier1StateId::UNKNOWN {
+                let byte = input[i];
+                next = self
+                    .cache
+                    .transition_miss(self.memory, from, byte, class(byte), self.regex);
+                table = &self.cache.transitions[..];
+            }
+            i += 1;
+            if next.is_match() {
+                self.current = next.current();
+                self.ever_matched = true;
+                return;
+            }
+            if PREFILTER && next.is_start() {
+                cur = Tier1StateId::START;
+                match finder(&input[i..]) {
+                    Some(offset) => i += offset,
+                    None => break,
+                }
+                continue;
+            }
+            // An ordinary state after a miss, or the dead state.
+            cur = next;
+        }
+        self.current = cur;
     }
 
     #[inline]
