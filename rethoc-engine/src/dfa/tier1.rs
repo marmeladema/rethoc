@@ -153,8 +153,8 @@ pub(crate) const TIER1_MAX_STATES: usize = (Tier1StateId::MAX as usize + 1) / 25
 ///
 /// The transition table is a flat `Vec<Tier1StateId>` indexed by
 /// `state index * stride + byte_class`, where `stride` is the number
-/// of byte equivalence classes ([`Regex::num_byte_classes`]) rounded up to
-/// a power of two, so that entries can hold row offsets.
+/// of byte equivalence classes ([`Regex::num_byte_classes`]).  Entries
+/// hold row offsets (`state index * stride`).
 /// Unpopulated slots contain `Tier1StateId::UNKNOWN`.  When the
 /// state count reaches the cap, the cache is emptied and refilled on
 /// demand (see [`DfaCache`]); answers do not depend on what is cached.
@@ -171,8 +171,12 @@ pub(crate) struct Tier1DfaCache {
     /// Flat transition table: `transitions[row offset + byte_class]`.
     /// Unpopulated slots contain `Tier1StateId::UNKNOWN`.
     transitions: Vec<Tier1StateId>,
-    /// Row width: a power of two, at least the number of byte classes.
+    /// Row width: the number of byte classes.
     stride: usize,
+    /// `ceil(2^32 / stride)`.  A row offset is a multiple of the stride
+    /// below 2^28 and the stride is at most 256, so the high half of
+    /// their product is exactly the offset over the stride.
+    stride_reciprocal: u64,
     /// Whether transitions into the start state carry
     /// [`Tier1StateId::START_TAG`]: the regex has a prefilter.
     tag_start: bool,
@@ -186,6 +190,7 @@ impl Tier1DfaCache {
             inner: DfaCache::new(),
             transitions: Vec::new(),
             stride: 256,
+            stride_reciprocal: (1 << 32) / 256,
             tag_start: false,
             targets: Vec::new(),
         }
@@ -201,7 +206,7 @@ impl Tier1DfaCache {
     #[inline]
     fn tagged(&self, id: DfaStateId) -> Tier1StateId {
         debug_assert!(id != DfaStateId::DEAD, "Tier 1 interns the empty state");
-        let mut row = id.0 << self.stride.trailing_zeros();
+        let mut row = id.0 * self.stride as u32;
         debug_assert!(row <= Tier1StateId::MAX);
         if self.tag_start && id == DfaStateId::START {
             row |= Tier1StateId::START_TAG;
@@ -212,16 +217,27 @@ impl Tier1DfaCache {
         Tier1StateId(row)
     }
 
+    /// Index in the state table of the state behind a table entry: its row
+    /// offset over the row width.  Runs once per stream (`finish`), where
+    /// a division showed on short streams, so it multiplies by the
+    /// reciprocal kept in `stride_reciprocal`.
+    #[inline]
+    fn index(&self, id: Tier1StateId) -> usize {
+        let index = (id.row() as u64 * self.stride_reciprocal) >> 32;
+        debug_assert_eq!(index as usize, id.row() / self.stride);
+        index as usize
+    }
+
     /// The plain id of the state behind a table entry.
     #[inline]
     fn untagged(&self, id: Tier1StateId) -> DfaStateId {
-        DfaStateId((id.row() >> self.stride.trailing_zeros()) as u32)
+        DfaStateId(self.index(id) as u32)
     }
 
     /// The state behind a table entry.  Not for `UNKNOWN`.
     #[inline]
     fn state(&self, id: Tier1StateId) -> &super::DfaState {
-        &self.inner.states[id.row() >> self.stride.trailing_zeros()]
+        &self.inner.states[self.index(id)]
     }
 
     /// Number of times the cache was emptied because it was full.
@@ -484,6 +500,7 @@ impl Tier1DfaCache {
         self.inner.clear();
         self.targets.clear();
         self.stride = stride;
+        self.stride_reciprocal = (1u64 << 32).div_ceil(stride as u64);
         memory.clear(num_nfa_states);
         self.transitions.clear();
         // Room for the smallest cache a matcher can run with, so that the
@@ -500,11 +517,7 @@ impl Tier1DfaCache {
         if self.inner.regex_id == id && self.inner.start_id != DfaStateId::DEAD {
             return;
         }
-        self.clear(
-            memory,
-            regex.states.len(),
-            regex.num_byte_classes.next_power_of_two(),
-        );
+        self.clear(memory, regex.states.len(), regex.num_byte_classes);
         self.inner.regex_id = id;
         self.tag_start = !matches!(regex.prefilter, Prefilter::None);
 
@@ -611,9 +624,7 @@ impl<'a> DfaMatcher<'a> {
         // bytes that cannot start a match loop back to the start state, so
         // memchr skips to the next candidate instead.  This happens every
         // time the DFA returns to the start state, not only at chunk entry.
-        // Bytes are their own columns only without byte classes.  A regex
-        // with 129 to 255 classes also has 256-wide rows, but its columns
-        // are classes.
+        // Without byte classes, bytes are their own columns.
         if regex.num_byte_classes == 256 {
             crate::prefilter::with_prefilter!(
                 self.prefilter,
@@ -781,12 +792,13 @@ impl fmt::Display for DfaMatcher<'_> {
 mod tests {
     use super::*;
 
-    /// More than 128 byte classes round the row width up to 256, the width
-    /// of a table without classes.  The columns are still classes: the
-    /// scanning loop and the tests' single lookup must agree on that, or
-    /// one reads the slots the other filled as transitions on other bytes.
+    /// With more than 128 byte classes the rows are not far from 256
+    /// wide, the width of a table without classes.  The columns are still
+    /// classes: the scanning loop and the tests' single lookup must agree
+    /// on that, or one reads the slots the other filled as transitions on
+    /// other bytes.
     #[test]
-    fn test_padded_rows_keep_class_columns() {
+    fn test_wide_rows_keep_class_columns() {
         // Bytes whose class numbers differ from their values.
         let literal: Vec<u8> = (60..=200).collect();
         let pattern: String = literal.iter().map(|b| format!("\\x{b:02x}")).collect();
@@ -803,7 +815,7 @@ mod tests {
         let mut memory = DfaMemory::default();
         let mut cache = Tier1DfaCache::new();
         cache.prepare(&mut memory, &re);
-        assert_eq!(cache.stride, 256);
+        assert_eq!(cache.stride, re.num_byte_classes);
         // Fill the rows through the single lookup, then scan.
         let mut current = cache.inner.start_id;
         for &b in &literal {
