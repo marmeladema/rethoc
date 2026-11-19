@@ -17,9 +17,9 @@ pub(crate) mod overlap;
 
 use std::fmt;
 
-use crate::{CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci, is_word_byte};
+use crate::{CounterIdx, Prefilter, Regex, State, StateIdx, byte_match_ci};
 
-use super::{DfaCache, DfaMemory, DfaStateId};
+use super::{BoundaryContext, DfaCache, DfaMemory, DfaStateId};
 
 /// Maximum counters for tier 2: the `counting_mask` and `counter_reset`
 /// fields in `Transition` are `u64` bitmasks.
@@ -731,15 +731,19 @@ impl Tier2DfaCache {
         deferred_asserts: &[StateIdx],
         is_match: bool,
         is_match_at_end: bool,
-        prev_was_word: bool,
+        context: BoundaryContext,
+        regex: &Regex,
     ) -> Option<DfaStateId> {
         let stride = self.stride;
-        self.inner.intern_state(
+        let needs = deferred_asserts.iter().fold(0, |needs, &idx| {
+            needs | regex.dfa_assertions.requirements(idx)
+        });
+        self.inner.intern_context(
             nfa_states,
             deferred_asserts,
             is_match,
             is_match_at_end,
-            prev_was_word,
+            context.masked(needs),
             || {
                 self.transitions
                     .extend(std::iter::repeat_with(Transition::empty).take(stride));
@@ -789,6 +793,16 @@ impl Tier2DfaCache {
             },
         );
 
+        // Evaluate EOF for parked continuations while the physical boundary
+        // is available. Their cache key then needs only known-next-byte reads.
+        let is_match_at_end = is_match_at_end
+            || (next_byte.is_none()
+                && memory.closure_deferred.iter().any(|&idx| {
+                    regex
+                        .dfa_assertions
+                        .eof_accept(idx, BoundaryContext::new(prev_byte).0)
+                }));
+
         let mut seed_instances: Vec<(CounterIdx, StateIdx)> = Vec::new();
         for &(counter, _ci_out) in &memory.closure_seeds {
             for &c in analysis.seed_consuming(counter.idx()) {
@@ -827,8 +841,8 @@ impl Tier2DfaCache {
         // means "the deferred assertion passed mid-stream (with next=byte) and
         // $ → Match was reachable."  But the assertion was evaluated with
         // next=Some(byte) — at actual end-of-input, next is None and word-
-        // boundary conditions may flip.  finish() correctly re-evaluates via
-        // resolve_deferred_at_end().
+        // boundary conditions may flip. The parked state already carries the EOF
+        // answer evaluated with its physical boundary.
         // Counters entered through Phase 1 resolution whose first body
         // byte was consumed on this transition (bit `i` = counter `i`).
         // Only these can need a pre-seed.
@@ -843,7 +857,7 @@ impl Tier2DfaCache {
             // Phase 1: resolve deferred assertions.
             let extra = from_state.resolve_deferred(byte, regex);
             if !extra.is_empty() {
-                let resolved_prev = from_state.prev_byte_representative();
+                let context = from_state.context;
                 // Use follow_break=false: the CInc break path should NOT
                 // contribute to resolved_is_match.  Match via counter break
                 // is handled by the with_break DFA successor, gated by
@@ -853,8 +867,8 @@ impl Tier2DfaCache {
                     extra.into_iter(),
                     regex,
                     analysis,
-                    false,
-                    resolved_prev,
+                    context.at_start(),
+                    context.previous(),
                     Some(byte),
                     false,
                 );
@@ -970,8 +984,8 @@ impl Tier2DfaCache {
                 None,
                 false,
             );
-            let nb_id = self.intern_closure_result(&cr_nb, byte);
-            let wb_id = self.intern_closure_result(&probe, byte);
+            let nb_id = self.intern_closure_result(&cr_nb, byte, regex);
+            let wb_id = self.intern_closure_result(&probe, byte, regex);
             let (nb_m, nb_mae) = self.match_flags(nb_id);
             let (wb_m, wb_mae) = self.match_flags(wb_id);
 
@@ -989,7 +1003,7 @@ impl Tier2DfaCache {
                 phase_reset,
             }
         } else {
-            let id = self.intern_closure_result(&probe, byte);
+            let id = self.intern_closure_result(&probe, byte, regex);
             let (m, mae) = self.match_flags(id);
 
             Transition {
@@ -1130,12 +1144,12 @@ impl Tier2DfaCache {
             .filter(|s| !body[s.idx()])
             .collect();
         let deferred = state.deferred_asserts.clone();
-        let (is_match, is_match_at_end, prev_was_word) =
-            (state.is_match, state.is_match_at_end, state.context.0 != 0);
+        let (is_match, is_match_at_end, context) =
+            (state.is_match, state.is_match_at_end, state.context);
         if nfa.is_empty() && deferred.is_empty() && !is_match && !is_match_at_end {
             return None;
         }
-        self.intern_state(&nfa, &deferred, is_match, is_match_at_end, prev_was_word)
+        self.intern_state(&nfa, &deferred, is_match, is_match_at_end, context, regex)
     }
 
     /// Whether dead counter-body states may be dropped for `regex`.
@@ -1159,7 +1173,7 @@ impl Tier2DfaCache {
                 .any(|(state, &in_body)| in_body && matches!(state, State::Assert { .. }))
     }
 
-    fn intern_closure_result(&mut self, cr: &ClosureResult, byte: u8) -> DfaStateId {
+    fn intern_closure_result(&mut self, cr: &ClosureResult, byte: u8, regex: &Regex) -> DfaStateId {
         if cr.nfa_states.is_empty()
             && cr.deferred_asserts.is_empty()
             && !cr.is_match
@@ -1167,17 +1181,13 @@ impl Tier2DfaCache {
         {
             return DfaStateId::DEAD;
         }
-        let pw = if cr.deferred_asserts.is_empty() {
-            false
-        } else {
-            is_word_byte(byte)
-        };
         self.intern_state(
             &cr.nfa_states,
             &cr.deferred_asserts,
             cr.is_match,
             cr.is_match_at_end,
-            pw,
+            BoundaryContext::new(Some(byte)),
+            regex,
         )
         .expect("DFA state cap reached although room was made")
     }
@@ -1235,7 +1245,8 @@ impl Tier2DfaCache {
                 &cr.deferred_asserts,
                 cr.is_match,
                 cr.is_match_at_end,
-                false,
+                BoundaryContext::new(None),
+                regex,
             )
             .expect("an empty cache has room for the start state");
         self.inner.start_is_match = self.inner.states[self.inner.start_id.idx()].is_match;
@@ -1710,25 +1721,7 @@ impl<'a> Tier2DfaMatcher<'a> {
 
     #[inline]
     pub fn finish(self) -> bool {
-        if self.ever_matched {
-            return true;
-        }
-        if self.match_at_end {
-            return true;
-        }
-        if self.current != DfaStateId::DEAD {
-            let state = &self.cache.inner.states[self.current.idx()];
-            if state.is_match_at_end {
-                return true;
-            }
-            // Standard deferred resolution: handles assertions outside
-            // counter bodies (deferred assert -> Match path).
-            let mut scratch = super::ReachScratch::new();
-            if state.resolve_deferred_at_end(self.regex, &mut scratch) {
-                return true;
-            }
-        }
-        false
+        self.ever_matched || self.match_at_end
     }
 
     #[allow(dead_code)]
@@ -1746,6 +1739,7 @@ impl fmt::Debug for Tier2DfaMatcher<'_> {
             s.field("nfa_states", &state.nfa_states);
             s.field("is_match", &state.is_match);
             s.field("is_match_at_end", &state.is_match_at_end);
+            s.field("context", &state.context);
         }
         s.field("ever_matched", &self.ever_matched)
             .field("match_at_end", &self.match_at_end)
@@ -1782,6 +1776,9 @@ impl fmt::Display for Tier2DfaMatcher<'_> {
         }
         if self.match_at_end {
             write!(f, " mae")?;
+        }
+        if !state.deferred_asserts.is_empty() {
+            write!(f, " context=({})", state.context)?;
         }
         // Counter summary: show per-counter active phase info.
         if self.has_live_counters && !self.cache.counters.meta.is_empty() {
@@ -1909,6 +1906,21 @@ mod tests {
         let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
         m.chunk(input);
         f(&m)
+    }
+
+    #[test]
+    fn parked_word_boundary_shares_equivalent_contexts() {
+        let re = build(r"\b[ab]{2,40}");
+        let analysis = re.tier2_analysis.as_ref().expect("Tier 2 pattern");
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier2DfaCache::new();
+        cache.prepare(&mut memory, &re, analysis);
+        let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+        let initial = m.current;
+        for byte in b" \n\r-" {
+            m.step(*byte);
+            assert_eq!(m.current, initial, "nonword predecessor {byte}");
+        }
     }
 
     /// True if the matcher sits in the start state with no live counter —
@@ -2060,11 +2072,15 @@ mod tests {
             .filter(|s| re.counter_body_states[s.idx()] && consume_byte(*s, b'x', &re).is_some())
             .collect();
         assert_eq!(body.len(), 1);
-        let body_only = cache.intern_state(&body, &[], false, false, false).unwrap();
+        let body_only = cache
+            .intern_state(&body, &[], false, false, BoundaryContext(0), &re)
+            .unwrap();
         assert_eq!(cache.settled_state(body_only, &re), body_only);
         // With a match-at-end flag there is still something to report, so
         // the body state is dropped and the flag kept.
-        let flagged = cache.intern_state(&body, &[], false, true, false).unwrap();
+        let flagged = cache
+            .intern_state(&body, &[], false, true, BoundaryContext(0), &re)
+            .unwrap();
         let settled = cache.settled_state(flagged, &re);
         assert_ne!(settled, flagged);
         let state = &cache.inner.states[settled.idx()];

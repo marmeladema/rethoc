@@ -1,9 +1,10 @@
-//! Exact boundary metadata for counter-free assertion graphs.
+//! Exact boundary metadata for Tier 1 and Tier 2 assertion graphs.
 //!
 //! A finite-bit worklist computes the previous-context requirements of each
 //! zero-width continuation. A five-bit reachability fixed point computes EOF
 //! acceptance, including assertion chains and zero-width cycles. Both analyses
-//! stop at consuming states and use storage linear in the compiled graph.
+//! follow counter entries and stop at consuming states and counter increments.
+//! Decisions at an increment belong to the matcher. Storage is linear in the graph.
 
 use std::fmt;
 use std::mem::size_of;
@@ -25,23 +26,22 @@ struct AssertionInfo {
     eof: u8,
 }
 
-/// Exact assertion metadata for a counter-free NFA.
+/// Exact assertion metadata for zero-width DFA continuations.
 ///
 /// The default has an empty entries slice with no payload allocation. It
-/// represents an assertion-free graph or a graph with counters, which has no
-/// Tier 1 analysis.
+/// represents a graph with no assertions or without an eligible DFA consumer.
 /// Otherwise the table has one entry for every NFA state, including consumers
 /// and Match states. Indexed queries require this complete, nonempty table.
 /// `Regex` boxes this owner even when its entries are empty, keeping a single
 /// pointer in the compiled regex without optional access during matching.
 #[derive(Debug, Default)]
-pub(crate) struct Tier1Assertions {
+pub(crate) struct DfaAssertions {
     /// Two bytes per NFA state; no nested allocations.
     entries: Box<[AssertionInfo]>,
 }
 
-impl Tier1Assertions {
-    /// Analyze a counter-free graph, returning an empty table without allocating
+impl DfaAssertions {
+    /// Analyze the graph, returning an empty table without allocating
     /// entries when it has no assertions.
     ///
     /// Every worklist bit can be introduced at most once per state, so graph
@@ -67,8 +67,9 @@ impl Tier1Assertions {
                     simple = false;
                     ordered &= out.idx() > raw && out1.idx() > raw;
                 }
-                State::CounterInstance { .. } | State::CounterIncrement { .. } => {
-                    debug_assert!(false, "Tier 1 analysis requires a counter-free graph");
+                State::CounterInstance { out, .. } => {
+                    ordered &= out.idx() > raw;
+                    simple = false;
                 }
                 _ => {}
             }
@@ -85,7 +86,7 @@ impl Tier1Assertions {
         }
     }
 
-    /// Whether no Tier 1 assertion analysis is stored.
+    /// Whether no assertion analysis is stored.
     ///
     /// For a Tier 1 eligible graph this selects the assertion-free closure,
     /// which derives EOF acceptance from traversal instead of indexing a table.
@@ -146,6 +147,7 @@ impl Tier1Assertions {
                         allowed_eof(kind) & entries[out.idx()].eof
                     },
                 },
+                State::CounterInstance { out, .. } => entries[out.idx()],
                 State::Split { out, out1 } => AssertionInfo {
                     requirements: entries[out.idx()].requirements
                         | entries[out1.idx()].requirements,
@@ -204,7 +206,7 @@ impl Tier1Assertions {
             .enumerate()
             .map(|(raw, state)| match *state {
                 State::Assert { kind, .. } => allowed_eof(kind),
-                State::Split { .. } => 0b11111,
+                State::Split { .. } | State::CounterInstance { .. } => 0b11111,
                 State::Match => {
                     entries[raw].eof = 0b11111;
                     work.push(StateIdx(raw as u32));
@@ -264,9 +266,9 @@ impl Tier1Assertions {
     }
 }
 
-impl fmt::Display for Tier1Assertions {
+impl fmt::Display for DfaAssertions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Tier 1 assertions: {} states", self.entries.len())?;
+        writeln!(f, "DFA assertions: {} states", self.entries.len())?;
         writeln!(f, "  EOF bits: start, word, LF, CR, other")?;
         for (raw, entry) in self.entries.iter().enumerate() {
             writeln!(
@@ -301,7 +303,7 @@ fn allowed_eof(kind: AssertKind) -> u8 {
         })
 }
 
-/// Flat reverse adjacency for Split and Assert edges only.
+/// Flat reverse adjacency for splits, assertions and counter entries.
 struct ReverseEpsilon {
     offsets: Vec<usize>,
     sources: Vec<StateIdx>,
@@ -340,11 +342,11 @@ impl ReverseEpsilon {
     }
 }
 
-/// Zero-width successors, excluding all counter and consuming transitions.
+/// Zero-width successors before a consuming state or counter increment.
 fn epsilon_targets(state: &State) -> [Option<StateIdx>; 2] {
     match *state {
         State::Split { out, out1 } => [Some(out), Some(out1)],
-        State::Assert { out, .. } => [Some(out), None],
+        State::Assert { out, .. } | State::CounterInstance { out, .. } => [Some(out), None],
         _ => [None, None],
     }
 }
@@ -384,6 +386,7 @@ mod tests {
             match states[state.idx()] {
                 State::Match => return true,
                 State::Split { out, out1 } => work.extend([out, out1]),
+                State::CounterInstance { out, .. } => work.push(out),
                 State::Assert { kind, out }
                     if kind.eval(previous.is_none(), true, previous, None) == AssertEval::Pass =>
                 {
@@ -395,7 +398,7 @@ mod tests {
         false
     }
 
-    fn check_eof(states: &[State], analysis: &Tier1Assertions) {
+    fn check_eof(states: &[State], analysis: &DfaAssertions) {
         for raw in 0..states.len() {
             let state = StateIdx(raw as u32);
             for previous in std::iter::once(None).chain((0..=255u8).map(Some)) {
@@ -411,8 +414,8 @@ mod tests {
     #[test]
     fn assertion_free_has_no_metadata() {
         for analysis in [
-            Tier1Assertions::default(),
-            Tier1Assertions::build(&[byte(1), State::Match]),
+            DfaAssertions::default(),
+            DfaAssertions::build(&[byte(1), State::Match]),
         ] {
             assert!(analysis.is_empty());
             assert_eq!(analysis.memory_size(), 0);
@@ -430,9 +433,9 @@ mod tests {
                 assertion(kind, 3),
                 State::Match,
             ];
-            let selected = Tier1Assertions::build(&states);
-            let simple = Tier1Assertions::build_simple(&states);
-            let general = Tier1Assertions::build_general(&states);
+            let selected = DfaAssertions::build(&states);
+            let simple = DfaAssertions::build_simple(&states);
+            let general = DfaAssertions::build_general(&states);
             assert_eq!(selected.entries, simple.entries);
             assert_eq!(simple.entries, general.entries);
             check_eof(&states, &simple);
@@ -455,9 +458,9 @@ mod tests {
                     byte(6),
                     State::Match,
                 ];
-                let selected = Tier1Assertions::build(&states);
-                let ordered = Tier1Assertions::build_ordered(&states);
-                let general = Tier1Assertions::build_general(&states);
+                let selected = DfaAssertions::build(&states);
+                let ordered = DfaAssertions::build_ordered(&states);
+                let general = DfaAssertions::build_general(&states);
                 assert_eq!(selected.entries, ordered.entries);
                 assert_eq!(ordered.entries, general.entries);
                 check_eof(&states, &ordered);
@@ -473,8 +476,8 @@ mod tests {
                 assertion(kind, 0),
                 assertion(AssertKind::End, 1),
             ];
-            let selected = Tier1Assertions::build(&states);
-            let general = Tier1Assertions::build_general(&states);
+            let selected = DfaAssertions::build(&states);
+            let general = DfaAssertions::build_general(&states);
             assert_eq!(selected.entries, general.entries);
             check_eof(&states, &selected);
         }
@@ -491,8 +494,8 @@ mod tests {
                     byte(2),
                     assertion(first, 3),
                 ];
-                let analysis = Tier1Assertions::build(&states);
-                let general = Tier1Assertions::build_general(&states);
+                let analysis = DfaAssertions::build(&states);
+                let general = DfaAssertions::build_general(&states);
                 assert_eq!(analysis.entries, general.entries);
                 check_eof(&states, &analysis);
                 assert_eq!(analysis.memory_size(), 2 * states.len());
@@ -513,7 +516,7 @@ mod tests {
                     byte(3),
                     State::Match,
                 ];
-                let analysis = Tier1Assertions::build(&states);
+                let analysis = DfaAssertions::build(&states);
                 for previous in EOF_CONTEXTS {
                     let masked = context(previous) & analysis.requirements(StateIdx(0));
                     let representative = if masked & START != 0 {
@@ -551,7 +554,7 @@ mod tests {
             assertion(AssertKind::End, 3),
             assertion(AssertKind::EndLF, 4),
         ];
-        let analysis = Tier1Assertions::build(&states);
+        let analysis = DfaAssertions::build(&states);
         assert_eq!(analysis.requirements(StateIdx(0)), 1 | 2 | START);
         assert_eq!(analysis.requirements(StateIdx(1)), 2 | START);
         assert_eq!(analysis.requirements(StateIdx(2)), 0);
@@ -580,7 +583,7 @@ mod tests {
                 out1: StateIdx(6),
             },
         ];
-        let analysis = Tier1Assertions::build(&states);
+        let analysis = DfaAssertions::build(&states);
         for raw in 0..3 {
             assert_eq!(analysis.requirements(StateIdx(raw)), 1 | 2 | 4 | START);
         }

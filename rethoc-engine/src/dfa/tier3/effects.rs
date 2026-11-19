@@ -843,7 +843,7 @@ pub(crate) fn eval_assert_chain(
                     // assertions (e.g. `\b → \B → $ → Match`).
                     if at_end {
                         if !super::super::DfaState::can_reach_match_at_end(
-                            out, prev, regex, scratch,
+                            out, false, prev, regex, scratch,
                         ) {
                             return false;
                         }

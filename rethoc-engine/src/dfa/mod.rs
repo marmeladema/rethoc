@@ -24,6 +24,7 @@
 //! program* that describes how to update counter values.  On a cache
 //! hit the program is replayed against each active counter context.
 
+mod assertions;
 mod tier1;
 pub(crate) mod tier2;
 pub(crate) mod tier3;
@@ -32,7 +33,8 @@ mod tier4;
 use indexmap::Equivalent;
 use indexmap::IndexSet;
 
-pub(crate) use tier1::{DfaMatcher, Tier1Assertions, Tier1DfaCache};
+pub(crate) use assertions::DfaAssertions;
+pub(crate) use tier1::{DfaMatcher, Tier1DfaCache};
 pub(crate) use tier2::{Tier2Analysis, Tier2DfaCache, Tier2DfaMatcher, compute_tier2_analysis};
 pub(crate) use tier3::{
     Tier3Analysis, Tier3DfaCache, Tier3DfaMatcher, Tier3OriginKind, compute_tier3_analysis,
@@ -79,7 +81,7 @@ impl DfaStateId {
 
 /// Boundary facts kept only while deferred continuations need them.
 /// Bits 0–2 are `ByteProps`; bit 3 distinguishes the initial boundary.
-/// Counting tiers retain their legacy word-only encoding (0 or 1).
+/// Tier 3 retains its word-only encoding (0 or 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct BoundaryContext(u8);
 
@@ -89,9 +91,14 @@ impl BoundaryContext {
         Self(previous.map_or(8, |b| crate::ByteProps::of(b).0))
     }
 
-    /// Preserve the counting tiers' word-only state keys.
+    /// Preserve Tier 3's word-only state keys.
     const fn legacy(word: bool) -> Self {
         Self(word as u8)
+    }
+
+    /// Retain only the facts the parked continuations can still read.
+    fn masked(self, requirements: u8) -> Self {
+        Self(self.0 & requirements)
     }
 
     /// Whether the retained context distinguishes input start.
@@ -130,8 +137,7 @@ pub(super) struct DfaState {
     /// the counting tiers use their existing `Assert(End)` gate policy.
     pub(super) is_match_at_end: bool,
     /// Context required by parked continuations, zero when none are pending.
-    /// Tier 1 retains only required byte/start facts; counting tiers retain
-    /// their original word-only encoding.
+    /// Tiers 1 and 2 mask to the required facts. Tier 3 keeps wordness.
     pub(super) context: BoundaryContext,
 }
 
@@ -143,20 +149,9 @@ pub(super) const fn prev_stand_in(prev_was_word: bool) -> u8 {
 }
 
 impl DfaState {
-    /// Return the legacy counting-tier previous byte for assertion resolution.
-    ///
-    /// Counting states remember one bit about the byte that entered them: its
-    /// word-ness.  That is all a parked assertion can still need.  The
-    /// kinds the DFA tiers defer ([`AssertKind::is_dfa_deferrable`]) read
-    /// the previous byte through `is_word_byte` only, or not at all;
-    /// `StartLF` reads more but never waits, since the previous byte is
-    /// always known when it is reached.
-    ///
-    /// This is a second summary of what [`AssertKind::eval`] reads, so it
-    /// is checked against `eval` for every deferrable kind and every byte
-    /// (`test_prev_stand_in_is_enough_for_deferred_assertions`).  A kind
-    /// that reads anything else of the previous byte must not become
-    /// deferrable without this state learning to remember it.
+    /// Tier 3 remembers only the previous byte's wordness. This suffices
+    /// for a parked word assertion itself. A continuation behind it can
+    /// need other boundary facts (Bug 74).
     #[inline]
     pub(super) fn prev_byte_representative(&self) -> Option<u8> {
         debug_assert!(self.context.0 <= 1, "legacy counting-tier context only");
@@ -167,17 +162,17 @@ impl DfaState {
     /// next input byte.  Returns extra NFA targets (the `out` states of
     /// passing assertions) that should be followed through epsilon closure.
     ///
-    /// `prev_was_word` is the word-ness of the byte that *entered* `from_state`.
+    /// All assertions in the chain see the boundary that parked them.
     #[inline]
     fn resolve_deferred(&self, byte: u8, regex: &Regex) -> Vec<StateIdx> {
         let mut extra = Vec::new();
         if self.deferred_asserts.is_empty() {
             return extra;
         }
-        let prev = self.prev_byte_representative();
+        let prev = self.context.previous();
         for &assert_idx in self.deferred_asserts.iter() {
             if let State::Assert { kind, out } = regex.states[assert_idx]
-                && kind.eval(false, false, prev, Some(byte)) == AssertEval::Pass
+                && kind.eval(self.context.at_start(), false, prev, Some(byte)) == AssertEval::Pass
             {
                 extra.push(out);
             }
@@ -192,11 +187,11 @@ impl DfaState {
         if self.deferred_asserts.is_empty() {
             return false;
         }
-        let prev = self.prev_byte_representative();
+        let prev = self.context.previous();
         for &assert_idx in self.deferred_asserts.iter() {
             if let State::Assert { kind, out } = regex.states[assert_idx]
-                && kind.eval(false, true, prev, None) == AssertEval::Pass
-                && Self::can_reach_match_at_end(out, prev, regex, scratch)
+                && kind.eval(self.context.at_start(), true, prev, None) == AssertEval::Pass
+                && Self::can_reach_match_at_end(out, self.context.at_start(), prev, regex, scratch)
             {
                 return true;
             }
@@ -213,6 +208,7 @@ impl DfaState {
     /// statically reachable but dynamically impossible at the same position.
     pub(super) fn can_reach_match_at_end(
         start: StateIdx,
+        at_start: bool,
         prev: Option<u8>,
         regex: &Regex,
         scratch: &mut ReachScratch,
@@ -229,7 +225,7 @@ impl DfaState {
             match states[idx] {
                 State::Match => return true,
                 State::Assert { kind, out } => {
-                    if kind.eval(false, true, prev, None) == AssertEval::Pass {
+                    if kind.eval(at_start, true, prev, None) == AssertEval::Pass {
                         scratch.stack.push(out);
                     }
                 }

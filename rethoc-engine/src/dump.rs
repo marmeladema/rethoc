@@ -446,9 +446,9 @@ impl fmt::Display for DumpRegex<'_> {
         writeln!(f, "  tier4 (counter programs):       {}", r.tier4_eligible)?;
         writeln!(f)?;
 
-        // -- Tier 1 Assertions ------------------------------------------------
-        if !r.tier1_assertions.is_empty() {
-            write!(f, "{}", r.tier1_assertions)?;
+        // -- DFA Assertions ------------------------------------------------
+        if !r.dfa_assertions.is_empty() {
+            write!(f, "{}", r.dfa_assertions)?;
             writeln!(f)?;
         }
 

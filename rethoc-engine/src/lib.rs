@@ -1047,11 +1047,11 @@ pub struct Regex {
     /// (Tier 1: no counters). All supported assertion kinds are handled
     /// with exact boundary context, including CRLF line anchors.
     dfa_eligible: bool,
-    /// Exact EOF and pending-context summaries for the counter-free DFA.
-    /// Empty for assertion-free graphs and graphs with retained counters.
+    /// Exact EOF and pending-context summaries for Tiers 1 and 2.
+    /// Empty for assertion-free graphs and graphs ineligible for both tiers.
     /// Otherwise there is one entry per NFA state. The owner is always boxed
     /// to keep this field one pointer wide; empty entries allocate no payload.
-    pub(crate) tier1_assertions: Box<dfa::Tier1Assertions>,
+    pub(crate) dfa_assertions: Box<dfa::DfaAssertions>,
     /// `true` when this pattern has non-nested counters with fixed-length
     /// bodies and can use the Tier 2 differential-counter DFA.
     tier2_eligible: bool,
@@ -1205,8 +1205,8 @@ impl Regex {
             + reach_match_alloc
             + break_match_alloc
             + body_states_alloc
-            + size_of::<dfa::Tier1Assertions>()
-            + self.tier1_assertions.memory_size()
+            + size_of::<dfa::DfaAssertions>()
+            + self.dfa_assertions.memory_size()
             + self.grouped_nfa_bytes()
     }
 
@@ -2889,11 +2889,6 @@ impl RegexBuilder {
             )
         });
         let dfa_eligible = !has_counters;
-        let tier1_assertions = Box::new(if dfa_eligible {
-            dfa::Tier1Assertions::build(self.states.as_slice())
-        } else {
-            dfa::Tier1Assertions::default()
-        });
 
         // Tier 4 counting DFA does NOT handle deferred assertions yet.
         let has_deferred_assert = self.states.iter().any(|s| {
@@ -3186,6 +3181,12 @@ impl RegexBuilder {
             }
         }
 
+        let dfa_assertions = Box::new(if dfa_eligible || tier2_eligible {
+            dfa::DfaAssertions::build(self.states.as_slice())
+        } else {
+            dfa::DfaAssertions::default()
+        });
+
         // Precompute Tier 3 analysis if eligible.
         let (tier3_eligible, tier3_analysis) = if tier3_eligible {
             let analysis = compute_tier3_analysis(
@@ -3306,7 +3307,7 @@ impl RegexBuilder {
             start_closure,
             start_closure_matches,
             dfa_eligible,
-            tier1_assertions,
+            dfa_assertions,
             tier2_eligible,
             tier2_overlap_proven,
             tier2_analysis,
@@ -8260,7 +8261,7 @@ mod tests {
         // char fails because prev=word, next=EOI(non-word) is a boundary.
         test_tier2_b_neg_eoi_counter {
             pattern: r#"^a{3,34}b{1,6}\B$"#,
-            memory: 1219,
+            memory: 1245,
             min_tier: 2,
             inputs: [
                 ("aaabb", false),
@@ -8273,7 +8274,7 @@ mod tests {
         // should still reject non-empty word-char inputs.
         test_tier2_b_neg_eoi_optional {
             pattern: r#"^(a{3,34}b{1,6}\B)?$"#,
-            memory: 1253,
+            memory: 1281,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -8326,7 +8327,7 @@ mod tests {
         // 13 chars: MATCH (\b passes at word→end).
         test_tier3_multi_counter_deferred_break {
             pattern: r#"^.{6,39}.{7,31}\b$"#,
-            memory: 1015,
+            memory: 1029,
             min_tier: 2,
             inputs: [
                 ("aaaaaaaaaaaa", false),
@@ -8337,7 +8338,7 @@ mod tests {
         // Same pattern with \B instead: \B fails at word→end.
         test_tier3_multi_counter_deferred_break_neg {
             pattern: r#"^.{6,39}.{7,31}\B$"#,
-            memory: 1015,
+            memory: 1029,
             min_tier: 2,
             inputs: [
                 ("aaaaaaaaaaaaa", false),
@@ -8888,7 +8889,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_2 {
             pattern: r"^(\b.{1,34}?)?$",
-            memory: 1049,
+            memory: 1065,
             min_tier: 2,
             inputs: [
                 ("a", true),
@@ -8899,7 +8900,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_3 {
             pattern: r"^(\b((.{1,34}|a?))?)?$",
-            memory: 1185,
+            memory: 1209,
             min_tier: 2,
             inputs: [
                 ("x", true),
@@ -8909,7 +8910,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_4 {
             pattern: r"^(\B.{1,34}?)?$",
-            memory: 1049,
+            memory: 1065,
             min_tier: 2,
             inputs: [
                 ("\x00", true), // \B: non-word→non-word
@@ -9299,7 +9300,7 @@ mod tests {
         }
         test_byte_table_with_bounded_repetition_cross_validate {
             pattern: "^(ab|cd|ef){2,4}$",
-            memory: 2243,
+            memory: 2269,
             min_tier: 2,
             inputs: [
                 ("abcd", true),
@@ -10829,7 +10830,7 @@ mod tests {
         // multi-counter path.
         test_tier2_overlap_unsafe_wildcard {
             pattern: r"^.{0,200}.{0,200}$",
-            memory: 1015,
+            memory: 1029,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -10869,7 +10870,7 @@ mod tests {
 
         test_adjacent_same_byte_counters {
             pattern: "^a{2,50}a{3,70}$",
-            memory: 981,
+            memory: 993,
             min_tier: 2,
             inputs: [
                 ("aaaaa", true),
@@ -11324,7 +11325,7 @@ mod tests {
         // was overwritten to false on every byte, causing false negatives.
         test_tier3_counter_free_mae_optional_skip {
             pattern: "([b-ed-ie-f].{4,43})?$",
-            memory: 1047,
+            memory: 1061,
             min_tier: 2,
             inputs: [
                 ("zzz", true),       // optional group skipped, $ matches at end
@@ -11443,7 +11444,7 @@ mod tests {
         // counter 1 at value 1.
         test_tier3_seed_filtering_revert {
             pattern: "^(0{8,31}(0+x{6,50}1y?)?(a?a?)?)?$",
-            memory: 2409,
+            memory: 2505,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -11474,7 +11475,7 @@ mod tests {
         // handoff.
         test_tier3_counter_dep_seed_false_positive {
             pattern: "^(.{6,39}.0?.{8,8}a?)?$",
-            memory: 1457,
+            memory: 1497,
             min_tier: 2,
             inputs: [
                 ("", true),
@@ -11507,7 +11508,7 @@ mod tests {
         // (Tier 2), L=6 (Tier 2), and L=6..16 (Tier 3).
         test_deferred_assert_before_counter_l2_body {
             pattern: r"^...\B(ee){6,40}$",
-            memory: 1151,
+            memory: 1173,
             min_tier: 2,
             inputs: [
                 ("aaaeeeeeeeeeeee", true),     // 3 + 12 = 15 (6 iterations of ee)
@@ -11520,7 +11521,7 @@ mod tests {
         }
         test_deferred_assert_before_counter_l6_body {
             pattern: r"^...\Be{6,6}{6,40}$",
-            memory: 1287,
+            memory: 1317,
             min_tier: 2,
             inputs: [
                 ("aaaeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", true), // 3+36=39 (6 iters)
@@ -11703,7 +11704,7 @@ mod tests {
         // gives a false negative.
         test_tier3_single_counter_break_path_mae {
             pattern: r"^.{0,36}c{2,12}e?((a?a?)?(a?a?)?)?$",
-            memory: 1865,
+            memory: 1929,
             min_tier: 2,
             inputs: [
                 ("cc", true),       // .{0,36} = "", c{2,12} = "cc"
@@ -11738,7 +11739,7 @@ mod tests {
         // an origin is genuinely reachable without counter breaks.
         test_tier3_contaminated_no_break_chain_false_positive {
             pattern: r"^(.{7,25}.{7,25})?((a?a?)?(a?a?)?)?$",
-            memory: 1389,
+            memory: 1425,
             min_tier: 2,
             inputs: [
                 ("", true),              // optional group skips, suffix skips, $ matches
@@ -11982,7 +11983,7 @@ mod tests {
         // pass (prev='c' word, next='a' word → non-boundary).
         test_tier3_counter_break_deferred_assert_mid_input {
             pattern: r".{2,38}c{4,10}\B",
-            memory: 1287,
+            memory: 1317,
             min_tier: 2,
             inputs: [
                 ("cccccca", true),              // 6c + a: c1 breaks, \B(c,a) passes
@@ -12264,7 +12265,7 @@ mod tests {
         // Fix: include ByteTable states in break_consuming_tails.
         test_tier3_byte_table_break_tail {
             pattern: r"^(c{2,48}c?y?b1)?((a?a?)?(a?a?)?)?$",
-            memory: 2617,
+            memory: 2665,
             min_tier: 2,
             inputs: [
                 ("cccccccccccccccccccccccccccccccccccccccccyb1", true), // 41 c's + yb1: Bug 35 crash case
@@ -12290,7 +12291,7 @@ mod tests {
         // Fix: deposit target_deferred_asserts in the Some(None) arm.
         test_tier3_tail_none_target_deferred_asserts {
             pattern: r"^1{2,30}c{9,48}y\b$",
-            memory: 2069,
+            memory: 2145,
             min_tier: 2,
             inputs: [
                 ("1111111cccccccccccccy", true),    // 7 ones + 13 c's + y: Bug 34 crash case
@@ -12374,7 +12375,7 @@ mod tests {
         // of tail processing instead of the static array.
         test_tier3_byte_table_tail_mae {
             pattern: r"^0{3,43}((a?c)*x(a?a?)?(a?a?)?)?$",
-            memory: 2549,
+            memory: 2593,
             min_tier: 2,
             inputs: [
                 ("000x", true),                // Bug 37 crash case: 3 zeros + x
@@ -12431,7 +12432,7 @@ mod tests {
         // even with no consuming states downstream.
         test_tier3_dead_target_byte_table_mae {
             pattern: r"^(.{6,36}a{0,4}e*c)?$",
-            memory: 1287,
+            memory: 1317,
             min_tier: 2,
             inputs: [
                 ("xxxcbd ccac", true),          // Bug 39 crash case
@@ -12693,7 +12694,7 @@ mod tests {
         // 1-element chain and emit one PendingEffect per chain.
         test_tier3_break_deferred_or_semantics {
             pattern: r"^c{2,49}((a?\B)?\b)*\b$",
-            memory: 1219,
+            memory: 1245,
             min_tier: 2,
             inputs: [
                 ("ccccccccccccccc", true),  // 15 c's: original fuzz crash
@@ -12797,7 +12798,7 @@ mod tests {
         // a shorter path is found.
         test_tier3_deferred_path_shortcut {
             pattern: r"^.{7,36}\B(\ba{0,0})?((a?a?)?(a?a?)?)?$",
-            memory: 1457,
+            memory: 1497,
             min_tier: 2,
             inputs: [
                 ("aaaaaaaa", true),         // Bug 49: 8 a's, false negative
@@ -12961,7 +12962,7 @@ mod tests {
         // \B at EOI fails (word→end = boundary, \B requires non-boundary).
         test_tier3_cov_none_target_deferred_fail {
             pattern: r"^.{2,30}c{9,48}y\B$",
-            memory: 2069,
+            memory: 2145,
             min_tier: 2,
             inputs: [
                 ("aaccccccccccy", false),    // c0=2, c1=10, tail 'y', \B at EOI fails
@@ -13350,7 +13351,7 @@ mod tests {
         // the return to the start state.
         test_reengage_end_anchor {
             pattern: "foo.{0,40}bar$",
-            memory: 1185,
+            memory: 1209,
             min_tier: 2,
             inputs: [
                 ("foobar", true),
@@ -13367,7 +13368,7 @@ mod tests {
         // Gap running into the end anchor: the counter itself decides match-at-end.
         test_reengage_gap_to_end {
             pattern: "foo.{0,40}$",
-            memory: 1083,
+            memory: 1101,
             min_tier: 2,
             inputs: [
                 ("foo", true),
@@ -13384,7 +13385,7 @@ mod tests {
         // thread, so the state is not idle while it is pending.
         test_reengage_word_boundary {
             pattern: "foo\\b.{0,40}bar",
-            memory: 1185,
+            memory: 1209,
             min_tier: 2,
             inputs: [
                 ("foo bar", true),
@@ -13461,7 +13462,7 @@ mod tests {
         // dropped although the result is not the start state.
         test_reengage_leading_word_boundary {
             pattern: "\\bfoo.{0,40}bar",
-            memory: 1185,
+            memory: 1209,
             min_tier: 2,
             inputs: [
                 ("foobar", true),
@@ -13484,7 +13485,7 @@ mod tests {
         // start-only branch back.
         test_reengage_start_assert_alt_tier2 {
             pattern: "^foo[a-e]{0,40}bar|qux[0-9]{0,40}z",
-            memory: 1524,
+            memory: 1566,
             min_tier: 2,
             inputs: [
                 ("foobar", true),
@@ -13508,7 +13509,7 @@ mod tests {
         // ends in the dead state and must stay there.
         test_reengage_anchored_dead_end {
             pattern: "^foo.{0,40}bar",
-            memory: 1185,
+            memory: 1209,
             min_tier: 2,
             inputs: [
                 ("foobar", true),
@@ -13526,7 +13527,7 @@ mod tests {
         // consumed (`\n`), which the cached dead transitions must honour.
         test_reengage_multiline_dead_restart {
             pattern: "(?m)^foo.{0,40}bar",
-            memory: 1185,
+            memory: 1209,
             min_tier: 2,
             inputs: [
                 ("foobar", true),
@@ -13547,7 +13548,7 @@ mod tests {
         // alone for these patterns.
         test_reengage_assert_in_body {
             pattern: "x(\\B\\w){3,40}!",
-            memory: 1015,
+            memory: 1029,
             min_tier: 2,
             inputs: [
                 ("xabc!", true),
@@ -13665,7 +13666,7 @@ mod tests {
         // Bug 56: the pattern and a shrunk input from the fuzz run.
         test_tier3_seed_with_dead_clean_chain_large {
             pattern: "^(c?1{9,44}.{10,27}?0)+",
-            memory: 2001,
+            memory: 2073,
             min_tier: 2,
             inputs: [
                 ("11111111110c111111111111111111111111110", false),
@@ -13968,7 +13969,7 @@ mod tests {
         // default settings.
         test_tier2_break_tail_is_not_body_progress_kept_counter {
             pattern: "\\b\\d{40,60}\\b USD",
-            memory: 1117,
+            memory: 1137,
             min_tier: 2,
             inputs: [
                 ("7777777777777777777777777777777777777777 7 USD", false),
@@ -14132,7 +14133,7 @@ mod tests {
         }
         test_byte_classes_multiline_start_counter_large {
             pattern: "(?m:^)a{40,60}b|qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
-            memory: 5435,
+            memory: 5709,
             min_tier: 2,
             inputs: [
                 ("  \naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", true),
@@ -14349,16 +14350,39 @@ mod tests {
         // Tier 3 independently ignores this in-body guard (Bug 69).
         test_tier2_guard_after_resolved_body_byte {
             pattern: r"\b(?:a|[ \n](?m:^)){2,40}",
-            memory: 1081,
+            memory: 1097,
             min_tier: 2,
             tier3_broken: true,
             inputs: [("a a", false), ("a\n", true), ("aa", true)],
+        }
+        // Bug 74. A parked boundary and its continuation share the same
+        // input position. Tier 3 still loses that position's context.
+        test_tier2_parked_boundary_at_input_start {
+            pattern: r"\b^a{2,40}",
+            memory: 993,
+            min_tier: 2,
+            tier3_broken: true,
+            inputs: [("aa", true), (" aa", false), ("\naa", false)],
+        }
+        test_tier2_parked_boundary_at_line_start {
+            pattern: r"\b(?m:^)a{2,40}",
+            memory: 993,
+            min_tier: 2,
+            tier3_broken: true,
+            inputs: [("aa", true), (" aa", false), ("\naa", true), ("\raa", false)],
+        }
+        test_tier2_parked_boundary_at_empty_input {
+            pattern: r"(?:a{2,40}|\B^)",
+            memory: 1029,
+            min_tier: 2,
+            tier3_broken: true,
+            inputs: [("", true), ("a", false), ("aa", true)],
         }
         // Right before the count, tier 2 takes it (fixed-length body): the
         // anchor is settled when the transition is computed.
         test_counter_body_line_start_behind_byte_stays_tier2 {
             pattern: r"(?:\n(?m:^)){40,60}c",
-            memory: 981,
+            memory: 993,
             min_tier: 2,
             inputs: [
                 ("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nc", true),
@@ -14524,7 +14548,7 @@ mod tests {
         // same states.
         test_line_start_between_body_bytes_fixed_length {
             pattern: r"(?:(?:px(?m:^)|qx)a){20,30}c",
-            memory: 1151,
+            memory: 1173,
             min_tier: 2,
             inputs: [
                 ("pxapxapxapxapxapxapxapxapxapxapxapxapxapxapxapxapxapxapxapxac", false),
@@ -14536,7 +14560,7 @@ mod tests {
         }
         test_line_start_in_front_of_body_fixed_length {
             pattern: r"(?:(?m:^)[ab][b\n]){40,60}c",
-            memory: 1079,
+            memory: 1093,
             min_tier: 2,
             inputs: [
                 ("\nabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc", false),
@@ -14550,7 +14574,7 @@ mod tests {
         // tier 2: a thread waiting there has not counted anything yet.
         test_counter_body_assertion_before_byte_stays_tier2 {
             pattern: r"(?:\B[ab]){40,60}c",
-            memory: 1013,
+            memory: 1025,
             min_tier: 2,
             inputs: [
                 ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac", true),
@@ -14562,7 +14586,7 @@ mod tests {
         }
         test_counter_body_branch_starts_with_assertion_stays_tier2 {
             pattern: r"(?:\Ba|b){40,60}c",
-            memory: 1049,
+            memory: 1065,
             min_tier: 2,
             inputs: [
                 ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc", true),
@@ -14960,7 +14984,7 @@ mod tests {
         let state_size = std::mem::size_of::<State>();
         assert_eq!(
             two.memory_size() - one.memory_size(),
-            state_size + two.tier1_assertions.memory_size() - one.tier1_assertions.memory_size(),
+            state_size + two.dfa_assertions.memory_size() - one.dfa_assertions.memory_size(),
             "second \\d should add one state, no extra class table",
         );
         // Predefined classes use ByteClassStatic — no entries in classes.
@@ -15029,8 +15053,8 @@ mod tests {
         let state_size = std::mem::size_of::<State>();
         assert_eq!(
             two_wild.memory_size() - one_wild.memory_size(),
-            state_size + two_wild.tier1_assertions.memory_size()
-                - one_wild.tier1_assertions.memory_size(),
+            state_size + two_wild.dfa_assertions.memory_size()
+                - one_wild.dfa_assertions.memory_size(),
             "second `.` should add one state, no extra class table",
         );
         // Wildcards use State::Wildcard — no entries in classes.
