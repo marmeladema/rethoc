@@ -614,7 +614,10 @@ impl<'a> DfaMatcher<'a> {
         // bytes that cannot start a match loop back to the start state, so
         // memchr skips to the next candidate instead.  This happens every
         // time the DFA returns to the start state, not only at chunk entry.
-        if self.cache.stride == 256 {
+        // Bytes are their own columns only without byte classes.  A regex
+        // with 129 to 255 classes also has 256-wide rows, but its columns
+        // are classes, here as in `transition_tagged`.
+        if regex.num_byte_classes == 256 {
             crate::prefilter::with_prefilter!(
                 self.prefilter,
                 self.scan::<false>(input, |b| b as usize, no_finder),
@@ -783,6 +786,49 @@ impl fmt::Display for DfaMatcher<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// More than 128 byte classes round the row width up to 256, the width
+    /// of a table without classes.  The columns are still classes: the
+    /// scanning loop and the single lookup must agree on that, or one
+    /// reads the slots the other filled as transitions on other bytes.
+    #[test]
+    fn test_padded_rows_keep_class_columns() {
+        // Bytes whose class numbers differ from their values.
+        let literal: Vec<u8> = (60..=200).collect();
+        let pattern: String = literal.iter().map(|b| format!("\\x{b:02x}")).collect();
+        let re = Regex::with_config(
+            &format!("(?s-u){pattern}"),
+            crate::RegexConfig {
+                byte_class_min_states: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(re.dfa_eligible);
+        assert!((129..256).contains(&re.num_byte_classes));
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier1DfaCache::new();
+        cache.prepare(&mut memory, &re);
+        assert_eq!(cache.stride, 256);
+        // Fill the rows through the single lookup, then scan.
+        let mut m = DfaMatcher::new(&mut cache, &mut memory, &re);
+        for &b in &literal {
+            m.step(b);
+        }
+        assert!(m.finish());
+        let mut m = DfaMatcher::new(&mut cache, &mut memory, &re);
+        m.chunk(&literal);
+        assert!(m.finish());
+        // The byte whose value is the class of the second literal byte is
+        // not that byte: it must not take its transition.  (The prefilter
+        // hides the first byte's row.)
+        let mut input = literal.clone();
+        input[1] = re.byte_classes[literal[1] as usize];
+        assert_ne!(input[1], literal[1]);
+        let mut m = DfaMatcher::new(&mut cache, &mut memory, &re);
+        m.chunk(&input);
+        assert!(!m.finish());
+    }
 
     /// Bug 64: emptying a full cache keeps the state the matcher stands
     /// on and drops everything else.

@@ -188,8 +188,9 @@ For byte b entering a cached state:
 At initialization use roots `[regex.start]`, `prev=None`, `at_start=true`.
 `finish()` returns an already observed match or the current exact EOF flag;
 EOF is not a consuming sentinel. Empty `chunk()` calls do nothing. A state is
-DEAD only if it has no consumers, pending assertions, match, or EOF acceptance;
-retain the current restart behavior from DEAD. Do not infer input-start from
+empty only if it has no consumers, pending assertions, match, or EOF acceptance.
+It is interned like any other state; its transitions restart from
+`regex.start` alone (formerly a DEAD sentinel with its own restart table). Do not infer input-start from
 `current == start_id`: an ordinary start state may recur later in the stream.
 
 Correctness obligations: provisional Pass is stable under revelation of a
