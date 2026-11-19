@@ -112,7 +112,15 @@ impl Prefilter {
     /// Offset of the first byte of `hay` that can start a match, or `None`
     /// if there is none.  Every byte is a candidate for [`Prefilter::None`].
     pub(crate) fn find(&self, hay: &[u8]) -> Option<usize> {
-        with_prefilter!(*self, (!hay.is_empty()).then_some(0), |find| find(hay))
+        match self {
+            // The class table by reference.  Through the macro it is bound
+            // by value, and whether that 32-byte copy is elided is up to
+            // the optimiser; for a search called once per short stretch
+            // the copy is a measurable part of the cost.  (The macro's
+            // other users copy it once per chunk.)
+            Prefilter::Memclass(t) => crate::memclass::memclass(t, hay),
+            _ => with_prefilter!(*self, (!hay.is_empty()).then_some(0), |find| find(hay)),
+        }
     }
 }
 

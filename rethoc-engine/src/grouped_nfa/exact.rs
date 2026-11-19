@@ -752,44 +752,86 @@ impl GroupedStream {
     }
 
     /// Feed the next bytes of the input.
+    ///
+    /// A small function: a stream that is idle for the whole chunk, the
+    /// common case for many streams of many patterns, only skips here.
+    /// The stepping loop is a function of its own, with the frame and the
+    /// registers its steps need.
     pub fn chunk(&mut self, regex: &Regex, scratch: &mut GroupedScratch, input: &[u8]) {
         let plan = self.plan(regex);
         assert!(!self.finished, "chunk on a finished stream: reset it first");
         if self.matched || input.is_empty() {
             return;
         }
-        scratch.prepare(plan);
-        let prefilter = &regex.prefilter;
-        let has_prefilter = !matches!(prefilter, crate::Prefilter::None);
-        let skip = plan.skip_when_idle && has_prefilter;
-        // The count-free step runs under the automatic choice only: forcing
-        // a pass runs the general step, which the tests compare with it.
+        // The count-free tables, which come with the skip, under the
+        // automatic choice only: forcing a pass runs the general step on
+        // every byte, which the tests compare with them.
         let tables = plan
             .count_free
             .as_deref()
             .filter(|_| scratch.sweep == Sweep::Auto);
-        let mut i = 0;
-        // An idle stream mostly stays idle for the whole chunk.  That case
-        // is decided here, before the loop: whatever the compiler sets up
-        // ahead of the loop for the steps inside it, a call that only
-        // skips does not pay for.
-        if let Some(tables) = tables
-            && self.live == 0
-        {
-            let Some(next) = self.skip_idle(prefilter, &tables.starts, input, 0) else {
-                return;
-            };
-            i = next;
+        // Nothing is kept across these calls, so this function needs no
+        // saved registers: a counting stream fed a byte at a time pays for
+        // little more than a call here.
+        match tables {
+            Some(tables) if self.live == 0 => self.chunk_idle(regex, scratch, input, tables),
+            _ => self.step_from(plan, regex, scratch, input, 0, tables),
         }
+    }
+
+    /// [`chunk`](Self::chunk) on an idle stream: skip to the first byte
+    /// that starts something, and step from there if there is one.
+    #[inline(never)]
+    fn chunk_idle(
+        &mut self,
+        regex: &Regex,
+        scratch: &mut GroupedScratch,
+        input: &[u8],
+        tables: &super::CountFreeTables,
+    ) {
+        let Some(next) = self.skip_idle(&regex.prefilter, &tables.starts, input, 0) else {
+            return;
+        };
+        let plan = self.plan(regex);
+        self.step_from(plan, regex, scratch, input, next, Some(tables));
+    }
+
+    /// The stepping loop of [`chunk`](Self::chunk), from `input[i]`.
+    #[inline(never)]
+    fn step_from(
+        &mut self,
+        plan: &GroupedNfaPlan,
+        regex: &Regex,
+        scratch: &mut GroupedScratch,
+        input: &[u8],
+        mut i: usize,
+        tables: Option<&super::CountFreeTables>,
+    ) {
+        scratch.prepare(plan);
+        let prefilter = &regex.prefilter;
+        let has_prefilter = !matches!(prefilter, crate::Prefilter::None);
+        // Without the count-free tables, the prefilter skips an idle
+        // stream ahead of the step.
+        let skip = tables.is_none() && plan.skip_when_idle && has_prefilter;
+        // One call of `step` in this loop, so that it is inlined: called
+        // from two places it was not, and a general step then paid for a
+        // call and reloaded its state (a fifth more instructions).  A skip
+        // leads straight into the count-free step, as it always has: any
+        // test between them follows the search's data-dependent loop, and
+        // costs branch mispredictions out of proportion to its size.
         while i < input.len() {
             if let Some(tables) = tables {
                 if self.live == 0 {
+                    // Returns at once on the first iteration: `chunk` has
+                    // skipped to `i`.
                     let Some(next) = self.skip_idle(prefilter, &tables.starts, input, i) else {
                         return;
                     };
                     i = next;
                 }
-                if self.unit && bitmap::all_count_free(&self.raw_active, tables) {
+                // The count-free step applies to a unit frontier of
+                // count-free nodes.  An empty one is both.
+                if self.live == 0 || self.unit && bitmap::all_count_free(&self.raw_active, tables) {
                     let (next, found) = by_width!(tables.a, |A| self
                         .count_free_run::<A>(plan, tables, regex, input, i));
                     #[cfg(test)]
@@ -857,10 +899,11 @@ impl GroupedStream {
             return None;
         };
         stat!(bytes_skipped += next - i);
-        if next > i {
-            self.prev = Some(input[next - 1]);
-            self.at_start = false;
-        }
+        // The byte before `next` is not recorded: the step or the run that
+        // follows starts from an empty frontier, whose closure reads no
+        // boundary (the tables exist only when the start closure has no
+        // assertion), and records its own byte.  Recording it here costs a
+        // branch that the input decides.
         Some(next)
     }
 
@@ -869,7 +912,7 @@ impl GroupedStream {
     /// stays nonempty and count-free (it stays unit).  The raw rows are
     /// written once, when the run ends.  Returns the next byte's index and
     /// whether a match was found (before the byte at that index).
-    #[inline(never)]
+    #[inline(always)]
     fn count_free_run<const A: usize>(
         &mut self,
         plan: &GroupedNfaPlan,
