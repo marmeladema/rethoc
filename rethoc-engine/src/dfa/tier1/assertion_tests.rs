@@ -284,7 +284,7 @@ fn eviction_preserves_pending_assertion_context_and_eof() {
             // The current EOF answer must survive eviction without seeing a
             // next byte; each next-byte answer then rebuilds one transition.
             for next in std::iter::once(None).chain(ALPHABET.map(Some)) {
-                let remapped = cache.tagged(remapped);
+                let remapped = cache.tagged(remapped).current();
                 let mut matcher = DfaMatcher::new(&mut cache, &mut memory, &regex);
                 matcher.current = remapped;
                 matcher.ever_matched = saved.is_match;
