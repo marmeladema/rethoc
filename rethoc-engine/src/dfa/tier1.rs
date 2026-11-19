@@ -86,8 +86,13 @@ fn push_consume_targets(state: &State, byte: u8, regex: &Regex, targets: &mut Ve
 /// and nothing else.  The tags say everything the
 /// scanning loop has to know about the entry, so that one comparison
 /// ([`is_tagged`](Self::is_tagged)) tells an ordinary transition from the
-/// special ones: a slot that is not computed yet, the dead state, a match
-/// state and, when the regex has a prefilter, the start state.
+/// special ones: a slot that is not computed yet, a match state and, when
+/// the regex has a prefilter, the start state.
+///
+/// There is no dead state among them.  A state with no live NFA state is
+/// interned like any other (the empty state): its row holds the
+/// transitions that restart from the start closure, and an input that can
+/// no longer match loops on it inside the ordinary run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Tier1StateId(u32);
 
@@ -101,14 +106,12 @@ impl Tier1StateId {
     const START: Self = Self(0);
     /// Tag of a state whose `is_match` flag is set; the offset is kept.
     const MATCH: u32 = 1 << 29;
-    /// The dead state: no NFA state is live.
-    const DEAD: Self = Self(1 << 30);
     /// A transition that is not computed yet.
     const UNKNOWN: Self = Self(1 << 31);
     /// Largest untagged value, and the mask of the offset bits.
     const MAX: u32 = Self::START_TAG - 1;
 
-    /// Whether any tag is set: unknown, dead, match or start.
+    /// Whether any tag is set: unknown, match or start.
     #[inline(always)]
     fn is_tagged(self) -> bool {
         self.0 > Self::MAX
@@ -130,8 +133,8 @@ impl Tier1StateId {
         Self(self.0 & !Self::START_TAG)
     }
 
-    /// Offset of the state's row in the transition table.  Not for `DEAD`
-    /// or `UNKNOWN`.
+    /// Offset of the state's row in the transition table.  Not for
+    /// `UNKNOWN`.
     #[inline(always)]
     fn row(self) -> usize {
         (self.0 & Self::MAX) as usize
@@ -173,8 +176,6 @@ pub(crate) struct Tier1DfaCache {
     /// Whether transitions into the start state carry
     /// [`Tier1StateId::START_TAG`]: the regex has a prefilter.
     tag_start: bool,
-    /// Lazily allocated restart transitions from DEAD; ids expire on eviction.
-    dead_transitions: Vec<Tier1StateId>,
     /// Reusable post-consumption roots, used only on cache misses.
     targets: Vec<StateIdx>,
 }
@@ -186,7 +187,6 @@ impl Tier1DfaCache {
             transitions: Vec::new(),
             stride: 256,
             tag_start: false,
-            dead_transitions: Vec::new(),
             targets: Vec::new(),
         }
     }
@@ -200,9 +200,7 @@ impl Tier1DfaCache {
     /// match.
     #[inline]
     fn tagged(&self, id: DfaStateId) -> Tier1StateId {
-        if id == DfaStateId::DEAD {
-            return Tier1StateId::DEAD;
-        }
+        debug_assert!(id != DfaStateId::DEAD, "Tier 1 interns the empty state");
         let mut row = id.0 << self.stride.trailing_zeros();
         debug_assert!(row <= Tier1StateId::MAX);
         if self.tag_start && id == DfaStateId::START {
@@ -217,14 +215,10 @@ impl Tier1DfaCache {
     /// The plain id of the state behind a table entry.
     #[inline]
     fn untagged(&self, id: Tier1StateId) -> DfaStateId {
-        if id == Tier1StateId::DEAD {
-            DfaStateId::DEAD
-        } else {
-            DfaStateId((id.row() >> self.stride.trailing_zeros()) as u32)
-        }
+        DfaStateId((id.row() >> self.stride.trailing_zeros()) as u32)
     }
 
-    /// The state behind a table entry.  Not for `DEAD` or `UNKNOWN`.
+    /// The state behind a table entry.  Not for `UNKNOWN`.
     #[inline]
     fn state(&self, id: Tier1StateId) -> &super::DfaState {
         &self.inner.states[id.row() >> self.stride.trailing_zeros()]
@@ -259,7 +253,6 @@ impl Tier1DfaCache {
         let stride = self.stride;
         let mut keep = [from];
         self.transitions.clear();
-        self.dead_transitions.clear();
         self.inner.evict(&mut keep, || {
             self.transitions
                 .extend(std::iter::repeat_n(Tier1StateId::UNKNOWN, stride));
@@ -362,7 +355,7 @@ impl Tier1DfaCache {
     }
 
     /// The transition out of `from` on `byte`, computed if it is missing.
-    /// `from` is a state or `DEAD`; the result is never `UNKNOWN`.
+    /// The result is never `UNKNOWN`.
     #[inline(always)]
     fn transition_tagged(
         &mut self,
@@ -371,9 +364,6 @@ impl Tier1DfaCache {
         byte: u8,
         regex: &Regex,
     ) -> Tier1StateId {
-        if from == Tier1StateId::DEAD {
-            return self.transition_from_dead(memory, byte, regex);
-        }
         let class = regex.byte_classes[byte as usize] as usize;
         let cached = self.transitions[from.row() + class];
         if cached != Tier1StateId::UNKNOWN {
@@ -417,30 +407,6 @@ impl Tier1DfaCache {
         to
     }
 
-    /// Transition from the DEAD state (re-seed from start).
-    /// Separated to keep the scanning loop small.
-    #[inline(never)]
-    fn transition_from_dead(
-        &mut self,
-        memory: &mut DfaMemory,
-        byte: u8,
-        regex: &Regex,
-    ) -> Tier1StateId {
-        let class = regex.byte_classes[byte as usize] as usize;
-        if let Some(&cached) = self.dead_transitions.get(class)
-            && cached != Tier1StateId::UNKNOWN
-        {
-            return cached;
-        }
-        self.make_room(DfaStateId::DEAD);
-        let next = self.populate(memory, DfaStateId::DEAD, byte, regex);
-        let next = self.tagged(next);
-        self.dead_transitions
-            .resize(self.stride, Tier1StateId::UNKNOWN);
-        self.dead_transitions[class] = next;
-        next
-    }
-
     /// Select the assertion policy only on a transition miss.
     fn populate(
         &mut self,
@@ -457,6 +423,10 @@ impl Tier1DfaCache {
     }
 
     /// Resolve the old boundary, consume exactly once, then seed the new one.
+    ///
+    /// The result can be the empty state: nothing live, no match.  It is
+    /// interned too, and its own transitions come out of this function
+    /// with nothing to consume, that is from the start closure alone.
     fn populate_inner<const ASSERTIONS: bool>(
         &mut self,
         memory: &mut DfaMemory,
@@ -466,23 +436,21 @@ impl Tier1DfaCache {
     ) -> DfaStateId {
         self.targets.clear();
         let mut resolved_match = false;
-        if from != DfaStateId::DEAD {
-            let state = &self.inner.states[from.idx()];
-            if ASSERTIONS && !state.deferred_asserts.is_empty() {
-                (resolved_match, _, _) = Self::closure::<true>(
-                    memory,
-                    state.deferred_asserts.iter().copied(),
-                    regex,
-                    state.context,
-                    Some(byte),
-                );
-                for &idx in &memory.closure_result {
-                    push_consume_targets(&regex.states[idx], byte, regex, &mut self.targets);
-                }
-            }
-            for &idx in &state.nfa_states {
+        let state = &self.inner.states[from.idx()];
+        if ASSERTIONS && !state.deferred_asserts.is_empty() {
+            (resolved_match, _, _) = Self::closure::<true>(
+                memory,
+                state.deferred_asserts.iter().copied(),
+                regex,
+                state.context,
+                Some(byte),
+            );
+            for &idx in &memory.closure_result {
                 push_consume_targets(&regex.states[idx], byte, regex, &mut self.targets);
             }
+        }
+        for &idx in &state.nfa_states {
+            push_consume_targets(&regex.states[idx], byte, regex, &mut self.targets);
         }
         let context = if ASSERTIONS {
             BoundaryContext::new(Some(byte))
@@ -500,13 +468,6 @@ impl Tier1DfaCache {
             None,
         );
         let matched = matched || resolved_match;
-        if memory.closure_result.is_empty()
-            && memory.closure_deferred.is_empty()
-            && !matched
-            && !at_end
-        {
-            return DfaStateId::DEAD;
-        }
         self.intern_state(
             &memory.closure_result,
             &memory.closure_deferred,
@@ -521,7 +482,6 @@ impl Tier1DfaCache {
         self.inner.clear();
         self.targets.clear();
         self.stride = stride;
-        self.dead_transitions.clear();
         memory.clear(num_nfa_states);
         self.transitions.clear();
     }
@@ -578,11 +538,6 @@ impl fmt::Debug for Tier1DfaCache {
             .field("evictions", &self.inner.evictions)
             .field("targets_len", &self.targets.len())
             .field("targets_capacity", &self.targets.capacity())
-            .field("dead_transitions_len", &self.dead_transitions.len())
-            .field(
-                "dead_transitions_capacity",
-                &self.dead_transitions.capacity(),
-            )
             .finish()
     }
 }
@@ -591,13 +546,22 @@ impl fmt::Debug for Tier1DfaCache {
 // Tier 1 DFA matcher (counter-free)
 // ---------------------------------------------------------------------------
 
+/// Whether `state` is the empty state: nothing live and no match, what the
+/// other tiers call the dead state.
+fn is_empty_state(state: &super::DfaState) -> bool {
+    state.nfa_states.is_empty()
+        && state.deferred_asserts.is_empty()
+        && !state.is_match
+        && !state.is_match_at_end
+}
+
 /// Lazy DFA matcher for Tier 1 (counter-free) patterns.
 pub struct DfaMatcher<'a> {
     cache: &'a mut Tier1DfaCache,
     memory: &'a mut DfaMemory,
     regex: &'a Regex,
-    /// The current state or `DEAD`; carries the match tag once
-    /// `ever_matched` is set by a transition.
+    /// The current state; carries the match tag once `ever_matched` is set
+    /// by a transition.
     current: Tier1StateId,
     ever_matched: bool,
     prefilter: Prefilter,
@@ -677,8 +641,7 @@ impl<'a> DfaMatcher<'a> {
     /// followed in a run that does nothing else: the entry at the current
     /// row offset plus the column, and one test that the entry has no tag.
     /// A tagged entry ends the run and is dealt with below it: a transition
-    /// to compute, a match, the dead state or, with a prefilter, the start
-    /// state.
+    /// to compute, a match or, with a prefilter, the start state.
     ///
     /// The run is not unrolled.  It waits on the chain of table loads, so
     /// four bytes per iteration saved instructions but no time on 2 KiB
@@ -706,31 +669,17 @@ impl<'a> DfaMatcher<'a> {
         };
         while i < len {
             // `next` is the tagged entry out of `from` on `input[i]`.
-            let (from, mut next) = if cur.is_tagged() {
-                // The dead state has no row.
-                let next = self
-                    .cache
-                    .transition_from_dead(self.memory, input[i], self.regex);
-                table = &self.cache.transitions[..];
-                if !next.is_tagged() {
+            let (from, mut next) = 'run: {
+                while i < len {
+                    let next = lookup(table, cur, input[i]);
+                    if next.is_tagged() {
+                        break 'run (cur, next);
+                    }
                     cur = next;
                     i += 1;
-                    continue;
                 }
-                (cur, next)
-            } else {
-                'run: {
-                    while i < len {
-                        let next = lookup(table, cur, input[i]);
-                        if next.is_tagged() {
-                            break 'run (cur, next);
-                        }
-                        cur = next;
-                        i += 1;
-                    }
-                    self.current = cur;
-                    return;
-                }
+                self.current = cur;
+                return;
             };
             if next == Tier1StateId::UNKNOWN {
                 let byte = input[i];
@@ -753,7 +702,7 @@ impl<'a> DfaMatcher<'a> {
                 }
                 continue;
             }
-            // An ordinary state after a miss, or the dead state.
+            // An ordinary state after a miss.
             cur = next;
         }
         self.current = cur;
@@ -764,7 +713,7 @@ impl<'a> DfaMatcher<'a> {
         if self.ever_matched {
             return true;
         }
-        self.current != Tier1StateId::DEAD && self.cache.state(self.current).is_match_at_end
+        self.cache.state(self.current).is_match_at_end
     }
 
     #[allow(dead_code)]
@@ -777,15 +726,13 @@ impl fmt::Debug for DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("DfaMatcher");
         s.field("current", &self.cache.untagged(self.current));
-        if self.current != Tier1StateId::DEAD {
-            let state = self.cache.state(self.current);
-            s.field("nfa_states", &state.nfa_states);
-            s.field("is_match", &state.is_match);
-            s.field("is_match_at_end", &state.is_match_at_end);
-            s.field("context", &state.context);
-            if !state.deferred_asserts.is_empty() {
-                s.field("deferred_asserts", &state.deferred_asserts);
-            }
+        let state = self.cache.state(self.current);
+        s.field("nfa_states", &state.nfa_states);
+        s.field("is_match", &state.is_match);
+        s.field("is_match_at_end", &state.is_match_at_end);
+        s.field("context", &state.context);
+        if !state.deferred_asserts.is_empty() {
+            s.field("deferred_asserts", &state.deferred_asserts);
         }
         s.field("ever_matched", &self.ever_matched);
         s.finish()
@@ -794,10 +741,10 @@ impl fmt::Debug for DfaMatcher<'_> {
 
 impl fmt::Display for DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.current == Tier1StateId::DEAD {
+        let state = self.cache.state(self.current);
+        if is_empty_state(state) {
             return write!(f, "DFA[T1] state=DEAD matched={}", self.ever_matched);
         }
-        let state = self.cache.state(self.current);
         write!(
             f,
             "DFA[T1] state={} nfa={{{}}} matched={}",

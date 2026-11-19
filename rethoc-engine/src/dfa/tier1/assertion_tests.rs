@@ -265,9 +265,6 @@ fn eviction_preserves_pending_assertion_context_and_eof() {
             cache.set_max_states(super::super::DFA_MIN_STATES);
             cache.prepare(&mut memory, &regex);
             let current = cache.transition(&mut memory, cache.inner.start_id, previous, &regex);
-            if current == DfaStateId::DEAD {
-                continue;
-            }
             let saved = cache.inner.states[current.idx()].clone();
             if saved.deferred_asserts.is_empty() {
                 continue;
@@ -309,10 +306,11 @@ fn eviction_preserves_pending_assertion_context_and_eof() {
     );
 }
 
-/// DEAD transitions can point at live context-bearing states. Their IDs must
-/// not survive eviction or be reused after the cache switches regexes.
+/// Transitions out of the empty state can point at live context-bearing
+/// states.  Their ids must not survive eviction or be reused after the
+/// cache switches regexes.
 #[test]
-fn dead_transition_ids_clear_on_eviction_and_regex_change() {
+fn empty_state_transitions_clear_on_eviction_and_regex_change() {
     for byte_class_min_states in [usize::MAX, 0] {
         let compile = |pattern| {
             Regex::with_config(
@@ -322,41 +320,43 @@ fn dead_transition_ids_clear_on_eviction_and_regex_change() {
                     ..Default::default()
                 },
             )
-            .expect("dead-transition fixture must compile")
+            .expect("empty-state fixture must compile")
         };
         let crlf = compile("(?Rm:^)a");
         let lf = compile("(?m:^)b");
         let mut memory = DfaMemory::default();
         let mut cache = Tier1DfaCache::new();
         cache.prepare(&mut memory, &crlf);
-        assert!(cache.dead_transitions.is_empty());
-        let dead = cache.transition(&mut memory, cache.inner.start_id, b'x', &crlf);
-        assert_eq!(dead, DfaStateId::DEAD);
-        let pending = cache.transition(&mut memory, dead, b'\r', &crlf);
-        assert_ne!(pending, DfaStateId::DEAD);
+        let empty = cache.transition(&mut memory, cache.inner.start_id, b'x', &crlf);
+        assert!(super::is_empty_state(&cache.inner.states[empty.idx()]));
+        assert_ne!(empty, cache.inner.start_id);
+        // The empty state loops on itself and restarts like any state.
+        assert_eq!(cache.transition(&mut memory, empty, b'x', &crlf), empty);
+        let pending = cache.transition(&mut memory, empty, b'\r', &crlf);
+        assert_ne!(pending, empty);
         assert_ne!(pending, cache.inner.start_id);
         let saved = cache.inner.states[pending.idx()].clone();
         assert!(!saved.deferred_asserts.is_empty());
-        assert!(cache.dead_transitions.contains(&cache.tagged(pending)));
 
         let remapped = cache.evict(pending);
         assert_eq!(cache.inner.states[remapped.idx()], saved);
-        assert!(cache.dead_transitions.is_empty());
-        assert_eq!(
-            cache.transition(&mut memory, DfaStateId::DEAD, b'\r', &crlf),
-            remapped
+        assert!(
+            cache
+                .transitions
+                .iter()
+                .all(|&next| next == super::Tier1StateId::UNKNOWN)
         );
-        assert!(cache.dead_transitions.contains(&cache.tagged(remapped)));
+        let empty = cache.transition(&mut memory, remapped, b'x', &crlf);
+        assert!(super::is_empty_state(&cache.inner.states[empty.idx()]));
+        assert_eq!(cache.transition(&mut memory, empty, b'\r', &crlf), remapped);
 
         cache.prepare(&mut memory, &lf);
-        assert!(cache.dead_transitions.is_empty());
-        let restarted = cache.transition(&mut memory, DfaStateId::DEAD, b'\n', &lf);
-        assert_ne!(restarted, DfaStateId::DEAD);
+        let empty = cache.transition(&mut memory, cache.inner.start_id, b'x', &lf);
+        assert!(super::is_empty_state(&cache.inner.states[empty.idx()]));
+        let restarted = cache.transition(&mut memory, empty, b'\n', &lf);
+        assert!(!super::is_empty_state(&cache.inner.states[restarted.idx()]));
         let matched = cache.transition(&mut memory, restarted, b'b', &lf);
-        assert_ne!(matched, DfaStateId::DEAD);
         assert!(cache.inner.states[matched.idx()].is_match);
-        cache.prepare(&mut memory, &crlf);
-        assert!(cache.dead_transitions.is_empty());
     }
 }
 
