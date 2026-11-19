@@ -1640,6 +1640,14 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
 
         let start_id = self.cache.inner.start_id;
+        if let [byte] = input
+            && self.current == start_id
+            && !self.has_live_counters
+            && !self.prefilter.accepts(*byte)
+        {
+            // Test a singleton in place instead of starting a SIMD scan.
+            return;
+        }
 
         // Prefilter-aware scanning: when the DFA is in the start state and
         // a prefilter is available, use memchr to skip ahead to the next

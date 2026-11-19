@@ -109,6 +109,19 @@ macro_rules! with_prefilter {
 pub(crate) use with_prefilter;
 
 impl Prefilter {
+    /// Whether this byte can start a match.
+    #[inline]
+    pub(crate) fn accepts(&self, byte: u8) -> bool {
+        match self {
+            Self::None => true,
+            Self::Memchr1(a) => byte == *a,
+            Self::Memchr2(a, b) => byte == *a || byte == *b,
+            Self::Memchr3(a, b, c) => byte == *a || byte == *b || byte == *c,
+            Self::Memclass(table) => table.contains(byte),
+            Self::Range(lo, hi) => (*lo..=*hi).contains(&byte),
+        }
+    }
+
     /// Offset of the first byte of `hay` that can start a match, or `None`
     /// if there is none.  Every byte is a candidate for [`Prefilter::None`].
     pub(crate) fn find(&self, hay: &[u8]) -> Option<usize> {
@@ -270,6 +283,23 @@ mod tests {
         )
         .unwrap();
         re.prefilter
+    }
+
+    #[test]
+    fn singleton_membership_agrees_with_slice_search() {
+        let filters = [
+            Prefilter::None,
+            Prefilter::Memchr1(255),
+            Prefilter::Memchr2(0, 128),
+            Prefilter::Memchr3(1, 127, 254),
+            Prefilter::Memclass(MemclassTable::new(&[0, 15, 240, 255])),
+            Prefilter::Range(176, 191),
+        ];
+        for filter in filters {
+            for byte in 0..=255 {
+                assert_eq!(filter.accepts(byte), filter.find(&[byte]).is_some());
+            }
+        }
     }
 
     // ── Basic variant selection ──
