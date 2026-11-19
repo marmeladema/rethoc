@@ -1,0 +1,10 @@
+[[engine]]
+name = "rethoc"
+cwd = "../engines/rethoc"
+
+[engine.version]
+bin = "./target/release/rethoc-rebar"
+args = ["--version"]
+
+[engine.run]
+bin = "./target/release/rethoc-rebar"
