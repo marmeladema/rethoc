@@ -9,15 +9,15 @@
 //! The tier3/tier4/nfa benchmarks disable merging to preserve the
 //! 3-counter structure and exercise those tiers directly.
 //!
-//! Benchmarked engines: rethoc/default, rethoc/tier3, rethoc/tier4,
+//! Benchmarked engines: rethoc/default, rethoc/tier2, rethoc/tier3, rethoc/tier4,
 //! rethoc/nfa, regex.
 //!
-//! # Nested pattern (`(.{0,1000}a){0,1000}b`)
+//! # Nested pattern (`(.{0,100}a){0,100}b`)
 //!
-//! Nested bounded repetition requiring Tier 4.  The inner `.{0,1000}`
-//! counter is nested inside the outer `(...){0,1000}` counter, creating
+//! Nested bounded repetition requiring Tier 4.  The inner `.{0,100}`
+//! counter is nested inside the outer `(...){0,100}` counter, creating
 //! an O(max_inner × max_outer) context space.  This pattern is not
-//! eligible for Tier 3 (nested counters) or Tier 2 (overlapping bytes).
+//! eligible for Tier 2 or Tier 3 because both require flat counters.
 //!
 //! Benchmarked engines: rethoc/tier4, regex.
 //!
@@ -31,6 +31,9 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use rethoc_engine::{MatcherMemory, RegexBuilder};
 
 const PATTERN: &str = r".{0,1000}.{0,1000}.{0,1000}a";
+
+// The three wildcard repetitions have an estimated 3,004 states before merging.
+const FLAT_STATE_LIMIT: usize = 4096;
 
 fn parse_hir(pattern: &str) -> rethoc_engine::Hir {
     use regex_syntax::ast::parse::ParserBuilder;
@@ -55,7 +58,12 @@ fn bench_compile(c: &mut Criterion) {
     group.bench_function("rethoc", |b| {
         let hir = parse_hir(PATTERN);
         b.iter(|| {
-            black_box(RegexBuilder::default().build(black_box(&hir)).unwrap());
+            black_box(
+                RegexBuilder::default()
+                    .max_estimated_states(FLAT_STATE_LIMIT)
+                    .build(black_box(&hir))
+                    .expect("flat benchmark pattern compiles"),
+            );
         })
     });
 
@@ -94,7 +102,7 @@ fn bench_no_match(c: &mut Criterion) {
     // Default compilation: merges .{0,1000}.{0,1000}.{0,1000} → .{0,3000}
     // (single counter, Tier 2).
     let rethoc_merged = RegexBuilder::default()
-        .max_estimated_states(4096)
+        .max_estimated_states(FLAT_STATE_LIMIT)
         .build(&hir)
         .unwrap();
     assert_eq!(rethoc_merged.min_tier(), 2);
@@ -102,7 +110,7 @@ fn bench_no_match(c: &mut Criterion) {
     // benchmarks that need the multi-counter structure.
     let rethoc_re = RegexBuilder::default()
         .merge_repetitions(false)
-        .max_estimated_states(4096)
+        .max_estimated_states(FLAT_STATE_LIMIT)
         .build(&hir)
         .unwrap();
     let regex_re = regex::bytes::RegexBuilder::new(PATTERN)
@@ -203,13 +211,13 @@ fn bench_no_match(c: &mut Criterion) {
 fn bench_match_at_end(c: &mut Criterion) {
     let hir = parse_hir(PATTERN);
     let rethoc_merged = RegexBuilder::default()
-        .max_estimated_states(4096)
+        .max_estimated_states(FLAT_STATE_LIMIT)
         .build(&hir)
         .unwrap();
     assert_eq!(rethoc_merged.min_tier(), 2);
     let rethoc_re = RegexBuilder::default()
         .merge_repetitions(false)
-        .max_estimated_states(4096)
+        .max_estimated_states(FLAT_STATE_LIMIT)
         .build(&hir)
         .unwrap();
     let regex_re = regex::bytes::RegexBuilder::new(PATTERN)
@@ -318,13 +326,13 @@ const NESTED_SIZES: &[usize] = &[256, 1024];
 
 fn bench_nested_match_at_end(c: &mut Criterion) {
     let hir = parse_hir(NESTED_PATTERN);
+    // Nested bounds give this fixture an estimate of 10,301 states.
     let rethoc_re = RegexBuilder::default()
-        .max_estimated_states(4096)
+        .max_estimated_states(16_384)
         .build(&hir)
         .unwrap();
 
-    // The regex crate cannot compile this nested pattern within its default
-    // 10 MB NFA size limit (or even 100 MB), so we only benchmark rethoc.
+    // Include the regex comparison when the nested pattern fits its NFA budget.
     let regex_re = regex::bytes::RegexBuilder::new(NESTED_PATTERN)
         .unicode(false)
         .dot_matches_new_line(true)
