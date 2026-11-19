@@ -14816,7 +14816,7 @@ mod tests {
             m.chunk(&filler[..6000]);
             assert!(!m.finish(), "cap {cap:?}: filler only");
             let want = cap.map_or(crate::dfa::DFA_MAX_STATES, |c| {
-                c.max(crate::dfa::DFA_MIN_STATES)
+                c.clamp(crate::dfa::DFA_MIN_STATES, crate::dfa::TIER1_MAX_STATES)
             });
             assert_eq!(memory.dfa_cache.as_ref().unwrap().max_states(), want);
         }

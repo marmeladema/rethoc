@@ -34,6 +34,8 @@ use indexmap::Equivalent;
 use indexmap::IndexSet;
 
 pub(crate) use assertions::DfaAssertions;
+#[cfg(test)]
+pub(crate) use tier1::TIER1_MAX_STATES;
 pub(crate) use tier1::{DfaMatcher, Tier1DfaCache};
 pub(crate) use tier2::{Tier2Analysis, Tier2DfaCache, Tier2DfaMatcher, compute_tier2_analysis};
 pub(crate) use tier3::{
