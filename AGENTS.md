@@ -358,6 +358,7 @@ from a seed; the oracle is the `regex` crate or the NFA.
 
 ```bash
 cargo test test_fuzz -- --ignored     # proptest: oracle + cross-tier
+cargo test test_fuzz_tier2_overlap -- --ignored --nocapture  # targeted overlap counts
 cargo +nightly fuzz run fuzz_match         # vs regex crate
 cargo +nightly fuzz run fuzz_differential  # tiers and grouped NFA vs NFA
 cargo +nightly fuzz run fuzz_compile       # compilation robustness

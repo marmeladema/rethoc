@@ -69,63 +69,132 @@ mod tests {
         }
     }
 
-    // -- Overlap-focused property test (Patch 9) --
+    /// Generate flat branches with a common terminal action. Each byte of a
+    /// body accepts b, and one position also accepts a byte private to that
+    /// branch. This gives us simultaneous increments and branch-specific exits.
+    fn overlap_case(
+        rng: &mut proptest::test_runner::TestRng,
+        num_counters: usize,
+        prefix: &str,
+        terminal: &str,
+    ) -> (String, Vec<String>) {
+        use proptest::prelude::RngExt;
 
-    /// Generate random overlapping two-counter patterns and verify
-    /// that any admitted by the proof match correctly against Tier 0.
-    #[test]
-    #[ignore] // slow: uses random patterns
-    fn test_fuzz_tier2_overlap() {
-        use crate::fuzz_gen::{FuzzRng, generate_pattern};
+        let mut branches = Vec::new();
+        let mut inputs = vec![String::new()];
+        let mut longest = 0;
+        let mut witness = String::new();
+        for letter in ['a', 'c', 'd'].into_iter().take(num_counters) {
+            let width = rng.random_range(1..=3);
+            let pos = rng.random_range(0..width);
+            let lead = "b".repeat(pos);
+            let tail = "b".repeat(width - pos - 1);
+            let min = rng.random_range(2..=5);
+            let max = rng.random_range(min..=min + 4);
+            branches.push(format!("(?:{lead}[b{letter}]{tail}){{{min},{max}}}"));
+            longest = longest.max(max * width);
 
+            let body = format!("{lead}{letter}{tail}");
+            for count in [min - 1, min, max, max + 1] {
+                inputs.push(format!("x{}", body.repeat(count)));
+            }
+            witness = body.repeat(min);
+        }
+        for len in 0..=longest + 1 {
+            inputs.push(format!("x{}", "b".repeat(len)));
+        }
+        // Expire all counters, then start a fresh attempt at a line boundary.
+        inputs.push(format!("x{}!\nx{witness}", "b".repeat(longest + 1)));
+        let mut mixed = String::from("x");
+        for _ in 0..=longest {
+            let bytes = b"bbbbacd!x";
+            mixed.push(char::from(bytes[rng.random_range(0..bytes.len())]));
+        }
+        inputs.push(mixed);
+        (
+            format!("{prefix}(?:{}){terminal}", branches.join("|")),
+            inputs,
+        )
+    }
+
+    fn check_generated_overlaps(patterns: usize) {
+        use proptest::test_runner::{RngAlgorithm, TestRng};
+
+        let mut rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
         let mut admitted = 0;
-        let mut tested = 0;
+        let mut saw_mixed_widths = false;
+        let mut comparisons = 0;
+        for case in 0..patterns {
+            let num_counters = 2 + case % 2;
+            let prefix = ["x", "^x", r"\bx", "(?m:^x)"][case / 2 % 4];
+            let terminal = ["", "$"][case / 8 % 2];
+            let (pattern, inputs) = overlap_case(&mut rng, num_counters, prefix, terminal);
+            let oracle = regex::bytes::Regex::new(&pattern).expect("valid generated overlap");
+            for byte_classes in [usize::MAX, 0] {
+                let re = crate::Regex::with_config(
+                    &pattern,
+                    crate::RegexConfig {
+                        max_unroll_states: 0,
+                        merge_repetitions: false,
+                        byte_class_min_states: byte_classes,
+                        ..Default::default()
+                    },
+                )
+                .expect("small generated overlap compiles");
+                assert_eq!(re.counter_info.len(), num_counters, "{pattern}");
+                assert!(re.tier2_overlap_proven, "{pattern}");
+                assert_eq!(re.engine(), Engine::Tier2, "{pattern}");
+                admitted += 1;
+                saw_mixed_widths |= re
+                    .counter_info
+                    .windows(2)
+                    .any(|pair| pair[0].body_byte_length != pair[1].body_byte_length);
 
-        // Use a deterministic seed sequence.
-        for seed in 0u64..500 {
-            let seed_bytes = seed.to_le_bytes();
-            let mut rng = FuzzRng::new(&seed_bytes);
-            let (pattern_str, ast) = generate_pattern(&mut rng);
-
-            let regex = match build_checked(&pattern_str) {
-                Some(r) => r,
-                None => continue,
-            };
-
-            if regex.counter_info.len() < 2 {
-                continue; // only test multi-counter patterns
-            }
-            tested += 1;
-
-            if !regex.tier2_overlap_proven {
-                continue;
-            }
-
-            // Admitted — test on boundary inputs.
-            admitted += 1;
-            let mut mem = crate::MatcherMemory::default();
-
-            // Generate some boundary inputs.
-            let inputs = crate::fuzz_gen::generate_inputs(&mut FuzzRng::new(&seed_bytes), &ast);
-            let inputs2 = crate::fuzz_gen::generate_inputs(
-                &mut FuzzRng::new(&(seed + 1000).to_le_bytes()),
-                &ast,
-            );
-
-            for input in inputs.iter().chain(inputs2.iter()) {
-                let mut m0 = mem.matcher_for_tier(&regex, 0).unwrap();
-                m0.chunk(input);
-                let nfa = m0.finish();
-
-                let mut m2 = mem.matcher_for_tier(&regex, 2).expect("admitted overlap");
-                m2.chunk(input);
-                assert_eq!(nfa, m2.finish(), "{pattern_str} on {input:?}");
+                let mut mem = crate::MatcherMemory::default();
+                if byte_classes == 0 {
+                    mem.set_dfa_state_cap(Some(crate::dfa::DFA_MIN_STATES));
+                }
+                for input in &inputs {
+                    let expected = oracle.is_match(input.as_bytes());
+                    for tier in [0, 2] {
+                        for chunk_size in [input.len().max(1), 1] {
+                            let mut m = mem.matcher_for_tier(&re, tier).expect("eligible tier");
+                            for chunk in input.as_bytes().chunks(chunk_size) {
+                                m.chunk(chunk);
+                            }
+                            comparisons += 1;
+                            assert_eq!(
+                                m.finish(),
+                                expected,
+                                "{pattern} on {input:?}, tier {tier}, chunk {chunk_size}, class threshold {byte_classes}"
+                            );
+                        }
+                    }
+                }
             }
         }
-
         eprintln!(
-            "fuzz tier2 overlap: {tested} multi-counter patterns tested, {admitted} admitted"
+            "{patterns} patterns, {admitted} admitted configurations, {comparisons} oracle comparisons"
         );
+        assert!(
+            admitted > 0,
+            "must exercise admitted multi-counter patterns"
+        );
+        assert!(
+            saw_mixed_widths,
+            "must exercise overlapping counters of different widths"
+        );
+    }
+
+    #[test]
+    fn generated_overlap_smoke() {
+        check_generated_overlaps(16);
+    }
+
+    #[test]
+    #[ignore] // Broader deterministic coverage of counter bounds and body widths.
+    fn test_fuzz_tier2_overlap() {
+        check_generated_overlaps(500);
     }
 
     // -- Exhaustive adversarial mini-model tests (Patch 8) --
