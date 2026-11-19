@@ -1746,7 +1746,7 @@ impl Tier3DfaCache {
     ) -> ClosureResult {
         let mut encountered_cinc = false;
 
-        let (is_match, is_match_at_end) = memory.epsilon_closure(
+        let (is_match, is_match_at_end) = memory.epsilon_closure::<false>(
             seeds,
             regex,
             at_start,
