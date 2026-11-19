@@ -100,12 +100,12 @@ impl Tier1StateId {
     /// Tag of the start state in the table of a regex with a prefilter:
     /// entering it hands the input over to the prefilter.  The matcher's
     /// current state never carries it.
-    const START_TAG: u32 = 1 << 28;
+    const START_TAG: u32 = 1 << 29;
     /// The start state as a current state: state 0, so row offset 0, also
     /// after the cache is emptied.
     const START: Self = Self(0);
     /// Tag of a state whose `is_match` flag is set; the offset is kept.
-    const MATCH: u32 = 1 << 29;
+    const MATCH: u32 = 1 << 30;
     /// A transition that is not computed yet.
     const UNKNOWN: Self = Self(1 << 31);
     /// Largest untagged value, and the mask of the offset bits.
@@ -141,8 +141,10 @@ impl Tier1StateId {
     }
 }
 
-/// Most states a Tier 1 cache can be asked to hold: every row offset has
-/// to fit below the tag bits, at the widest row (256 columns).
+/// Most states a Tier 1 cache can be asked to hold (2^21): every row
+/// offset has to fit below the tag bits.  Sized for the widest row (256
+/// columns) whatever the regex: narrower rows could address more, but no
+/// cache is meant to grow that far (2 GiB of transitions at 256 columns).
 pub(crate) const TIER1_MAX_STATES: usize = (Tier1StateId::MAX as usize + 1) / 256;
 
 // ---------------------------------------------------------------------------
@@ -174,7 +176,7 @@ pub(crate) struct Tier1DfaCache {
     /// Row width: the number of byte classes.
     stride: usize,
     /// `ceil(2^32 / stride)`.  A row offset is a multiple of the stride
-    /// below 2^28 and the stride is at most 256, so the high half of
+    /// below 2^29 and the stride is at most 256, so the high half of
     /// their product is exactly the offset over the stride.
     stride_reciprocal: u64,
     /// Whether transitions into the start state carry
@@ -196,7 +198,8 @@ impl Tier1DfaCache {
         }
     }
 
-    /// Set the state cap (see [`DfaCache::set_max_states`]).
+    /// Set the state cap (see [`DfaCache::set_max_states`]).  A cap above
+    /// [`TIER1_MAX_STATES`] is lowered to it.
     pub(crate) fn set_max_states(&mut self, max_states: usize) {
         self.inner.set_max_states(max_states.min(TIER1_MAX_STATES));
     }

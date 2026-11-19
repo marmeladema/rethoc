@@ -3896,7 +3896,8 @@ pub struct MatcherMemory {
 impl MatcherMemory {
     /// Set how many DFA states the caches of tiers 1–3 hold before they
     /// are emptied and refilled; `None` restores the default.  Values
-    /// below the engine's minimum are raised to it.  This trades speed
+    /// below the engine's minimum are raised to it, and Tier 1 lowers
+    /// values above 2^21 states to that.  This trades speed
     /// for memory and never changes a match result; the differential
     /// tools and tests use a tiny cap to exercise cache eviction on every
     /// input.
