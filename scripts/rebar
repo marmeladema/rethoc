@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Check and measure rethoc on upstream rebar grep benchmarks."""
+
+import argparse
+import csv
+import fcntl
+import io
+import os
+from pathlib import Path
+import platform
+import re
+import subprocess
+import tempfile
+import tomllib
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = ROOT / "benchmarks/rebar"
+WORK = ROOT / "bench/rebar-integration"
+UPSTREAM = WORK / "upstream"
+URL = "https://github.com/BurntSushi/rebar.git"
+OVERLAY = UPSTREAM / "rethoc-benchmarks"
+ENGINES = ("rethoc", "rust/regex")
+CASES = (
+    "curated/09-aws-keys/quick",
+    "grep/every-line",
+    "grep/long-words-ascii",
+    "imported/lh3lh3-reb/date",
+    "imported/lh3lh3-reb/email",
+    "imported/lh3lh3-reb/uri",
+    "imported/lh3lh3-reb/uri-or-email",
+    "opt/accelerate/whole-line",
+)
+CHECK_CASES = (*CASES, "test/model/grep")
+
+
+def run(*args, cwd=ROOT, capture=False, stdout=None):
+    return subprocess.run(
+        args, cwd=cwd, text=True, check=True, capture_output=capture, stdout=stdout
+    ).stdout
+
+
+def prepare():
+    if not UPSTREAM.exists():
+        run("git", "clone", "--depth=1", URL, UPSTREAM)
+    run("git", "fetch", "--depth=1", URL, "HEAD", cwd=UPSTREAM)
+    run("git", "checkout", "--detach", "FETCH_HEAD", cwd=UPSTREAM)
+    revision = run("git", "rev-parse", "HEAD", cwd=UPSTREAM, capture=True).strip()
+    print(f"Using rebar {revision}", flush=True)
+
+    fixtures = UPSTREAM / "benchmarks"
+    OVERLAY.mkdir(exist_ok=True)
+    for name in ("haystacks", "regexes"):
+        link = OVERLAY / name
+        if not link.is_symlink():
+            link.symlink_to(fixtures / name, target_is_directory=True)
+    (OVERLAY / "engines.toml").write_text(
+        (fixtures / "engines.toml").read_text() + "\n" + (SOURCE / "engine.toml").read_text()
+    )
+    groups = {}
+    for case in CHECK_CASES:
+        group, name = case.rsplit("/", 1)
+        groups.setdefault(group, set()).add(name)
+    for group, selected in groups.items():
+        source = fixtures / "definitions" / f"{group}.toml"
+        destination = OVERLAY / "definitions" / f"{group}.toml"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        # Use the upstream TOML verbatim except for the extra engine membership.
+        original = source.read_text()
+        expected = tomllib.loads(original)
+        entries = {entry["name"]: entry for entry in expected["bench"]}
+        for name in sorted(selected):
+            entry = entries.get(name)
+            if entry is None:
+                raise ValueError(f"missing upstream benchmark {group}/{name}")
+            if entry["model"] != "grep" or "rust/regex" not in entry["engines"]:
+                raise ValueError(f"incompatible upstream benchmark {group}/{name}")
+            entry["engines"].insert(0, "rethoc")
+        sections = re.split(r"(?m)(^\[\[bench\]\][ \t]*$)", original)
+        for i in range(2, len(sections), 2):
+            if tomllib.loads(sections[i]).get("name") in selected:
+                sections[i], count = re.subn(
+                    r"(?m)^engines\s*=\s*\[", 'engines = ["rethoc", ', sections[i], count=1
+                )
+                if count != 1:
+                    raise ValueError(f"could not register rethoc in {source}")
+        overlay = "".join(sections)
+        if tomllib.loads(overlay) != expected:
+            raise ValueError(f"unexpected changes to upstream benchmark definitions in {source}")
+        destination.write_text(overlay)
+
+    adapter = UPSTREAM / "engines/rethoc"
+    adapter.mkdir(exist_ok=True)
+    for name in ("Cargo.toml", "Cargo.lock", "main.rs"):
+        destination = adapter / name
+        content = (SOURCE / name).read_bytes()
+        if not destination.exists() or destination.read_bytes() != content:
+            destination.write_bytes(content)
+    for directory in (UPSTREAM, UPSTREAM / "engines/rust/regex", adapter):
+        run("cargo", "build", "--locked", "--release", "--target-dir", directory / "target",
+            cwd=directory)
+    return revision
+
+
+def rebar(*args, **kwargs):
+    return run(ROOT / "scripts/capped", "--", UPSTREAM / "target/release/rebar",
+               *args, cwd=UPSTREAM, **kwargs)
+
+
+def selection(cases):
+    return (
+        "--dir", OVERLAY, "-e", "^(rethoc|rust/regex)$",
+        "-f", "^(" + "|".join(map(re.escape, cases)) + ")$",
+    )
+
+
+def validate_pairs(pairs, cases):
+    expected = {(case, engine) for case in cases for engine in ENGINES}
+    if set(pairs) != expected or len(pairs) != len(expected):
+        raise ValueError(f"unexpected benchmark pairs: missing {expected - set(pairs)}, "
+                         f"extra {set(pairs) - expected}, got {len(pairs)} rows")
+
+
+def nanoseconds(duration):
+    match = re.fullmatch(r"([0-9.]+)\s*(ns|µs|us|ms|s)", duration)
+    if not match:
+        raise ValueError(f"unrecognized rebar duration {duration!r}")
+    return float(match[1]) * {"ns": 1, "µs": 1e3, "us": 1e3, "ms": 1e6, "s": 1e9}[match[2]]
+
+
+def measure(revision):
+    output = Path(tempfile.mkdtemp(prefix="results-", dir=WORK))
+    print(f"Writing measurements to {output}", flush=True)
+    raw = output / "results.csv"
+    with raw.open("w") as stream:
+        rebar("measure", *selection(CASES), stdout=stream)
+    with raw.open() as stream:
+        rows = list(csv.DictReader(stream))
+    validate_pairs([(row["name"], row["engine"]) for row in rows], CASES)
+    for row in rows:
+        if row["err"] or int(row["iters"]) <= 0 or nanoseconds(row["median"]) <= 0:
+            raise ValueError(f"invalid measurement for {row['name']} / {row['engine']}: {row['err']}")
+    with (output / "comparison.txt").open("w") as stream:
+        rebar("cmp", raw, stdout=stream)
+
+    results = {(row["name"], row["engine"]): row for row in rows}
+    baseline_versions = {row["engine_version"] for row in rows if row["engine"] == "rust/regex"}
+    rethoc_revision = run("git", "rev-parse", "HEAD", capture=True).strip()
+    dirty = bool(run("git", "status", "--porcelain", capture=True))
+    toolchain = run("rustc", "--version", capture=True).strip()
+    cpu = platform.processor() or platform.machine()
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        cpu = next(
+            (line.split(":", 1)[1].strip() for line in cpuinfo.read_text().splitlines()
+             if line.startswith("model name")),
+            cpu,
+        )
+    report = [
+        "## Rebar grep benchmarks",
+        "",
+        f"- rethoc: `{rethoc_revision}`" + (" (working tree modified)" if dirty else ""),
+        f"- rebar: `{revision}`",
+        f"- rust/regex: `{', '.join(sorted(baseline_versions))}`",
+        f"- Toolchain: `{toolchain}`",
+        f"- Runner: {platform.platform()}, {cpu}",
+        "",
+        "| Benchmark | rethoc median | rust/regex median | rethoc / rust/regex |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for case in CASES:
+        ours = results[case, "rethoc"]["median"]
+        baseline = results[case, "rust/regex"]["median"]
+        report.append(f"| `{case}` | {ours} | {baseline} | "
+                      f"{nanoseconds(ours) / nanoseconds(baseline):.2f}× |")
+    summary = "\n".join(report) + "\n"
+    (output / "summary.md").write_text(summary)
+    if step_summary := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(step_summary, "a") as stream:
+            stream.write(summary)
+    print(summary)
+
+
+def benchmark(command):
+    revision = prepare()
+    listing = rebar("measure", "--list", *selection(CHECK_CASES), capture=True)
+    validate_pairs([(name, engine) for name, _, engine, _ in csv.reader(io.StringIO(listing))],
+                   CHECK_CASES)
+    rebar("measure", "--test", *selection(CHECK_CASES))
+    print(f"Verified published counts for both engines on {len(CHECK_CASES)} cases.", flush=True)
+    if command == "measure":
+        measure(revision)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("check", "measure"))
+    args = parser.parse_args()
+    WORK.mkdir(parents=True, exist_ok=True)
+    with (WORK / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        benchmark(args.command)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        raise SystemExit(f"rebar: {error}") from None

@@ -1,0 +1,24 @@
+[package]
+name = "rethoc-rebar"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "rethoc-rebar"
+path = "main.rs"
+
+[dependencies]
+anyhow = "1"
+bstr = { version = "1", default-features = false, features = ["std"] }
+klv = { path = "../../shared/klv" }
+regex-syntax = "0.8.9"
+rethoc-engine = { path = "../../../../../rethoc-engine" }
+timer = { path = "../../shared/timer" }
+
+[profile.release]
+debug = true
+codegen-units = 1
+lto = "fat"
