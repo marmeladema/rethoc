@@ -14378,6 +14378,21 @@ mod tests {
             tier3_broken: true,
             inputs: [("", true), ("a", false), ("aa", true)],
         }
+        // Bug 75. Reaching End through a permitted break still leaves
+        // its following assertions to evaluate. Tier 3 assumes they pass.
+        test_tier2_guarded_end_after_break {
+            pattern: r"a{2,40}$\B",
+            memory: 993,
+            min_tier: 2,
+            tier3_broken: true,
+            inputs: [("a", false), ("aa", false), ("aa ", false)],
+        }
+        test_tier2_passing_end_after_break {
+            pattern: r"a{2,40}$\b",
+            memory: 993,
+            min_tier: 2,
+            inputs: [("a", false), ("aa", true), ("aa ", false)],
+        }
         // Right before the count, tier 2 takes it (fixed-length body): the
         // anchor is settled when the transition is computed.
         test_counter_body_line_start_behind_byte_stays_tier2 {

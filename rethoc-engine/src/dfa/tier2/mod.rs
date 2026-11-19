@@ -773,7 +773,7 @@ impl Tier2DfaCache {
     ) -> ClosureResult {
         let mut encountered_cinc = false;
 
-        let (is_match, is_match_at_end) = memory.epsilon_closure(
+        let (is_match, is_match_at_end) = memory.epsilon_closure::<true>(
             seeds,
             regex,
             at_start,
@@ -792,16 +792,6 @@ impl Tier2DfaCache {
                 }
             },
         );
-
-        // Evaluate EOF for parked continuations while the physical boundary
-        // is available. Their cache key then needs only known-next-byte reads.
-        let is_match_at_end = is_match_at_end
-            || (next_byte.is_none()
-                && memory.closure_deferred.iter().any(|&idx| {
-                    regex
-                        .dfa_assertions
-                        .eof_accept(idx, BoundaryContext::new(prev_byte).0)
-                }));
 
         let mut seed_instances: Vec<(CounterIdx, StateIdx)> = Vec::new();
         for &(counter, _ci_out) in &memory.closure_seeds {
@@ -1906,6 +1896,22 @@ mod tests {
         let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
         m.chunk(input);
         f(&m)
+    }
+
+    #[test]
+    fn end_through_split_sets_exact_flag_without_parking() {
+        for (pattern, input, accepted) in [
+            (r"a{2,4}$(?:x)?", b"aa".as_slice(), true),
+            (r"a{2,4}$(?:x)?", b"a", false),
+            (r"a{2,4}$(?:\B|x)", b"aa", false),
+            (r"a{2,4}$(?:\b|x)", b"aa", true),
+        ] {
+            with_matcher(pattern, input, |m| {
+                let state = &m.cache.inner.states[m.current.idx()];
+                assert!(state.deferred_asserts.is_empty(), "{pattern}");
+                assert_eq!(m.match_at_end, accepted, "{pattern} on {input:?}");
+            });
+        }
     }
 
     #[test]

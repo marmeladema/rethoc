@@ -133,8 +133,8 @@ pub(super) struct DfaState {
     pub(super) deferred_asserts: Box<[StateIdx]>,
     /// True if `Match` is directly reachable (no pending `$` gate).
     pub(super) is_match: bool,
-    /// Acceptance at EOF. Tier 1 computes this exactly for every assertion;
-    /// the counting tiers use their existing `Assert(End)` gate policy.
+    /// Acceptance at EOF. Tiers 1 and 2 evaluate assertions in the physical
+    /// boundary context. Tier 3 uses reachability.
     pub(super) is_match_at_end: bool,
     /// Context required by parked continuations, zero when none are pending.
     /// Tiers 1 and 2 mask to the required facts. Tier 3 keeps wordness.
@@ -362,11 +362,16 @@ impl DfaMemory {
     /// return `Defer`, in which case the Assert state index is collected
     /// in `closure_deferred`.
     ///
+    /// With `EXACT_EOF`, End and deferred assertions contribute their exact
+    /// EOF answers at the physical boundary. Each closure includes only the
+    /// counter break paths selected by its caller. Tier 3 uses optimistic
+    /// EOF flags in its separate counter program.
+    ///
     /// Returns `(is_match, is_match_at_end)`.  Consuming states are left
     /// in `self.closure_result`; deferred asserts in `self.closure_deferred`.
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    fn epsilon_closure(
+    fn epsilon_closure<const EXACT_EOF: bool>(
         &mut self,
         seeds: impl Iterator<Item = StateIdx>,
         regex: &Regex,
@@ -409,6 +414,11 @@ impl DfaMemory {
                     if kind == AssertKind::End {
                         if at_end {
                             self.closure_stack.push(out);
+                        } else if EXACT_EOF {
+                            is_match_at_end |= next_byte.is_none()
+                                && regex
+                                    .dfa_assertions
+                                    .eof_accept(idx, BoundaryContext::new(prev_byte).0);
                         } else if regex.state_can_reach_match[out.idx()] {
                             is_match_at_end = true;
                         }
@@ -423,6 +433,11 @@ impl DfaMemory {
                             // Assertion failed — skip.
                         }
                         AssertEval::Defer => {
+                            if EXACT_EOF {
+                                is_match_at_end |= regex
+                                    .dfa_assertions
+                                    .eof_accept(idx, BoundaryContext::new(prev_byte).0);
+                            }
                             // Park this assert for deferred resolution.
                             self.closure_deferred.push(idx);
                         }
