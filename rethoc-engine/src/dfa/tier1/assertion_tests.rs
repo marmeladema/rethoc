@@ -350,13 +350,27 @@ fn empty_state_transitions_clear_on_eviction_and_regex_change() {
         assert!(super::is_empty_state(&cache.inner.states[empty.idx()]));
         assert_eq!(cache.transition(&mut memory, empty, b'\r', &crlf), remapped);
 
+        // Switching regexes leaves the start state's row and nothing in it.
+        let fresh = |cache: &Tier1DfaCache| {
+            cache.inner.states.len() == 1
+                && cache.transitions.len() == cache.stride
+                && cache
+                    .transitions
+                    .iter()
+                    .all(|&next| next == super::Tier1StateId::UNKNOWN)
+        };
         cache.prepare(&mut memory, &lf);
+        assert!(fresh(&cache));
         let empty = cache.transition(&mut memory, cache.inner.start_id, b'x', &lf);
         assert!(super::is_empty_state(&cache.inner.states[empty.idx()]));
         let restarted = cache.transition(&mut memory, empty, b'\n', &lf);
         assert!(!super::is_empty_state(&cache.inner.states[restarted.idx()]));
         let matched = cache.transition(&mut memory, restarted, b'b', &lf);
         assert!(cache.inner.states[matched.idx()].is_match);
+        cache.prepare(&mut memory, &crlf);
+        assert!(fresh(&cache));
+        let empty = cache.transition(&mut memory, cache.inner.start_id, b'x', &crlf);
+        assert!(super::is_empty_state(&cache.inner.states[empty.idx()]));
     }
 }
 
