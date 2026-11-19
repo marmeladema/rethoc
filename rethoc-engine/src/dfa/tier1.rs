@@ -162,9 +162,9 @@ pub(crate) const TIER1_MAX_STATES: usize = (Tier1StateId::MAX as usize + 1) / 25
 /// The cache is **persisted across `matcher()` calls** for the same
 /// `Regex`.  A unique regex ID detects when a different regex is used
 /// and clears the cache.
-// Keep the transition vector and stride adjacent. On AArch64 this lets the
-// measured compiler load the vector length and stride together; correctness
-// does not depend on Vec's internal layout or on paired-load code generation.
+// The scanning loop reads only the transition vector's pointer and length:
+// entries hold row offsets, so `stride` is no longer read per byte.  The
+// field order dates from when it was; nothing depends on it.
 #[repr(C)]
 pub(crate) struct Tier1DfaCache {
     inner: DfaCache,
@@ -355,8 +355,10 @@ impl Tier1DfaCache {
     }
 
     /// The transition out of `from` on `byte`, computed if it is missing.
-    /// The result is never `UNKNOWN`.
-    #[inline(always)]
+    /// The result is never `UNKNOWN`.  Matchers go through
+    /// [`DfaMatcher::scan`]; this is the same lookup one byte at a time,
+    /// for tests that walk the table.
+    #[cfg(test)]
     fn transition_tagged(
         &mut self,
         memory: &mut DfaMemory,
@@ -553,6 +555,7 @@ impl fmt::Debug for Tier1DfaCache {
 
 /// Whether `state` is the empty state: nothing live and no match, what the
 /// other tiers call the dead state.
+#[cfg(test)]
 fn is_empty_state(state: &super::DfaState) -> bool {
     state.nfa_states.is_empty()
         && state.deferred_asserts.is_empty()
@@ -598,17 +601,6 @@ impl<'a> DfaMatcher<'a> {
     }
 
     #[inline(always)]
-    pub fn step(&mut self, byte: u8) {
-        self.current = self
-            .cache
-            .transition_tagged(self.memory, self.current, byte, self.regex)
-            .current();
-        if self.current.is_match() {
-            self.ever_matched = true;
-        }
-    }
-
-    #[inline(always)]
     pub fn chunk(&mut self, input: &[u8]) {
         if self.ever_matched {
             return;
@@ -621,7 +613,7 @@ impl<'a> DfaMatcher<'a> {
         // time the DFA returns to the start state, not only at chunk entry.
         // Bytes are their own columns only without byte classes.  A regex
         // with 129 to 255 classes also has 256-wide rows, but its columns
-        // are classes, here as in `transition_tagged`.
+        // are classes.
         if regex.num_byte_classes == 256 {
             crate::prefilter::with_prefilter!(
                 self.prefilter,
@@ -750,9 +742,6 @@ impl fmt::Debug for DfaMatcher<'_> {
 impl fmt::Display for DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.cache.state(self.current);
-        if is_empty_state(state) {
-            return write!(f, "DFA[T1] state=DEAD matched={}", self.ever_matched);
-        }
         write!(
             f,
             "DFA[T1] state={} nfa={{{}}} matched={}",
@@ -794,8 +783,8 @@ mod tests {
 
     /// More than 128 byte classes round the row width up to 256, the width
     /// of a table without classes.  The columns are still classes: the
-    /// scanning loop and the single lookup must agree on that, or one
-    /// reads the slots the other filled as transitions on other bytes.
+    /// scanning loop and the tests' single lookup must agree on that, or
+    /// one reads the slots the other filled as transitions on other bytes.
     #[test]
     fn test_padded_rows_keep_class_columns() {
         // Bytes whose class numbers differ from their values.
@@ -816,11 +805,11 @@ mod tests {
         cache.prepare(&mut memory, &re);
         assert_eq!(cache.stride, 256);
         // Fill the rows through the single lookup, then scan.
-        let mut m = DfaMatcher::new(&mut cache, &mut memory, &re);
+        let mut current = cache.inner.start_id;
         for &b in &literal {
-            m.step(b);
+            current = cache.transition(&mut memory, current, b, &re);
         }
-        assert!(m.finish());
+        assert!(cache.inner.states[current.idx()].is_match);
         let mut m = DfaMatcher::new(&mut cache, &mut memory, &re);
         m.chunk(&literal);
         assert!(m.finish());
