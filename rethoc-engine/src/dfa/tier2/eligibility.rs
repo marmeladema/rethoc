@@ -373,10 +373,19 @@ pub(crate) fn counter_body_length(
     let mut result: Option<usize> = None;
     let mut stack: Vec<(StateIdx, usize)> = vec![(ci_out, 0)];
     let mut visited: Vec<Option<usize>> = vec![None; states.len()];
-    let mut in_stack = vec![false; states.len()];
+    visited[ci_out.idx()] = Some(0);
     while let Some((idx, depth)) = stack.pop() {
-        let i = idx.idx();
-        in_stack[i] = false;
+        let mut enqueue = |succ: StateIdx, depth| {
+            match visited[succ.idx()] {
+                Some(prev) if prev != depth => return None,
+                Some(_) => {}
+                None => {
+                    visited[succ.idx()] = Some(depth);
+                    stack.push((succ, depth));
+                }
+            }
+            Some(())
+        };
         match states[idx] {
             State::CounterIncrement { counter, .. } if counter == own_counter => match result {
                 None => result = Some(depth),
@@ -385,33 +394,11 @@ pub(crate) fn counter_body_length(
             },
             State::Split { out, out1 } => {
                 for succ in [out, out1] {
-                    let si = succ.idx();
-                    if !in_stack[si] {
-                        match visited[si] {
-                            Some(d) if d == depth => {}
-                            Some(_) => return None,
-                            None => {
-                                visited[si] = Some(depth);
-                                in_stack[si] = true;
-                                stack.push((succ, depth));
-                            }
-                        }
-                    }
+                    enqueue(succ, depth)?;
                 }
             }
             State::Assert { out, .. } | State::CounterInstance { out, .. } => {
-                let si = out.idx();
-                if !in_stack[si] {
-                    match visited[si] {
-                        Some(d) if d == depth => {}
-                        Some(_) => return None,
-                        None => {
-                            visited[si] = Some(depth);
-                            in_stack[si] = true;
-                            stack.push((out, depth));
-                        }
-                    }
-                }
+                enqueue(out, depth)?;
             }
             State::Byte { out, out_exit, .. }
             | State::ByteCI { out, out_exit, .. }
@@ -419,51 +406,18 @@ pub(crate) fn counter_body_length(
             | State::ByteClassStatic { out, out_exit, .. }
             | State::ByteClassCustom { out, out_exit, .. } => {
                 let nd = depth + 1;
-                let si = out.idx();
-                if !in_stack[si] {
-                    match visited[si] {
-                        Some(d) if d == nd => {}
-                        Some(_) => return None,
-                        None => {
-                            visited[si] = Some(nd);
-                            in_stack[si] = true;
-                            stack.push((out, nd));
-                        }
-                    }
-                }
+                enqueue(out, nd)?;
                 // The exit branch re-enters at the same depth as the
                 // consuming step (it branches post-consumption).
                 if out_exit != StateIdx::NONE {
-                    let esi = out_exit.idx();
-                    if !in_stack[esi] {
-                        match visited[esi] {
-                            Some(d) if d == nd => {}
-                            Some(_) => return None,
-                            None => {
-                                visited[esi] = Some(nd);
-                                in_stack[esi] = true;
-                                stack.push((out_exit, nd));
-                            }
-                        }
-                    }
+                    enqueue(out_exit, nd)?;
                 }
             }
             State::ByteTable { table } => {
                 let nd = depth + 1;
                 for &succ in &byte_tables[table.idx()].0 {
                     if succ != StateIdx::NONE {
-                        let si = succ.idx();
-                        if !in_stack[si] {
-                            match visited[si] {
-                                Some(d) if d == nd => {}
-                                Some(_) => return None,
-                                None => {
-                                    visited[si] = Some(nd);
-                                    in_stack[si] = true;
-                                    stack.push((succ, nd));
-                                }
-                            }
-                        }
+                        enqueue(succ, nd)?;
                     }
                 }
             }

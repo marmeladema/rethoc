@@ -6391,6 +6391,13 @@ mod tests {
                 ("bcbca", true),
             ],
         }
+        test_variable_counter_body_behind_byte_table {
+            pattern: "(a|bb|c){2,5}",
+            memory: 5183,
+            min_tier: 3,
+            inputs: [("abb", true), ("bbb", false), ("cbb", true)],
+        }
+
         // Bug 54: nested counters behind ByteTable not detected.
         // The outer {1,100} wraps alternation branches each containing
         // b{1,100} — inner counters nested inside the outer counter.
