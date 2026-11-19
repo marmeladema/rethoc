@@ -1358,6 +1358,34 @@ fn consuming_states_walk(
 // Tier 2 Matcher
 // ---------------------------------------------------------------------------
 
+/// A search can finish early with a match, or when an absolute-start
+/// pattern has lost all its threads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchStatus {
+    Searching,
+    Matched,
+    Exhausted,
+}
+
+impl SearchStatus {
+    #[inline]
+    fn from_match_flag(is_match: bool) -> Self {
+        if is_match {
+            Self::Matched
+        } else {
+            Self::Searching
+        }
+    }
+
+    /// A completed search keeps its first result.
+    #[inline]
+    fn record_match(&mut self, matched: bool) {
+        if matched && *self == Self::Searching {
+            *self = Self::Matched;
+        }
+    }
+}
+
 /// Tier 2 DFA matcher with differential counters.
 pub struct Tier2DfaMatcher<'a> {
     cache: &'a mut Tier2DfaCache,
@@ -1365,7 +1393,7 @@ pub struct Tier2DfaMatcher<'a> {
     regex: &'a Regex,
     analysis: &'a Tier2Analysis,
     current: DfaStateId,
-    ever_matched: bool,
+    status: SearchStatus,
     match_at_end: bool,
     has_live_counters: bool,
     /// Copy of [`Tier2DfaCache::settle_enabled`]: whether dead
@@ -1402,7 +1430,7 @@ impl<'a> Tier2DfaMatcher<'a> {
 
         Tier2DfaMatcher {
             current: cache.inner.start_id,
-            ever_matched: cache.inner.start_is_match,
+            status: SearchStatus::from_match_flag(cache.inner.start_is_match),
             match_at_end: cache.inner.start_is_match_at_end,
             has_live_counters: has_live,
             settle: cache.settle_enabled,
@@ -1481,7 +1509,7 @@ impl<'a> Tier2DfaMatcher<'a> {
         if !t.counts_or_seeds && !self.has_live_counters {
             self.current = t.no_break;
             self.match_at_end = t.no_break_is_match_at_end;
-            self.ever_matched = self.ever_matched || t.no_break_is_match;
+            self.status.record_match(t.no_break_is_match);
             return;
         }
 
@@ -1512,11 +1540,11 @@ impl<'a> Tier2DfaMatcher<'a> {
         // Select DFA successor and record match flags.
         if any_can_break {
             self.current = t.with_break;
-            self.ever_matched = self.ever_matched || t.with_break_is_match;
+            self.status.record_match(t.with_break_is_match);
             self.match_at_end = t.with_break_is_match_at_end;
         } else {
             self.current = t.no_break;
-            self.ever_matched = self.ever_matched || t.no_break_is_match;
+            self.status.record_match(t.no_break_is_match);
             self.match_at_end = t.no_break_is_match_at_end;
         }
 
@@ -1574,11 +1602,19 @@ impl<'a> Tier2DfaMatcher<'a> {
     }
 
     fn step_from_dead(&mut self, byte: u8) {
+        if self.status != SearchStatus::Searching {
+            return;
+        }
         if self.has_live_counters {
             self.cache.counters.reset();
             self.has_live_counters = false;
         }
         self.match_at_end = false;
+
+        if self.regex.start_anchored {
+            self.status = SearchStatus::Exhausted;
+            return;
+        }
 
         // The transition out of DEAD depends only on the byte (the
         // restart closure with that byte as predecessor), so it is cached
@@ -1610,7 +1646,7 @@ impl<'a> Tier2DfaMatcher<'a> {
 
         if trans.counting_mask == 0 {
             if trans.no_break_is_match {
-                self.ever_matched = true;
+                self.status = SearchStatus::Matched;
             }
             if trans.no_break_is_match_at_end {
                 self.match_at_end = true;
@@ -1635,7 +1671,7 @@ impl<'a> Tier2DfaMatcher<'a> {
 
     #[inline(always)]
     pub fn chunk(&mut self, input: &[u8]) {
-        if self.ever_matched {
+        if self.status != SearchStatus::Searching {
             return;
         }
 
@@ -1663,14 +1699,14 @@ impl<'a> Tier2DfaMatcher<'a> {
     fn chunk_no_prefilter(&mut self, input: &[u8]) {
         if self.cache.stride == 256 {
             for &b in input {
-                if self.ever_matched {
+                if self.status != SearchStatus::Searching {
                     return;
                 }
                 self.step_direct(b);
             }
         } else {
             for &b in input {
-                if self.ever_matched {
+                if self.status != SearchStatus::Searching {
                     return;
                 }
                 self.step(b);
@@ -1695,7 +1731,7 @@ impl<'a> Tier2DfaMatcher<'a> {
     ) {
         let mut i = 0;
         while i < input.len() {
-            if self.ever_matched {
+            if self.status != SearchStatus::Searching {
                 return;
             }
             // When at the start state, skip ahead with memchr.
@@ -1717,12 +1753,12 @@ impl<'a> Tier2DfaMatcher<'a> {
 
     #[inline]
     pub fn finish(self) -> bool {
-        self.ever_matched || self.match_at_end
+        self.ismatch() || self.match_at_end
     }
 
-    #[allow(dead_code)]
+    /// Whether a match has already been found without waiting for EOF.
     pub fn ismatch(&self) -> bool {
-        self.ever_matched
+        self.status == SearchStatus::Matched
     }
 }
 
@@ -1737,7 +1773,7 @@ impl fmt::Debug for Tier2DfaMatcher<'_> {
             s.field("is_match_at_end", &state.is_match_at_end);
             s.field("context", &state.context);
         }
-        s.field("ever_matched", &self.ever_matched)
+        s.field("status", &self.status)
             .field("match_at_end", &self.match_at_end)
             .field("has_live_counters", &self.has_live_counters)
             .field("settle", &self.settle);
@@ -1748,7 +1784,10 @@ impl fmt::Debug for Tier2DfaMatcher<'_> {
 impl fmt::Display for Tier2DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.current == DfaStateId::DEAD {
-            write!(f, "DFA[T2] state=DEAD matched={}", self.ever_matched)?;
+            write!(f, "DFA[T2] state=DEAD matched={}", self.ismatch())?;
+            if self.status == SearchStatus::Exhausted {
+                write!(f, " exhausted")?;
+            }
             if self.has_live_counters {
                 write!(f, " live_counters")?;
             }
@@ -1765,7 +1804,7 @@ impl fmt::Display for Tier2DfaMatcher<'_> {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
                 .join(","),
-            self.ever_matched,
+            self.ismatch(),
         )?;
         if state.is_match {
             write!(f, " is_match")?;
@@ -1832,6 +1871,30 @@ mod tests {
         let mut m = mem.matcher_for_tier(re, 2).unwrap();
         m.chunk(input);
         m.finish()
+    }
+
+    #[test]
+    fn private_steps_preserve_terminal_results() {
+        let re = build(r"^a{2,4}b");
+        let mut memory = MatcherMemory::default();
+        for (input, expected) in [
+            (b"aab".as_slice(), SearchStatus::Matched),
+            (b"xx".as_slice(), SearchStatus::Exhausted),
+        ] {
+            let crate::AnyMatcher::Tier2Dfa(mut m) =
+                memory.matcher_for_tier(&re, 2).expect("eligible pattern")
+            else {
+                unreachable!("forced Tier 2")
+            };
+            m.chunk(input);
+            assert_eq!(m.status, expected);
+            // Bypass the public chunk guard, including a step from DEAD.
+            for &byte in b"xxaab" {
+                m.step(byte);
+                assert_eq!(m.status, expected);
+            }
+            assert_eq!(m.finish(), expected == SearchStatus::Matched);
+        }
     }
 
     // ── Cache eviction (Bug 64) ──
@@ -2103,18 +2166,19 @@ mod tests {
     fn test_anchored_pattern_after_gap_expires() {
         // Anchored pattern: after the gap expires and the last live thread
         // dies, nothing can match any more.  The matcher ends up DEAD and
-        // stays there through the cached dead transitions.
+        // stops scanning without populating restart transitions.
         with_matcher("^foo.{0,5}bar", b"fooxxxxxxxxxx", |m| {
             assert!(m.settle);
             assert!(!m.has_live_counters);
             assert_eq!(m.current, DfaStateId::DEAD);
+            assert_eq!(m.status, SearchStatus::Exhausted);
             let populated = m
                 .cache
                 .dead_transitions
                 .iter()
                 .filter(|t| t.no_break != DfaStateId::UNPOPULATED)
                 .count();
-            assert_eq!(populated, 1, "one byte class seen while dead");
+            assert_eq!(populated, 0, "an absolute start cannot restart");
         });
         let re = build("^foo.{0,5}bar");
         let mut mem = MatcherMemory::default();
@@ -2127,7 +2191,7 @@ mod tests {
     fn test_dead_transitions_are_cached_and_cleared() {
         // Leaving the DEAD state must work through the cache as well: an
         // unanchored branch restarts from it.
-        let first = build("^foo.{0,5}bar|^qux");
+        let first = build(r"^foo.{0,5}bar|(?m:^qux)");
         let second = build("^a.{0,5}b");
         let mut memory = DfaMemory::default();
         let mut cache = Tier2DfaCache::new();
@@ -2138,7 +2202,8 @@ mod tests {
             let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &first, analysis);
             m.chunk(b"zzzzzzzzqux");
             assert_eq!(m.current, DfaStateId::DEAD);
-            assert!(!m.finish());
+            m.chunk(b"\nqux");
+            assert!(m.finish(), "line-start branch must restart at LF");
         }
         assert!(
             cache

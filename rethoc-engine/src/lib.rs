@@ -1043,6 +1043,8 @@ pub struct Regex {
     /// `Matcher::ever_matched` so that `chunk()` can short-circuit
     /// immediately.
     start_closure_matches: bool,
+    /// Every match must begin at the absolute start of the stream.
+    start_anchored: bool,
     /// `true` when this pattern can be matched using the lazy DFA
     /// (Tier 1: no counters). All supported assertion kinds are handled
     /// with exact boundary context, including CRLF line anchors.
@@ -3284,6 +3286,10 @@ impl RegexBuilder {
             byte_tables: byte_tables_slice.into_boxed_slice(),
             start_closure,
             start_closure_matches,
+            start_anchored: hir
+                .properties()
+                .look_set_prefix()
+                .contains(hir::Look::Start),
             dfa_eligible,
             dfa_assertions,
             tier2_eligible,
@@ -13531,6 +13537,46 @@ mod tests {
                 ("fooxbaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxr", false),
                 ("fooxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxbabar", true),
                 ("fooxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", false),
+            ],
+        }
+        // Bug 79: absolute-start exhaustion applies only if every branch
+        // requires it. A line-start branch can restart after LF.
+        test_absolute_start_alternation {
+            pattern: r"^a{2,40}b|^qux",
+            memory: 1137,
+            min_tier: 2,
+            inputs: [
+                ("aab", true),
+                ("qux", true),
+                ("a!aab", false),
+                ("a!\nqux", false),
+            ],
+        }
+        test_absolute_start_mixed_line_alternation {
+            pattern: r"^a{2,40}b|(?m:^qux)",
+            memory: 1173,
+            min_tier: 2,
+            inputs: [
+                ("aab", true),
+                ("qux", true),
+                ("a!\nqux", true),
+                ("a!qux", false),
+                ("a!\naab", false),
+            ],
+        }
+        // EOF can accept an anchored repetition at its bound. A subsequent
+        // byte invalidates that EOF match, even if a later suffix fits.
+        test_absolute_start_with_end {
+            pattern: r"\Aa{2,40}$",
+            memory: 993,
+            min_tier: 2,
+            inputs: [
+                ("a", false),
+                ("aa", true),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true),
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false),
+                ("aa!aa", false),
+                ("\naa", false),
             ],
         }
         // Tier 2, line anchor: leaving the dead state depends on the byte just
