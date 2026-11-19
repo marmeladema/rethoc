@@ -1143,18 +1143,12 @@ impl Tier2DfaCache {
 
     /// Whether dead counter-body states may be dropped for `regex`.
     ///
-    /// Two classes of pattern are excluded because the "body thread ⇒ live
-    /// instance" argument does not carry over to them unchanged:
-    ///
-    /// - **Overlap-proven patterns.**  Their Tier 2 eligibility rests on a
-    ///   common terminal break condition. They retain the ordinary DFA
-    ///   successor whenever several increments can fire together.
-    /// - **Assertions inside a counter body.**  A thread parked on a
-    ///   deferred body assertion has its instance cleared and re-seeded by
-    ///   `populate()`, so instance liveness is not exact for these bodies.
+    /// In an assertion-free body a thread always owns a counter instance.
+    /// This also holds for overlapping counters: their common terminal
+    /// break cannot introduce any body states or seeds. A thread parked on
+    /// a body assertion can have its instance cleared and later re-seeded.
     fn can_settle(regex: &Regex) -> bool {
         !regex.counter_body_states.is_empty()
-            && !regex.tier2_overlap_proven
             && !regex
                 .states
                 .iter()
@@ -2152,24 +2146,33 @@ mod tests {
     }
 
     #[test]
-    fn test_settle_disabled_for_overlap_proven_patterns() {
-        // Exercise the settling guard independently of overlap admission.
-        let mut re = build("foo.{0,5}bar");
-        assert!(Tier2DfaCache::can_settle(&re));
-        re.tier2_overlap_proven = true;
-        assert!(!Tier2DfaCache::can_settle(&re));
+    fn test_settle_after_overlapping_counters_expire() {
+        let pattern = "x(?:[ab]{2,4}|[bc]{2,4})$";
+        with_matcher(pattern, b"xbbbbb", |m| {
+            assert!(m.regex.tier2_overlap_proven);
+            assert!(matches!(m.regex.prefilter, Prefilter::Memchr1(b'x')));
+            assert!(at_start(m), "expiry should re-engage the x prefilter");
+        });
 
-        let analysis = re.tier2_analysis.as_ref().unwrap();
-        let mut memory = DfaMemory::default();
-        let mut cache = Tier2DfaCache::new();
-        cache.prepare(&mut memory, &re, analysis);
-        assert!(!cache.settle_enabled);
-        let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
-        m.chunk(b"fooxxxxxxxxxxxxxxxx");
-        assert!(!m.settle);
-        assert!(m.cache.settled.is_empty());
-        // The dead body state stays, as it did before settling existed.
-        assert!(has_body_state(&m));
+        let re = build(pattern);
+        let mut memory = MatcherMemory::default();
+        for (input, expected) in [
+            (b"xbbbb".as_slice(), true),
+            (b"xbbbbb", false),
+            (b"xbbbbbxbb", true),
+        ] {
+            for chunk_size in [input.len(), 1] {
+                let mut matcher = memory.matcher_for_tier(&re, 2).expect("Tier 2 overlap");
+                for chunk in input.chunks(chunk_size) {
+                    matcher.chunk(chunk);
+                }
+                assert_eq!(
+                    matcher.finish(),
+                    expected,
+                    "{input:?}, chunks of {chunk_size}"
+                );
+            }
+        }
     }
 
     #[test]
