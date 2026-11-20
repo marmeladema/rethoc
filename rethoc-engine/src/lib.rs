@@ -14892,6 +14892,76 @@ mod tests {
         Some(m.finish())
     }
 
+    #[test]
+    fn test_range_pair_stream_splits() {
+        fn run(
+            memory: &mut MatcherMemory,
+            re: &Regex,
+            backend: u8,
+            input: &[u8],
+            cuts: &[usize],
+        ) -> Option<bool> {
+            let mut matcher = match backend {
+                5 => memory.matcher_grouped(re).ok()?,
+                6 => memory.matcher_sparse(re).ok()?,
+                tier => return match_tier_chunked(memory, re, tier, input, cuts),
+            };
+            let mut prev = 0;
+            for &cut in cuts {
+                matcher.chunk(&input[prev..cut]);
+                prev = cut;
+            }
+            matcher.chunk(&input[prev..]);
+            Some(matcher.finish())
+        }
+
+        let mut covered = [false; 7];
+        for (pattern, hit, miss) in [
+            (
+                r"([0-9][0-9]?)/([0-9][0-9]?)/([0-9][0-9]([0-9][0-9])?)",
+                "9x12/3/4567",
+                "9x12/3/4",
+            ),
+            (r"[0-9]/x{2,5}z", "1/x!2/xxxz", "1/xz"),
+            (r"[0-9]/(ab|c){2,5}z", "1/a!2/abcz", "1/abz"),
+        ] {
+            let config = RegexConfig {
+                max_unroll_states: 0,
+                merge_repetitions: false,
+                grouped_nfa: GroupedNfaMode::Always,
+                sparse_counting: true,
+                ..Default::default()
+            };
+            let re = Regex::with_config(pattern, config.clone()).expect("compile pair fixture");
+            assert!(
+                matches!(re.prefilter, Prefilter::RangePair(..)),
+                "{pattern}"
+            );
+            let mut reference = Regex::with_config(pattern, config).expect("compile reference");
+            reference.prefilter = Prefilter::None;
+            let oracle = regex::bytes::Regex::new(pattern).expect("compile oracle");
+            for text in [hit, miss] {
+                let input = format!("{}{}", "7x".repeat(40), text).into_bytes();
+                let expected = oracle.is_match(&input);
+                for tier in 0..=6 {
+                    let mut memory = MatcherMemory::default();
+                    let mut reference_memory = MatcherMemory::default();
+                    for cut in 0..=input.len() {
+                        let cuts = [cut, cut];
+                        let actual = run(&mut memory, &re, tier, &input, &cuts);
+                        let baseline = run(&mut reference_memory, &reference, tier, &input, &cuts);
+                        assert_eq!(actual, baseline, "{pattern}, tier {tier}, cut {cut}");
+                        if let Some(actual) = actual {
+                            covered[tier as usize] = true;
+                            assert_eq!(actual, expected, "{pattern}, tier {tier}, cut {cut}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(covered.into_iter().all(|seen| seen), "{covered:?}");
+    }
+
     /// Long streams that repeatedly open a counted gap, let it expire, and
     /// then offer another candidate — the situation in which the counting
     /// tiers return to the start state and hand control back to the

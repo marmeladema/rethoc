@@ -2,16 +2,17 @@
 //!
 //! When the DFA is in the DEAD state (no active threads), a prefilter
 //! skips over large runs of irrelevant input at SIMD speed by scanning
-//! for bytes that can possibly begin a match.
+//! for candidate match starts.
 //!
 //! The prefilter is computed at compile time from the NFA start state's
 //! epsilon closure, collecting the set of bytes accepted by consuming
-//! states reachable without passing through assertions.
+//! states reachable without passing through assertions. Narrow ranges may
+//! also use the next consuming frontier to rule out a start using lookahead.
 
 use std::fmt;
 
 use crate::memclass::MemclassTable;
-use crate::{ByteMap, State, StateIdx};
+use crate::{ByteClassBits, ByteMap, State, StateIdx};
 
 /// A prefilter for skipping non-matching bytes in the input.
 ///
@@ -37,6 +38,9 @@ pub(crate) enum Prefilter {
     /// Used when there are more than 8 distinct start bytes but they fit
     /// within a range of at most 16 values.
     Range(u8, u8),
+    /// Two consecutive inclusive ranges. A final byte in the first range
+    /// is a candidate because the next byte may arrive in another chunk.
+    RangePair(u8, u8, u8, u8),
 }
 
 impl fmt::Display for Prefilter {
@@ -68,6 +72,10 @@ impl fmt::Display for Prefilter {
                 write!(f, "memclass({})", bytes.join(", "))
             }
             Prefilter::Range(lo, hi) => write!(f, "range(0x{:02X}..=0x{:02X})", lo, hi),
+            Prefilter::RangePair(lo, hi, next_lo, next_hi) => write!(
+                f,
+                "range_pair(0x{lo:02X}..=0x{hi:02X}, 0x{next_lo:02X}..=0x{next_hi:02X})"
+            ),
         }
     }
 }
@@ -99,6 +107,11 @@ macro_rules! with_prefilter {
                 let $find = |hay: &[u8]| $crate::memclass::memclass(&t, hay);
                 $body
             }
+            $crate::Prefilter::RangePair(lo, hi, next_lo, next_hi) => {
+                let $find =
+                    |hay: &[u8]| $crate::memrange::memrange_pair(lo, hi, next_lo, next_hi, hay);
+                $body
+            }
             $crate::Prefilter::Range(lo, hi) => {
                 let $find = |hay: &[u8]| $crate::memrange::memrange(lo, hi, hay);
                 $body
@@ -118,14 +131,15 @@ impl Prefilter {
             Self::Memchr2(a, b) => byte == *a || byte == *b,
             Self::Memchr3(a, b, c) => byte == *a || byte == *b || byte == *c,
             Self::Memclass(table) => table.contains(byte),
-            Self::Range(lo, hi) => (*lo..=*hi).contains(&byte),
+            Self::Range(lo, hi) | Self::RangePair(lo, hi, ..) => (*lo..=*hi).contains(&byte),
         }
     }
 
     /// Identify an immediate candidate before starting a bulk search.
-    /// Single literals use a word-wide comparison; the other filters check
-    /// the first byte. A miss leaves the remaining search to the caller.
-    #[inline]
+    /// Single literals use a word-wide comparison. Other filters probe only
+    /// position zero using first-byte membership. A miss leaves the full
+    /// search to the caller.
+    #[inline(always)]
     pub(crate) fn find_in_prefix(&self, hay: &[u8]) -> Option<usize> {
         if let Self::Memchr1(byte) = *self
             && let Some(word) = hay.first_chunk::<8>()
@@ -139,7 +153,8 @@ impl Prefilter {
         hay.first().filter(|&&byte| self.accepts(byte)).map(|_| 0)
     }
 
-    /// Offset of the first byte of `hay` that can start a match, or `None`
+    /// Offset of the first candidate start in `hay`, including an unconfirmed
+    /// final byte for a pair filter, or `None`
     /// if there is none.  Every byte is a candidate for [`Prefilter::None`].
     pub(crate) fn find(&self, hay: &[u8]) -> Option<usize> {
         match self {
@@ -154,112 +169,133 @@ impl Prefilter {
     }
 }
 
-/// Compute a prefilter from the NFA start state.
-///
-/// Walks epsilon transitions from `start` to collect all bytes accepted
-/// by reachable consuming states.  Follows `Split`, `CounterInstance` and
-/// `CounterIncrement` (all epsilon states; the last is only reachable
-/// when a counter body can match empty).  Bails on `Assert` (needs
-/// runtime context — left for a future improvement).
-///
-/// Returns `Prefilter::None` when no consuming states are reachable
-/// (e.g. assertions block all paths) or when the byte set is too large
-/// for any prefilter variant.  The caller is responsible for checking
-/// whether the pattern can match empty (in which case every byte is
-/// interesting and no prefilter helps).
+/// States reached at one byte offset, including zero-width transitions.
+/// Retain the visited states so their consuming successors can seed the next offset.
+struct Frontier {
+    queue: Vec<StateIdx>,
+    seen: Vec<bool>,
+}
+
+impl Frontier {
+    fn new(num_states: usize) -> Self {
+        Self {
+            queue: Vec::new(),
+            seen: vec![false; num_states],
+        }
+    }
+
+    fn push(&mut self, idx: StateIdx) {
+        if idx != StateIdx::NONE && !self.seen[idx.idx()] {
+            self.seen[idx.idx()] = true;
+            self.queue.push(idx);
+        }
+    }
+
+    /// Follow splits and collect the consuming states' bytes. Counters and
+    /// an early Match retain the single-byte approximation but rule out
+    /// refinement. An assertion makes this offset unsuitable for scanning.
+    fn collect(
+        &mut self,
+        states: &[State],
+        classes: &[ByteClassBits],
+        byte_tables: &[ByteMap],
+    ) -> Option<([bool; 256], bool)> {
+        let mut bytes = [false; 256];
+        let mut can_refine = true;
+        let mut cursor = 0;
+        while let Some(&idx) = self.queue.get(cursor) {
+            cursor += 1;
+            match states[idx] {
+                State::Split { out, out1 } => {
+                    self.push(out);
+                    self.push(out1);
+                }
+                State::CounterInstance { out, .. } => {
+                    can_refine = false;
+                    self.push(out);
+                }
+                State::CounterIncrement { out, out1, .. } => {
+                    // An empty body may reach both the next iteration and the exit.
+                    can_refine = false;
+                    self.push(out);
+                    self.push(out1);
+                }
+                State::Match => can_refine = false,
+                State::Assert { .. } => return None,
+                State::Byte { byte, .. } => bytes[usize::from(byte)] = true,
+                State::ByteCI { byte, .. } => {
+                    bytes[usize::from(byte)] = true;
+                    bytes[usize::from(byte ^ 0x20)] = true;
+                }
+                State::Wildcard { .. } => bytes.fill(true),
+                State::ByteClassStatic { table, .. } => {
+                    for (slot, &accepted) in bytes.iter_mut().zip(table) {
+                        *slot |= accepted;
+                    }
+                }
+                State::ByteClassCustom { class, .. } => {
+                    for b in 0..=255u8 {
+                        bytes[usize::from(b)] |= classes[class.idx()].contains(b);
+                    }
+                }
+                State::ByteTable { table } => {
+                    for (slot, &target) in bytes.iter_mut().zip(&byte_tables[table.idx()].0) {
+                        *slot |= target != StateIdx::NONE;
+                    }
+                }
+            }
+        }
+        Some((bytes, can_refine))
+    }
+
+    /// Advance one consuming edge from each member. Both successors of
+    /// a fused consume-and-split are reachable after the same input byte.
+    fn successors(&self, states: &[State], byte_tables: &[ByteMap]) -> Self {
+        let mut next = Self::new(states.len());
+        for &idx in &self.queue {
+            match states[idx] {
+                State::Byte { out, out_exit, .. }
+                | State::ByteCI { out, out_exit, .. }
+                | State::Wildcard { out, out_exit }
+                | State::ByteClassStatic { out, out_exit, .. }
+                | State::ByteClassCustom { out, out_exit, .. } => {
+                    next.push(out);
+                    next.push(out_exit);
+                }
+                State::ByteTable { table } => {
+                    for &target in &byte_tables[table.idx()].0 {
+                        next.push(target);
+                    }
+                }
+                State::Split { .. } => {}
+                State::Assert { .. }
+                | State::CounterInstance { .. }
+                | State::CounterIncrement { .. }
+                | State::Match => unreachable!("only refine an unconditional consuming frontier"),
+            }
+        }
+        next
+    }
+}
+
+/// Compute a start filter for a pattern that does not match the empty string.
+/// A narrow first-byte range may also restrict the following byte when
+/// every starting path consumes two bytes without passing a counter or assertion.
 pub(crate) fn compute_prefilter(
     start: StateIdx,
     states: &[State],
-    classes: &[crate::ByteClassBits],
+    classes: &[ByteClassBits],
     byte_tables: &[ByteMap],
 ) -> Prefilter {
-    let mut start_bytes = [false; 256];
-    let mut stack = vec![start];
-    let mut visited = vec![false; states.len()];
-    let mut found_any = false;
-
-    while let Some(idx) = stack.pop() {
-        let i = idx.idx();
-        if i >= states.len() || visited[i] {
-            continue;
-        }
-        visited[i] = true;
-        match states[idx] {
-            State::Split { out, out1 } => {
-                stack.push(out);
-                stack.push(out1);
-            }
-            // CounterInstance is an epsilon state — follow through to
-            // find consuming bytes in the counter body.
-            State::CounterInstance { out, .. } => {
-                stack.push(out);
-            }
-            State::Byte { byte, .. } => {
-                start_bytes[byte as usize] = true;
-                found_any = true;
-            }
-            State::ByteCI { byte, .. } => {
-                start_bytes[byte as usize] = true;
-                start_bytes[(byte ^ 0x20) as usize] = true;
-                found_any = true;
-            }
-            State::Wildcard { .. } => {
-                for b in 0..=255u8 {
-                    start_bytes[b as usize] = true;
-                }
-                found_any = true;
-            }
-            State::ByteClassStatic { table, .. } => {
-                for b in 0..=255u8 {
-                    if table[b as usize] {
-                        start_bytes[b as usize] = true;
-                    }
-                }
-                found_any = true;
-            }
-            State::ByteClassCustom { class, .. } => {
-                for b in 0..=255u8 {
-                    if classes[class.idx()].contains(b) {
-                        start_bytes[b as usize] = true;
-                    }
-                }
-                found_any = true;
-            }
-            State::ByteTable { table, .. } => {
-                for b in 0..=255u8 {
-                    if byte_tables[table.idx()].0[b as usize] != StateIdx::NONE {
-                        start_bytes[b as usize] = true;
-                    }
-                }
-                found_any = true;
-            }
-            // Assert states need runtime context.  Bail entirely —
-            // including bytes behind assertions would produce a
-            // prefilter that finds candidates the DFA re-seeding
-            // can't process (start_closure is empty when asserts
-            // are present).
-            State::Assert { .. } => {
-                return Prefilter::None;
-            }
-            // A CounterIncrement is only reachable here, without consuming
-            // a byte, when its body can match empty.  The match can then go
-            // on past it: around the loop again, or out through the break
-            // once enough (possibly empty) iterations are done.  Follow
-            // both, so that the bytes after the repetition are candidates
-            // too.  A superset of the true start bytes is always sound.
-            State::CounterIncrement { out, out1, .. } => {
-                stack.push(out);
-                stack.push(out1);
-            }
-            State::Match => {}
-        }
-    }
-
-    if !found_any {
+    let mut first = Frontier::new(states.len());
+    first.push(start);
+    let Some((start_bytes, can_refine)) = first.collect(states, classes, byte_tables) else {
         return Prefilter::None;
-    }
+    };
 
-    let bytes: Vec<u8> = (0..=255u8).filter(|&b| start_bytes[b as usize]).collect();
+    let bytes: Vec<u8> = (0..=255u8)
+        .filter(|&b| start_bytes[usize::from(b)])
+        .collect();
     match bytes.len() {
         0 => Prefilter::None,
         1 => Prefilter::Memchr1(bytes[0]),
@@ -269,11 +305,24 @@ pub(crate) fn compute_prefilter(
         _ => {
             let lo = bytes[0];
             let hi = bytes[bytes.len() - 1];
-            if hi - lo < 16 {
-                Prefilter::Range(lo, hi)
-            } else {
-                Prefilter::None
+            if hi - lo >= 16 {
+                return Prefilter::None;
             }
+            if can_refine
+                && let Some((next_bytes, true)) =
+                    first
+                        .successors(states, byte_tables)
+                        .collect(states, classes, byte_tables)
+            {
+                let accepted = |b: &u8| next_bytes[usize::from(*b)];
+                if let (Some(next_lo), Some(next_hi)) =
+                    ((0..=255u8).find(accepted), (0..=255u8).rfind(accepted))
+                    && next_hi - next_lo < 16
+                {
+                    return Prefilter::RangePair(lo, hi, next_lo, next_hi);
+                }
+            }
+            Prefilter::Range(lo, hi)
         }
     }
 }
@@ -333,6 +382,7 @@ mod tests {
             Prefilter::Memchr3(1, 127, 254),
             Prefilter::Memclass(MemclassTable::new(&[0, 15, 240, 255])),
             Prefilter::Range(176, 191),
+            Prefilter::RangePair(120, 130, 250, 255),
         ];
         for filter in filters {
             for byte in 0..=255 {
@@ -415,6 +465,78 @@ mod tests {
     fn test_dot_star_no_prefilter() {
         // .* matches everything — no useful prefilter.
         assert!(matches!(prefilter_for(".*"), Prefilter::None));
+    }
+
+    #[test]
+    fn range_pair_date() {
+        let re = Regex::new("([0-9][0-9]?)/([0-9][0-9]?)/([0-9][0-9]([0-9][0-9])?)")
+            .expect("valid date pattern");
+        assert!(matches!(
+            re.prefilter,
+            Prefilter::RangePair(b'0', b'9', b'/', b'9')
+        ));
+        assert_eq!(re.info().prefilter, "range_pair(0x30..=0x39, 0x2F..=0x39)");
+        assert!(
+            re.dump(false)
+                .to_string()
+                .contains("RangePair(48, 57, 47, 57)")
+        );
+        assert_eq!(re.prefilter.find_in_prefix(b"2/"), Some(0));
+        assert_eq!(re.prefilter.find_in_prefix(b"2"), Some(0));
+        assert_eq!(re.prefilter.find_in_prefix(b"2x3/"), Some(0));
+        assert_eq!(re.prefilter.find(b"2x3/"), Some(2));
+    }
+
+    #[test]
+    fn range_pair_includes_exit_from_first_consumer() {
+        assert!(matches!(
+            prefilter_for("[0-9]{1,2}/"),
+            Prefilter::RangePair(b'0', b'9', b'/', b'9')
+        ));
+        assert!(matches!(
+            prefilter_for("[0-9]{1,2}"),
+            Prefilter::Range(b'0', b'9')
+        ));
+    }
+
+    #[test]
+    fn range_pair_byte_table_uses_all_destinations() {
+        let re = Regex::new("0a|1b|2c|3d|4e|5f|6g|7h|8i|9j").expect("valid alternation");
+        assert!(matches!(re.states[re.start], State::ByteTable { .. }));
+        assert!(matches!(
+            re.prefilter,
+            Prefilter::RangePair(b'0', b'9', b'a', b'j')
+        ));
+        let mut memory = crate::MatcherMemory::default();
+        for offset in 0..10 {
+            let mut matcher = memory.matcher(&re);
+            matcher.chunk(&[b'0' + offset, b'a' + offset]);
+            assert!(matcher.finish());
+        }
+    }
+
+    #[test]
+    fn range_pair_refinement_guards() {
+        for pattern in [r"[0-9]\b/", "[0-9][az]", "[0-9](?i:a)"] {
+            assert!(
+                matches!(prefilter_for(pattern), Prefilter::Range(b'0', b'9')),
+                "{pattern}"
+            );
+        }
+        for pattern in ["^[0-9]/", "[0-9]?"] {
+            assert!(
+                matches!(prefilter_for(pattern), Prefilter::None),
+                "{pattern}"
+            );
+        }
+        assert!(matches!(
+            prefilter_for_no_unroll("[0-9]{2,5}/"),
+            Prefilter::Range(b'0', b'9')
+        ));
+        assert!(matches!(
+            prefilter_for("[0-9]/"),
+            Prefilter::RangePair(b'0', b'9', b'/', b'/')
+        ));
     }
 
     // ── CounterInstance follow-through ──

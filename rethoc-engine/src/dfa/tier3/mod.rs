@@ -3755,6 +3755,13 @@ impl<'a> Tier3DfaMatcher<'a> {
                     |hay| crate::memrange::memrange(lo, hi, hay),
                 );
             }
+            Prefilter::RangePair(lo, hi, next_lo, next_hi) => {
+                self.chunk_impl::<true>(
+                    input,
+                    |x| lo <= x && x <= hi,
+                    |hay| crate::memrange::memrange_pair(lo, hi, next_lo, next_hi, hay),
+                );
+            }
         }
     }
 

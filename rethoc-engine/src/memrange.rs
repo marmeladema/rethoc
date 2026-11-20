@@ -2,6 +2,8 @@
 //!
 //! `memrange(lo, hi, haystack)` finds the index of the first byte `b` in
 //! `haystack` satisfying `lo <= b <= hi`.
+//! The pair prefilter compares adjacent bytes against two ranges, retaining
+//! a candidate at the end of a chunk when its successor is still unknown.
 //!
 //! **Core insight**: `clamp(x, lo, hi) == x` iff `lo <= x <= hi`.
 //! In vector ops: `cmpeq(min(max(x, lo), hi), x)` — 3 SIMD ops per chunk.
@@ -23,6 +25,43 @@ pub fn memrange(lo: u8, hi: u8, haystack: &[u8]) -> Option<usize> {
         return None;
     }
     imp::memrange(lo, hi, haystack)
+}
+
+/// Find the first possible start of two adjacent inclusive ranges. A final
+/// byte in the first range is a candidate even without its successor, so a
+/// streaming caller can consume it before the next chunk arrives.
+#[inline]
+pub(crate) fn memrange_pair(
+    lo: u8,
+    hi: u8,
+    next_lo: u8,
+    next_hi: u8,
+    haystack: &[u8],
+) -> Option<usize> {
+    debug_assert!(lo <= hi && next_lo <= next_hi);
+    imp::memrange_pair(lo, hi, next_lo, next_hi, haystack)
+}
+
+#[inline]
+fn memrange_pair_fallback(
+    lo: u8,
+    hi: u8,
+    next_lo: u8,
+    next_hi: u8,
+    haystack: &[u8],
+) -> Option<usize> {
+    let mut rest = haystack;
+    while let Some((&byte, tail)) = rest.split_first() {
+        if (lo..=hi).contains(&byte)
+            && tail
+                .first()
+                .is_none_or(|next| (next_lo..=next_hi).contains(next))
+        {
+            return Some(haystack.len() - rest.len());
+        }
+        rest = tail;
+    }
+    None
 }
 
 /// Scalar fallback: simple byte-at-a-time loop.
@@ -47,7 +86,7 @@ pub fn memrange_scalar(lo: u8, hi: u8, haystack: &[u8]) -> Option<usize> {
 // ---------------------------------------------------------------------------
 #[cfg(target_arch = "x86_64")]
 mod imp {
-    use super::memrange_fallback;
+    use super::{memrange_fallback, memrange_pair_fallback};
     use core::arch::x86_64::*;
 
     #[inline]
@@ -75,6 +114,86 @@ mod imp {
             unsafe { memrange_sse2(lo, hi, rest) }
         };
         offset.map(|i| SSE2_WIDTH + i)
+    }
+
+    #[inline]
+    pub(super) fn memrange_pair(
+        lo: u8,
+        hi: u8,
+        next_lo: u8,
+        next_hi: u8,
+        haystack: &[u8],
+    ) -> Option<usize> {
+        if haystack.len() > AVX2_WIDTH && is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 was detected at runtime.
+            return unsafe { memrange_pair_avx2(lo, hi, next_lo, next_hi, haystack) };
+        }
+        memrange_pair_sse2(lo, hi, next_lo, next_hi, haystack)
+    }
+
+    #[inline]
+    pub(super) fn memrange_pair_sse2(
+        lo: u8,
+        hi: u8,
+        next_lo: u8,
+        next_hi: u8,
+        haystack: &[u8],
+    ) -> Option<usize> {
+        let mut offset = 0;
+        while haystack.len() - offset > SSE2_WIDTH {
+            // SAFETY: SSE2 is baseline on x86_64 and both unaligned loads
+            // fit in the SSE2_WIDTH + 1 remaining bytes.
+            let bits = unsafe {
+                let ptr = haystack.as_ptr().add(offset);
+                let first = _mm_loadu_si128(ptr.cast());
+                let second = _mm_loadu_si128(ptr.add(1).cast());
+                test_sse2(first, _mm_set1_epi8(lo as i8), _mm_set1_epi8(hi as i8))
+                    & test_sse2(
+                        second,
+                        _mm_set1_epi8(next_lo as i8),
+                        _mm_set1_epi8(next_hi as i8),
+                    )
+            };
+            if bits != 0 {
+                return Some(offset + bits.trailing_zeros() as usize);
+            }
+            offset += SSE2_WIDTH;
+        }
+        memrange_pair_fallback(lo, hi, next_lo, next_hi, &haystack[offset..]).map(|i| offset + i)
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn memrange_pair_avx2(
+        lo: u8,
+        hi: u8,
+        next_lo: u8,
+        next_hi: u8,
+        haystack: &[u8],
+    ) -> Option<usize> {
+        let mut offset = 0;
+        while haystack.len() - offset > AVX2_WIDTH {
+            // SAFETY: AVX2 is enabled and both unaligned loads fit in the
+            // AVX2_WIDTH + 1 remaining bytes.
+            let bits = unsafe {
+                let ptr = haystack.as_ptr().add(offset);
+                let first = _mm256_loadu_si256(ptr.cast());
+                let second = _mm256_loadu_si256(ptr.add(1).cast());
+                test_avx2(
+                    first,
+                    _mm256_set1_epi8(lo as i8),
+                    _mm256_set1_epi8(hi as i8),
+                ) & test_avx2(
+                    second,
+                    _mm256_set1_epi8(next_lo as i8),
+                    _mm256_set1_epi8(next_hi as i8),
+                )
+            };
+            if bits != 0 {
+                return Some(offset + bits.trailing_zeros() as usize);
+            }
+            offset += AVX2_WIDTH;
+        }
+        memrange_pair_fallback(lo, hi, next_lo, next_hi, &haystack[offset..]).map(|i| offset + i)
     }
 
     // -- SSE2 (16 bytes per iteration) --
@@ -213,7 +332,7 @@ mod imp {
 // compiled without NEON fall through to the scalar fallback.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 mod imp {
-    use super::memrange_fallback;
+    use super::{memrange_fallback, memrange_pair_fallback};
     use core::arch::aarch64::*;
 
     const NEON_WIDTH: usize = 16;
@@ -222,6 +341,67 @@ mod imp {
     pub(super) fn memrange(lo: u8, hi: u8, haystack: &[u8]) -> Option<usize> {
         // SAFETY: NEON availability guaranteed by cfg(target_feature = "neon").
         unsafe { memrange_neon(lo, hi, haystack) }
+    }
+
+    #[inline]
+    pub(super) fn memrange_pair(
+        lo: u8,
+        hi: u8,
+        next_lo: u8,
+        next_hi: u8,
+        haystack: &[u8],
+    ) -> Option<usize> {
+        // Packing byte flags into nibbles below assumes little-endian lanes.
+        if cfg!(target_endian = "big") {
+            return memrange_pair_fallback(lo, hi, next_lo, next_hi, haystack);
+        }
+        let Some(last) = haystack.len().checked_sub(NEON_WIDTH) else {
+            return memrange_pair_fallback(lo, hi, next_lo, next_hi, haystack);
+        };
+        // SAFETY: NEON is enabled by this module's cfg. While offset < last
+        // at least NEON_WIDTH + 1 bytes remain, so both unaligned loads fit.
+        // The final load covers exactly the last NEON_WIDTH bytes.
+        unsafe {
+            let lo_vec = vdupq_n_u8(lo);
+            let span = vdupq_n_u8(hi - lo);
+            let next_lo_vec = vdupq_n_u8(next_lo);
+            let next_span = vdupq_n_u8(next_hi - next_lo);
+            let ptr = haystack.as_ptr();
+            let mut offset = 0;
+            while offset < last {
+                let first = vld1q_u8(ptr.add(offset));
+                let second = vld1q_u8(ptr.add(offset + 1));
+                // Unsigned wrapping subtraction maps the inclusive range to
+                // zero through its span, including when the range crosses 127.
+                let a = vcleq_u8(vsubq_u8(first, lo_vec), span);
+                let b = vcleq_u8(vsubq_u8(second, next_lo_vec), next_span);
+                if let Some(lane) = first_pair_lane(vandq_u8(a, b)) {
+                    return Some(offset + lane);
+                }
+                offset += NEON_WIDTH;
+            }
+
+            // Overlap the last block to avoid a scalar tail on short lines.
+            // Earlier starts in the overlap have already been ruled out.
+            // Shifting the final B mask leaves an unconditional B in lane
+            // 15, retaining the possible cross-chunk start at the last byte.
+            let tail = vld1q_u8(ptr.add(last));
+            let a = vcleq_u8(vsubq_u8(tail, lo_vec), span);
+            let b = vcleq_u8(vsubq_u8(tail, next_lo_vec), next_span);
+            let next = vextq_u8::<1>(b, vdupq_n_u8(0xff));
+            first_pair_lane(vandq_u8(a, next)).map(|lane| last + lane)
+        }
+    }
+
+    /// Pack the sixteen byte flags into nibbles in one scalar register.
+    #[inline(always)]
+    unsafe fn first_pair_lane(mask: uint8x16_t) -> Option<usize> {
+        // SAFETY: NEON is enabled by this module's cfg; only register lanes are accessed.
+        unsafe {
+            let nibbles = vshrn_n_u16::<4>(vreinterpretq_u16_u8(mask));
+            let bits = vget_lane_u64::<0>(vreinterpret_u64_u8(nibbles));
+            (bits != 0).then(|| bits.trailing_zeros() as usize / 4)
+        }
     }
 
     /// NEON: 16 bytes per iteration.
@@ -306,11 +486,22 @@ mod imp {
     all(target_arch = "aarch64", target_feature = "neon")
 )))]
 mod imp {
-    use super::memrange_fallback;
+    use super::{memrange_fallback, memrange_pair_fallback};
 
     #[inline]
     pub(super) fn memrange(lo: u8, hi: u8, haystack: &[u8]) -> Option<usize> {
         memrange_fallback(lo, hi, haystack)
+    }
+
+    #[inline]
+    pub(super) fn memrange_pair(
+        lo: u8,
+        hi: u8,
+        next_lo: u8,
+        next_hi: u8,
+        haystack: &[u8],
+    ) -> Option<usize> {
+        memrange_pair_fallback(lo, hi, next_lo, next_hi, haystack)
     }
 }
 
@@ -319,7 +510,88 @@ mod imp {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
-    use super::memrange;
+    use super::{memrange, memrange_pair, memrange_pair_fallback};
+
+    fn check_pair(lo: u8, hi: u8, next_lo: u8, next_hi: u8, hay: &[u8]) {
+        let expected = hay
+            .windows(2)
+            .position(|pair| (lo..=hi).contains(&pair[0]) && (next_lo..=next_hi).contains(&pair[1]))
+            .or_else(|| {
+                hay.last()
+                    .filter(|b| (lo..=hi).contains(b))
+                    .map(|_| hay.len() - 1)
+            });
+        let check = |name, result| {
+            assert_eq!(
+                expected, result,
+                "{name}({lo}, {hi}, {next_lo}, {next_hi}, {hay:?})"
+            )
+        };
+        check("dispatch", memrange_pair(lo, hi, next_lo, next_hi, hay));
+        check(
+            "scalar",
+            memrange_pair_fallback(lo, hi, next_lo, next_hi, hay),
+        );
+        #[cfg(target_arch = "x86_64")]
+        check(
+            "sse2",
+            super::imp::memrange_pair_sse2(lo, hi, next_lo, next_hi, hay),
+        );
+    }
+
+    #[test]
+    fn pairs_at_vector_boundaries() {
+        let mut buf = [0; 128];
+        for shift in 0..32 {
+            for len in [0, 1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+                let hay = &mut buf[shift..shift + len];
+                hay.fill(b'x');
+                check_pair(b'0', b'9', b'/', b'9', hay);
+                for i in 0..len {
+                    // First range alone, possibly at the unconfirmed final byte.
+                    hay[i] = b'0';
+                    check_pair(b'0', b'9', b'/', b'9', hay);
+                    if i + 1 < len {
+                        hay[i + 1] = b'/';
+                        check_pair(b'0', b'9', b'/', b'9', hay);
+                        hay[i + 1] = b'x';
+                    }
+                    hay[i] = b'x';
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pair_ranges_agree_with_specification() {
+        let mut buf = [0; 256];
+        let mut state = 0xDEAD_BEEFu32;
+        for b in &mut buf {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (state >> 16) as u8;
+        }
+        for (lo, hi, next_lo, next_hi) in [
+            (0, 0, 255, 255),
+            (128, 255, 0, 127),
+            (0, 255, 127, 128),
+            (127, 128, 0, 255),
+            (0, 31, 10, 40),
+        ] {
+            for start in 0..32 {
+                for len in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 128, 192] {
+                    check_pair(lo, hi, next_lo, next_hi, &buf[start..start + len]);
+                }
+            }
+        }
+        // A and B occur in unrelated lanes before two overlapping real
+        // pairs and a final A. Only the first real pair should be returned.
+        buf.fill(b'x');
+        buf[3] = b'0';
+        buf[8] = b'/';
+        buf[31..34].copy_from_slice(b"987");
+        buf[255] = b'9';
+        check_pair(b'0', b'9', b'/', b'9', &buf);
+    }
 
     #[test]
     fn empty_haystack() {

@@ -848,7 +848,7 @@ impl GroupedStream {
             } else if skip && self.live == 0 {
                 // The closure of an empty frontier is the start closure,
                 // the same at every boundary, without a match; a byte the
-                // prefilter rules out leaves the frontier empty.
+                // skips starts that cannot match with the available input.
                 match prefilter.find(&input[i..]) {
                     Some(0) => {}
                     Some(off) => {
