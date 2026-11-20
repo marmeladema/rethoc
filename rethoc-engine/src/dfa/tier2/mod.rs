@@ -206,11 +206,9 @@ struct Transition {
     /// DFA successor when no counter instance can break.
     no_break: DfaStateId,
     no_break_is_match: bool,
-    no_break_is_match_at_end: bool,
     /// DFA successor when at least one instance can break.
     with_break: DfaStateId,
     with_break_is_match: bool,
-    with_break_is_match_at_end: bool,
     /// True if this transition crosses at least one CInc node.
 
     /// Bitmask: bit `i` set means counter `i` fires CInc at this transition.
@@ -251,10 +249,8 @@ impl Transition {
         Self {
             no_break: DfaStateId::UNPOPULATED,
             no_break_is_match: false,
-            no_break_is_match_at_end: false,
             with_break: DfaStateId::UNPOPULATED,
             with_break_is_match: false,
-            with_break_is_match_at_end: false,
             counting_mask: 0,
             pre_seeds: Box::new([]),
             counts_or_seeds: false,
@@ -994,16 +990,14 @@ impl Tier2DfaCache {
             );
             let nb_id = self.intern_closure_result(&cr_nb, byte, regex);
             let wb_id = self.intern_closure_result(&probe, byte, regex);
-            let (nb_m, nb_mae) = self.match_flags(nb_id);
-            let (wb_m, wb_mae) = self.match_flags(wb_id);
+            let nb_m = self.is_match(nb_id);
+            let wb_m = self.is_match(wb_id);
 
             Transition {
                 no_break: nb_id,
                 no_break_is_match: nb_m || resolved_is_match,
-                no_break_is_match_at_end: nb_mae,
                 with_break: wb_id,
                 with_break_is_match: wb_m || resolved_is_match,
-                with_break_is_match_at_end: wb_mae,
                 counting_mask,
                 counts_or_seeds,
                 idle_self_loop: false,
@@ -1014,15 +1008,13 @@ impl Tier2DfaCache {
             }
         } else {
             let id = self.intern_closure_result(&probe, byte, regex);
-            let (m, mae) = self.match_flags(id);
+            let m = self.is_match(id);
 
             Transition {
                 no_break: id,
                 no_break_is_match: m || resolved_is_match,
-                no_break_is_match_at_end: mae,
                 with_break: id,
                 with_break_is_match: m || resolved_is_match,
-                with_break_is_match_at_end: mae,
                 counting_mask: 0,
                 counts_or_seeds,
                 idle_self_loop: id == from && !counts_or_seeds && !m && !resolved_is_match,
@@ -1198,13 +1190,8 @@ impl Tier2DfaCache {
         .expect("DFA state cap reached although room was made")
     }
 
-    fn match_flags(&self, id: DfaStateId) -> (bool, bool) {
-        if id == DfaStateId::DEAD {
-            (false, false)
-        } else {
-            let s = &self.inner.states[id.idx()];
-            (s.is_match, s.is_match_at_end)
-        }
+    fn is_match(&self, id: DfaStateId) -> bool {
+        id != DfaStateId::DEAD && self.inner.states[id.idx()].is_match
     }
 
     fn clear(&mut self, memory: &mut DfaMemory, num_nfa_states: usize, stride: usize) {
@@ -1409,7 +1396,6 @@ pub struct Tier2DfaMatcher<'a> {
     analysis: &'a Tier2Analysis,
     current: DfaStateId,
     status: SearchStatus,
-    match_at_end: bool,
     has_live_counters: bool,
     /// Copy of [`Tier2DfaCache::settle_enabled`]: whether dead
     /// counter-body states may be dropped from the DFA state once no
@@ -1446,7 +1432,6 @@ impl<'a> Tier2DfaMatcher<'a> {
         Tier2DfaMatcher {
             current: cache.inner.start_id,
             status: SearchStatus::from_match_flag(cache.inner.start_is_match),
-            match_at_end: cache.inner.start_is_match_at_end,
             has_live_counters: has_live,
             settle: cache.settle_enabled,
             cache,
@@ -1524,7 +1509,6 @@ impl<'a> Tier2DfaMatcher<'a> {
         // Fast path: non-counting, no seeds, no live counters.
         if !t.counts_or_seeds && !self.has_live_counters {
             self.current = t.no_break;
-            self.match_at_end = t.no_break_is_match_at_end;
             self.status.record_match(t.no_break_is_match);
             return t.idle_self_loop;
         }
@@ -1557,11 +1541,9 @@ impl<'a> Tier2DfaMatcher<'a> {
         if any_can_break {
             self.current = t.with_break;
             self.status.record_match(t.with_break_is_match);
-            self.match_at_end = t.with_break_is_match_at_end;
         } else {
             self.current = t.no_break;
             self.status.record_match(t.no_break_is_match);
-            self.match_at_end = t.no_break_is_match_at_end;
         }
 
         // Apply counter_reset: clear instances for counters whose body
@@ -1610,8 +1592,8 @@ impl<'a> Tier2DfaMatcher<'a> {
         // listed in the successor carry no thread: continue from the same
         // state without them, so that later transitions stop counting and
         // — back in the start state — the prefilter can re-engage.
-        // `match_at_end` is left alone: the settled state keeps the match
-        // flags, and the flag set above describes this position.
+        // The settled state keeps the match flags, so the answer at end of
+        // input does not change.
         if self.settle && !self.has_live_counters && self.current != DfaStateId::DEAD {
             self.current = self.cache.settled_state(self.current, self.regex);
         }
@@ -1626,7 +1608,6 @@ impl<'a> Tier2DfaMatcher<'a> {
             self.cache.counters.reset();
             self.has_live_counters = false;
         }
-        self.match_at_end = false;
 
         if self.regex.start_anchored {
             self.status = SearchStatus::Exhausted;
@@ -1661,13 +1642,8 @@ impl<'a> Tier2DfaMatcher<'a> {
             return;
         }
 
-        if trans.counting_mask == 0 {
-            if trans.no_break_is_match {
-                self.status = SearchStatus::Matched;
-            }
-            if trans.no_break_is_match_at_end {
-                self.match_at_end = true;
-            }
+        if trans.counting_mask == 0 && trans.no_break_is_match {
+            self.status = SearchStatus::Matched;
         }
 
         // Ensure counter phases are populated before counter ops.
@@ -1787,7 +1763,22 @@ impl<'a> Tier2DfaMatcher<'a> {
 
     #[inline]
     pub fn finish(self) -> bool {
-        self.ismatch() || self.match_at_end
+        self.ismatch() || self.match_at_end()
+    }
+
+    /// Whether the stream matches if it ends here: a property of the
+    /// current state.  Every successor is entered with its own flag, a
+    /// settled state keeps the flag of the state it replaces, and the DEAD
+    /// state accepts nothing, so the matcher does not track it per byte.
+    #[inline]
+    fn match_at_end(&self) -> bool {
+        // A stream that ends where it started, as most short ones do,
+        // needs no lookup: the start state's flag is kept with the cache.
+        if self.current == DfaStateId::START {
+            return self.cache.inner.start_is_match_at_end;
+        }
+        self.current != DfaStateId::DEAD
+            && self.cache.inner.states[self.current.idx()].is_match_at_end
     }
 
     /// Whether a match has already been found without waiting for EOF.
@@ -1808,7 +1799,7 @@ impl fmt::Debug for Tier2DfaMatcher<'_> {
             s.field("context", &state.context);
         }
         s.field("status", &self.status)
-            .field("match_at_end", &self.match_at_end)
+            .field("match_at_end", &self.match_at_end())
             .field("has_live_counters", &self.has_live_counters)
             .field("settle", &self.settle);
         s.finish()
@@ -1843,7 +1834,7 @@ impl fmt::Display for Tier2DfaMatcher<'_> {
         if state.is_match {
             write!(f, " is_match")?;
         }
-        if self.match_at_end {
+        if self.match_at_end() {
             write!(f, " mae")?;
         }
         if !state.deferred_asserts.is_empty() {
@@ -2002,6 +1993,29 @@ mod tests {
     }
 
     #[test]
+    fn test_finish_on_the_start_state_uses_its_flag() {
+        // A stream that ends on the start state takes its answer from the
+        // flag kept with the cache, not from the state table.  The two
+        // agree, whether the start state accepts at end of input or not.
+        for (pattern, accepts) in [("foo.{0,5}bar|$", true), ("foo.{0,5}bar", false)] {
+            for input in [b"".as_slice(), b"z", b"zz"] {
+                with_matcher(pattern, input, |m| {
+                    assert_eq!(m.current, DfaStateId::START, "`{pattern}` on {input:?}");
+                    assert_eq!(m.cache.inner.start_is_match_at_end, accepts);
+                    assert_eq!(m.cache.inner.states[0].is_match_at_end, accepts);
+                    assert_eq!(m.match_at_end(), accepts, "`{pattern}` on {input:?}");
+                });
+            }
+            // Anywhere else the state's own flag answers.
+            with_matcher(pattern, b"zfo", |m| {
+                assert_ne!(m.current, DfaStateId::START);
+                let state = &m.cache.inner.states[m.current.idx()];
+                assert_eq!(m.match_at_end(), state.is_match_at_end);
+            });
+        }
+    }
+
+    #[test]
     fn end_through_split_sets_exact_flag_without_parking() {
         for (pattern, input, accepted) in [
             (r"a{2,4}$(?:x)?", b"aa".as_slice(), true),
@@ -2012,7 +2026,7 @@ mod tests {
             with_matcher(pattern, input, |m| {
                 let state = &m.cache.inner.states[m.current.idx()];
                 assert!(state.deferred_asserts.is_empty(), "{pattern}");
-                assert_eq!(m.match_at_end, accepted, "{pattern} on {input:?}");
+                assert_eq!(m.match_at_end(), accepted, "{pattern} on {input:?}");
             });
         }
     }
@@ -2110,7 +2124,7 @@ mod tests {
             cache.prepare(&mut memory, &re, analysis);
             let mut whole = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
             whole.chunk(input);
-            let expected = (whole.current, whole.has_live_counters, whole.match_at_end);
+            let expected = (whole.current, whole.has_live_counters, whole.match_at_end());
 
             let mut memory = DfaMemory::default();
             let mut cache = Tier2DfaCache::new();
@@ -2119,7 +2133,7 @@ mod tests {
             m.chunk(&input[..split]);
             m.chunk(&input[split..]);
             assert_eq!(
-                (m.current, m.has_live_counters, m.match_at_end),
+                (m.current, m.has_live_counters, m.match_at_end()),
                 expected,
                 "split at {split}"
             );
@@ -2371,9 +2385,9 @@ mod tests {
     fn test_settle_preserves_match_at_end() {
         // The gap runs into `$`: at the bound the stream may end in a
         // match; one byte later it may not, and the matcher is at start.
-        with_matcher("foo.{0,5}$", b"fooxxxxx", |m| assert!(m.match_at_end));
+        with_matcher("foo.{0,5}$", b"fooxxxxx", |m| assert!(m.match_at_end()));
         with_matcher("foo.{0,5}$", b"fooxxxxxx", |m| {
-            assert!(!m.match_at_end);
+            assert!(!m.match_at_end());
             assert!(at_start(m));
         });
         let re = build("foo.{0,5}$");
