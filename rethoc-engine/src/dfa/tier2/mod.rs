@@ -609,8 +609,11 @@ impl CounterState {
     /// Advance active_phase for every counter (called on every byte).
     #[inline]
     fn advance_all_phases(&mut self) {
+        // Wrap by comparison: `%` is a division on every byte, also when a
+        // one-byte body has a single phase.
         for m in &mut self.meta {
-            m.active_phase = (m.active_phase + 1) % m.num_phases;
+            let next = m.active_phase + 1;
+            m.active_phase = if next == m.num_phases { 0 } else { next };
         }
     }
 
@@ -619,7 +622,12 @@ impl CounterState {
     fn seed(&mut self, c_idx: usize, initial_value: u32) {
         let m = &self.meta[c_idx];
         let nph = m.num_phases;
-        let target_phase = (m.active_phase + nph - 1) % nph;
+        // The phase before the active one, wrapped the same way.
+        let target_phase = if m.active_phase == 0 {
+            nph - 1
+        } else {
+            m.active_phase - 1
+        };
         let phase_idx = m.phase_start + target_phase;
         let was_empty = self.phases[phase_idx].is_empty();
         self.phases[phase_idx].alloc_new_with_value(initial_value);
