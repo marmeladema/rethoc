@@ -196,6 +196,126 @@ struct CounterMeta {
 // Transition
 // ---------------------------------------------------------------------------
 
+/// A successor in a cached transition: a state index with tag bits on top.
+///
+/// The low bits index [`DfaCache::states`].  The tags say what the scanning
+/// loop has to know about the edge, so that one comparison
+/// ([`is_tagged`](Self::is_tagged)) tells an edge that only moves the
+/// current state from every other kind: not computed yet, into the DEAD
+/// state, a match, or one that counts or seeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Tier2StateId(u32);
+
+impl Tier2StateId {
+    // Two kinds of constant.  One of type `Self` is a complete value, which
+    // an entry or the current state can be equal to: `UNKNOWN`, `START`,
+    // `DEAD`.  One named `*_TAG` is a single bit, a `u32` that the methods
+    // below combine with a state index and that nothing compares an id with.
+    // `MAX` is neither: the largest index, and the mask of the index bits.
+    //
+    // A tag that Tier 1 has too has the value it has in `Tier1StateId`: the
+    // match tag, and `UNKNOWN`.  Bit 29 is Tier 1's start tag and is left
+    // unused here, so that a start tag in this tier can take the same bit.
+    // The two tags only this tier has sit below it.
+
+    /// A transition that is not computed yet.
+    const UNKNOWN: Self = Self(1 << 31);
+    /// The edge reports a match: its successor is a match state, or an
+    /// assertion resolved by its byte reached one.
+    const MATCH_TAG: u32 = 1 << 30;
+    /// The successor is the DEAD state; the index bits are zero.
+    const DEAD_TAG: u32 = 1 << 28;
+    /// The edge crosses an increment or seeds a counter: it has to go
+    /// through [`Tier2DfaMatcher::step_inner`] even when no instance is
+    /// live.  Set on [`Transition::no_break`] only.
+    const EFFECT_TAG: u32 = 1 << 27;
+    /// Largest untagged value, and the mask of the index bits.
+    const MAX: u32 = Self::EFFECT_TAG - 1;
+
+    /// The start state as a current state: state 0, also after the cache
+    /// is emptied.
+    const START: Self = Self(0);
+    /// The DEAD state as a current state.
+    const DEAD: Self = Self(Self::DEAD_TAG);
+
+    /// A current state from a plain id (which may be DEAD).
+    #[inline]
+    fn from_state(state: DfaStateId) -> Self {
+        if state == DfaStateId::DEAD {
+            Self::DEAD
+        } else {
+            debug_assert!(state.0 <= Self::MAX);
+            Self(state.0)
+        }
+    }
+
+    /// The same state with the tags of an edge into it.
+    #[inline]
+    fn with_tags(self, is_match: bool, effect: bool) -> Self {
+        debug_assert_eq!(self, self.as_current());
+        let mut id = self.0;
+        if is_match {
+            id |= Self::MATCH_TAG;
+        }
+        if effect {
+            id |= Self::EFFECT_TAG;
+        }
+        Self(id)
+    }
+
+    /// Whether any tag is set.
+    #[inline(always)]
+    fn is_tagged(self) -> bool {
+        self.0 > Self::MAX
+    }
+
+    #[inline(always)]
+    fn is_match(self) -> bool {
+        self.0 & Self::MATCH_TAG != 0
+    }
+
+    #[inline(always)]
+    fn is_dead(self) -> bool {
+        self.0 & Self::DEAD_TAG != 0
+    }
+
+    #[inline(always)]
+    fn has_effect(self) -> bool {
+        self.0 & Self::EFFECT_TAG != 0
+    }
+
+    /// The entry as the matcher's current state: where the edge leads,
+    /// without what taking it involved.  One mask, on the path from one
+    /// state to the next.
+    #[inline(always)]
+    fn as_current(self) -> Self {
+        Self(self.0 & (Self::MAX | Self::DEAD_TAG))
+    }
+
+    /// Index of a current state in the state table.  Not for DEAD.
+    #[inline(always)]
+    fn idx(self) -> usize {
+        debug_assert!(!self.is_tagged());
+        self.0 as usize
+    }
+
+    /// The successor state as a plain id.  Not for `UNKNOWN`, which has
+    /// none: it would come out as state 0, the start state.  There is no
+    /// `==` between this type and `DfaStateId` for that reason.
+    #[inline(always)]
+    fn state(self) -> DfaStateId {
+        debug_assert!(self != Self::UNKNOWN, "an uncomputed entry has no state");
+        // All ones (`DfaStateId::DEAD`) when the DEAD tag is set, without a
+        // branch: this sits on the path from one state to the next.
+        let dead = ((self.0 >> Self::DEAD_TAG.trailing_zeros()) & 1).wrapping_neg();
+        DfaStateId((self.0 & Self::MAX) | dead)
+    }
+}
+
+/// Most states a Tier 2 cache can be asked to hold: every state index has
+/// to fit below the tag bits.  A larger cap is lowered to this.
+const TIER2_MAX_STATES: usize = Tier2StateId::MAX as usize + 1;
+
 /// Cached DFA transition for `(state, byte)`.
 ///
 /// Non-counting transitions use `no_break` only.
@@ -203,14 +323,14 @@ struct CounterMeta {
 /// based on the differential counter condition.
 #[derive(Clone)]
 struct Transition {
-    /// DFA successor when no counter instance can break.
-    no_break: DfaStateId,
-    no_break_is_match: bool,
-    /// DFA successor when at least one instance can break.
-    with_break: DfaStateId,
-    with_break_is_match: bool,
-    /// True if this transition crosses at least one CInc node.
-
+    /// DFA successor when no counter instance can break, tagged with what
+    /// taking this edge involves.
+    no_break: Tier2StateId,
+    /// DFA successor when at least one instance can break, with the match
+    /// tag of taking the edge that way.  It never carries the "counts or
+    /// seeds" tag: that one is read from `no_break`, before the counters
+    /// decide between the two.
+    with_break: Tier2StateId,
     /// Bitmask: bit `i` set means counter `i` fires CInc at this transition.
     counting_mask: u64,
     /// Seeds to apply BEFORE counter_increment.
@@ -220,22 +340,6 @@ struct Transition {
     /// (initial_value > 0).  The seed must be visible to the increment
     /// so the counter can break on this very transition.
     pre_seeds: Box<[(CounterIdx, u32)]>,
-    /// Whether stepping this transition must process increments or seeds even
-    /// when no counter instances were live on entry.
-    counts_or_seeds: bool,
-    /// This populated edge leads to a state (not DEAD) and cannot count,
-    /// seed, or match: with no live instance, taking it only changes the
-    /// current state.  [`Tier2DfaMatcher::idle_run`] follows such edges.
-    idle_plain: bool,
-    /// This populated edge leads back to its own state and cannot count,
-    /// seed, or match.  A run of bytes whose edges in one row are all such
-    /// loops is skipped without following them one by one.
-    ///
-    /// For an ordinary state this is an [`idle_plain`](Self::idle_plain)
-    /// edge that loops.  In the DEAD row it is an edge that stays dead,
-    /// which `idle_plain` excludes: the skip over dead bytes in
-    /// [`Tier2DfaMatcher::scan_without_prefilter`] tests this flag alone.
-    idle_self_loop: bool,
     /// Seeds to apply AFTER counter_increment and counter_reset.
     ///
     /// Probe seeds (initial_value = 0) that start new counter instances
@@ -257,15 +361,10 @@ struct Transition {
 impl Transition {
     fn empty() -> Self {
         Self {
-            no_break: DfaStateId::UNPOPULATED,
-            no_break_is_match: false,
-            with_break: DfaStateId::UNPOPULATED,
-            with_break_is_match: false,
+            no_break: Tier2StateId::UNKNOWN,
+            with_break: Tier2StateId::UNKNOWN,
             counting_mask: 0,
             pre_seeds: Box::new([]),
-            counts_or_seeds: false,
-            idle_plain: false,
-            idle_self_loop: false,
             seeds: Box::new([]),
             counter_reset: 0,
             phase_reset: 0,
@@ -672,8 +771,8 @@ pub(crate) struct Tier2DfaCache {
     /// Per DFA state: the state to continue from once no counter instance
     /// is live — the same state without its counter-body NFA states (see
     /// [`settled_state`](Self::settled_state)).  Grown on demand;
-    /// [`DfaStateId::UNPOPULATED`] marks entries not computed yet.
-    settled: Vec<DfaStateId>,
+    /// [`Tier2StateId::UNKNOWN`] marks entries not computed yet.
+    settled: Vec<Tier2StateId>,
     /// Whether [`settled_state`](Self::settled_state) may be used for the
     /// prepared regex.  Computed once in [`prepare`](Self::prepare).
     settle_enabled: bool,
@@ -703,9 +802,10 @@ impl Tier2DfaCache {
         }
     }
 
-    /// Set the state cap (see [`DfaCache::set_max_states`]).
+    /// Set the state cap (see [`DfaCache::set_max_states`]).  A cap above
+    /// [`TIER2_MAX_STATES`] is lowered to it.
     pub(crate) fn set_max_states(&mut self, max_states: usize) {
-        self.inner.set_max_states(max_states);
+        self.inner.set_max_states(max_states.min(TIER2_MAX_STATES));
     }
 
     /// Number of times the cache was emptied because it was full.
@@ -721,7 +821,7 @@ impl Tier2DfaCache {
     ///
     /// The counters are the stream's own state and are left alone.
     #[inline]
-    fn make_room(&mut self, from: DfaStateId) -> DfaStateId {
+    fn make_room(&mut self, from: Tier2StateId) -> Tier2StateId {
         if self.inner.has_room(2) {
             from
         } else {
@@ -730,9 +830,10 @@ impl Tier2DfaCache {
     }
 
     #[cold]
-    fn evict(&mut self, from: DfaStateId) -> DfaStateId {
+    fn evict(&mut self, from: Tier2StateId) -> Tier2StateId {
         let stride = self.stride;
-        let mut keep = [from];
+        // The shared table renumbers plain ids.
+        let mut keep = [from.state()];
         self.transitions.clear();
         self.settled.clear();
         self.dead_transitions.clear();
@@ -741,7 +842,7 @@ impl Tier2DfaCache {
             self.transitions
                 .extend(std::iter::repeat_with(Transition::empty).take(stride));
         });
-        keep[0]
+        Tier2StateId::from_state(keep[0])
     }
 
     /// Look up or insert a DFA state.  `None` when the state cap is
@@ -756,12 +857,12 @@ impl Tier2DfaCache {
         is_match_at_end: bool,
         context: BoundaryContext,
         regex: &Regex,
-    ) -> Option<DfaStateId> {
+    ) -> Option<Tier2StateId> {
         let stride = self.stride;
         let needs = deferred_asserts.iter().fold(0, |needs, &idx| {
             needs | regex.dfa_assertions.requirements(idx)
         });
-        self.inner.intern_context(
+        let id = self.inner.intern_context(
             nfa_states,
             deferred_asserts,
             is_match,
@@ -771,7 +872,9 @@ impl Tier2DfaCache {
                 self.transitions
                     .extend(std::iter::repeat_with(Transition::empty).take(stride));
             },
-        )
+        );
+        // The one place a plain id of the shared table becomes a tagged one.
+        id.map(Tier2StateId::from_state)
     }
 
     // -----------------------------------------------------------------------
@@ -842,7 +945,7 @@ impl Tier2DfaCache {
     fn populate(
         &mut self,
         memory: &mut DfaMemory,
-        from: DfaStateId,
+        from: Tier2StateId,
         byte: u8,
         regex: &Regex,
         analysis: &Tier2Analysis,
@@ -865,7 +968,7 @@ impl Tier2DfaCache {
         // break, say — says nothing about the body (Bug 62).
         let mut resolved_body_mask: u64 = 0;
 
-        if from != DfaStateId::DEAD {
+        if !from.is_dead() {
             let from_state = &self.inner.states[from.idx()];
             // Phase 1: resolve deferred assertions.
             let extra = from_state.resolve_deferred(byte, regex);
@@ -1005,14 +1108,9 @@ impl Tier2DfaCache {
             let wb_m = self.is_match(wb_id);
 
             Transition {
-                no_break: nb_id,
-                no_break_is_match: nb_m || resolved_is_match,
-                with_break: wb_id,
-                with_break_is_match: wb_m || resolved_is_match,
+                no_break: nb_id.with_tags(nb_m || resolved_is_match, counts_or_seeds),
+                with_break: wb_id.with_tags(wb_m || resolved_is_match, false),
                 counting_mask,
-                counts_or_seeds,
-                idle_plain: false,
-                idle_self_loop: false,
                 pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
                 counter_reset,
@@ -1023,14 +1121,9 @@ impl Tier2DfaCache {
             let m = self.is_match(id);
 
             Transition {
-                no_break: id,
-                no_break_is_match: m || resolved_is_match,
-                with_break: id,
-                with_break_is_match: m || resolved_is_match,
+                no_break: id.with_tags(m || resolved_is_match, counts_or_seeds),
+                with_break: id.with_tags(m || resolved_is_match, false),
                 counting_mask: 0,
-                counts_or_seeds,
-                idle_plain: id != DfaStateId::DEAD && !counts_or_seeds && !m && !resolved_is_match,
-                idle_self_loop: id == from && !counts_or_seeds && !m && !resolved_is_match,
                 pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
                 counter_reset,
@@ -1124,20 +1217,20 @@ impl Tier2DfaCache {
     ///
     /// Must only be called when [`settle_enabled`](Self::settle_enabled).
     #[inline]
-    fn settled_state(&mut self, id: DfaStateId, regex: &Regex) -> DfaStateId {
+    fn settled_state(&mut self, id: Tier2StateId, regex: &Regex) -> Tier2StateId {
         match self.settled.get(id.idx()) {
-            Some(&s) if s != DfaStateId::UNPOPULATED => s,
+            Some(&s) if s != Tier2StateId::UNKNOWN => s,
             _ => self.compute_settled(id, regex),
         }
     }
 
     #[cold]
-    fn compute_settled(&mut self, id: DfaStateId, regex: &Regex) -> DfaStateId {
+    fn compute_settled(&mut self, id: Tier2StateId, regex: &Regex) -> Tier2StateId {
         debug_assert!(self.settle_enabled);
         let target = self.without_body_states(id, regex).unwrap_or(id);
         if self.settled.len() < self.inner.states.len() {
             self.settled
-                .resize(self.inner.states.len(), DfaStateId::UNPOPULATED);
+                .resize(self.inner.states.len(), Tier2StateId::UNKNOWN);
         }
         self.settled[id.idx()] = target;
         // The result has no body states left, so it settles to itself.
@@ -1148,7 +1241,7 @@ impl Tier2DfaCache {
     /// Intern the state `id` minus its counter-body NFA states.  `None`
     /// when `id` has none, when nothing would remain, or when the state
     /// cap is reached.
-    fn without_body_states(&mut self, id: DfaStateId, regex: &Regex) -> Option<DfaStateId> {
+    fn without_body_states(&mut self, id: Tier2StateId, regex: &Regex) -> Option<Tier2StateId> {
         let body = &regex.counter_body_states;
         let state = &self.inner.states[id.idx()];
         if !state.nfa_states.iter().any(|s| body[s.idx()]) {
@@ -1184,13 +1277,18 @@ impl Tier2DfaCache {
                 .any(|(state, &in_body)| in_body && matches!(state, State::Assert { .. }))
     }
 
-    fn intern_closure_result(&mut self, cr: &ClosureResult, byte: u8, regex: &Regex) -> DfaStateId {
+    fn intern_closure_result(
+        &mut self,
+        cr: &ClosureResult,
+        byte: u8,
+        regex: &Regex,
+    ) -> Tier2StateId {
         if cr.nfa_states.is_empty()
             && cr.deferred_asserts.is_empty()
             && !cr.is_match
             && !cr.is_match_at_end
         {
-            return DfaStateId::DEAD;
+            return Tier2StateId::DEAD;
         }
         self.intern_state(
             &cr.nfa_states,
@@ -1203,8 +1301,8 @@ impl Tier2DfaCache {
         .expect("DFA state cap reached although room was made")
     }
 
-    fn is_match(&self, id: DfaStateId) -> bool {
-        id != DfaStateId::DEAD && self.inner.states[id.idx()].is_match
+    fn is_match(&self, id: Tier2StateId) -> bool {
+        !id.is_dead() && self.inner.states[id.idx()].is_match
     }
 
     fn clear(&mut self, memory: &mut DfaMemory, num_nfa_states: usize, stride: usize) {
@@ -1254,8 +1352,17 @@ impl Tier2DfaCache {
                 BoundaryContext::new(None),
                 regex,
             )
-            .expect("an empty cache has room for the start state");
-        debug_assert_eq!(self.inner.start_id, DfaStateId::START);
+            .expect("an empty cache has room for the start state")
+            .state();
+        // Checked in release builds too: a matcher starts from the START
+        // constant and compares against it without reading `start_id`, so
+        // a start state anywhere else would give wrong answers silently.
+        // This runs once per prepared regex, not per stream.
+        assert_eq!(
+            self.inner.start_id,
+            DfaStateId::START,
+            "the start state is the first state interned"
+        );
         self.inner.start_is_match = self.inner.states[self.inner.start_id.idx()].is_match;
         self.inner.start_is_match_at_end =
             self.inner.states[self.inner.start_id.idx()].is_match_at_end;
@@ -1407,7 +1514,8 @@ pub struct Tier2DfaMatcher<'a> {
     memory: &'a mut DfaMemory,
     regex: &'a Regex,
     analysis: &'a Tier2Analysis,
-    current: DfaStateId,
+    /// The current state: an untagged index, or the DEAD tag alone.
+    current: Tier2StateId,
     status: SearchStatus,
     has_live_counters: bool,
     /// Copy of [`Tier2DfaCache::settle_enabled`]: whether dead
@@ -1442,8 +1550,14 @@ impl<'a> Tier2DfaMatcher<'a> {
             has_live = cache.counters.has_live();
         }
 
+        // The start state is state 0, also after the cache is emptied, so
+        // the constant is the current state.  Converting `start_id` here
+        // instead looks harmless but is a compare and a conditional move on
+        // every stream (a plain id can be DEAD, a tagged one says so with a
+        // tag), which showed on short streams: about 1% on a 35-byte line.
+        debug_assert_eq!(cache.inner.start_id, DfaStateId::START);
         Tier2DfaMatcher {
-            current: cache.inner.start_id,
+            current: Tier2StateId::START,
             status: SearchStatus::from_match_flag(cache.inner.start_is_match),
             has_live_counters: has_live,
             settle: cache.settle_enabled,
@@ -1460,7 +1574,7 @@ impl<'a> Tier2DfaMatcher<'a> {
     fn ensure_transition(&mut self, byte: u8) -> usize {
         let class = self.regex.byte_classes[byte as usize] as usize;
         let slot = self.current.idx() * self.cache.stride + class;
-        if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
+        if self.cache.transitions[slot].no_break == Tier2StateId::UNKNOWN {
             return self.populate_transition(byte, class);
         }
         slot
@@ -1474,10 +1588,11 @@ impl<'a> Tier2DfaMatcher<'a> {
     fn populate_transition(&mut self, byte: u8, class: usize) -> usize {
         // The current state gets a new id if the cache has to be emptied.
         self.current = self.cache.make_room(self.current);
+        let from = self.current;
         let slot = self.current.idx() * self.cache.stride + class;
         let trans = self
             .cache
-            .populate(self.memory, self.current, byte, self.regex, self.analysis);
+            .populate(self.memory, from, byte, self.regex, self.analysis);
         self.cache.transitions[slot] = trans;
         slot
     }
@@ -1486,7 +1601,7 @@ impl<'a> Tier2DfaMatcher<'a> {
     #[inline(always)]
     fn ensure_transition_direct(&mut self, byte: u8) -> usize {
         let slot = self.current.idx() * 256 + byte as usize;
-        if self.cache.transitions[slot].no_break == DfaStateId::UNPOPULATED {
+        if self.cache.transitions[slot].no_break == Tier2StateId::UNKNOWN {
             return self.populate_transition(byte, byte as usize);
         }
         slot
@@ -1494,7 +1609,7 @@ impl<'a> Tier2DfaMatcher<'a> {
 
     #[inline(always)]
     fn step(&mut self, byte: u8) {
-        if self.current == DfaStateId::DEAD {
+        if self.current.is_dead() {
             self.step_from_dead(byte);
             return;
         }
@@ -1505,7 +1620,7 @@ impl<'a> Tier2DfaMatcher<'a> {
 
     #[inline(always)]
     fn step_direct(&mut self, byte: u8) {
-        if self.current == DfaStateId::DEAD {
+        if self.current.is_dead() {
             self.step_from_dead(byte);
             return;
         }
@@ -1514,17 +1629,17 @@ impl<'a> Tier2DfaMatcher<'a> {
         self.step_inner(slot)
     }
 
-    /// Follow cached [`idle_plain`](Transition::idle_plain) edges from the
-    /// current state and return how many bytes of `input` they consumed.
-    /// Stops at the first byte whose edge is missing or does anything
-    /// else; [`step`](Self::step) takes that one.
+    /// Follow cached untagged edges from the current state and return how
+    /// many bytes of `input` they consumed.  Stops at the first byte whose
+    /// edge carries a tag (missing, DEAD, match, counting or seeding);
+    /// [`step`](Self::step) takes that one.
     ///
     /// Must only be called with no live counter instance and a current
     /// state other than DEAD.  The current state and the table live in
     /// locals for the whole run, so a byte costs one lookup and one test.
     #[inline(always)]
     fn idle_run<const DIRECT: bool>(&mut self, input: &[u8]) -> usize {
-        debug_assert!(!self.has_live_counters && self.current != DfaStateId::DEAD);
+        debug_assert!(!self.has_live_counters && !self.current.is_dead());
         let table = &self.cache.transitions[..];
         let stride = if DIRECT { 256 } else { self.cache.stride };
         let classes = &self.regex.byte_classes;
@@ -1535,28 +1650,31 @@ impl<'a> Tier2DfaMatcher<'a> {
                 classes[byte as usize] as usize
             }
         };
-        let mut current = self.current;
+        let mut current = self.current.0;
         let mut taken = 0;
         while taken < input.len() {
-            let row = &table[current.idx() * stride..][..stride];
-            let t = &row[column(input[taken])];
-            if !t.idle_plain {
+            let row = &table[current as usize * stride..][..stride];
+            let next = row[column(input[taken])].no_break;
+            if next.is_tagged() {
                 break;
             }
             taken += 1;
-            if t.idle_self_loop {
+            if next.0 == current {
                 // The state does not change: the following bytes need no
                 // lookup that depends on the previous one, only their own
-                // flag in this row.
+                // entry in this row.  It is compared with the current state
+                // in a register, as in `dead_run`, which says why that
+                // matters.
                 let rest = &input[taken..];
                 taken += rest
                     .iter()
-                    .position(|&byte| !row[column(byte)].idle_self_loop)
+                    .position(|&byte| row[column(byte)].no_break.0 != current)
                     .unwrap_or(rest.len());
             } else {
-                current = t.no_break;
+                current = next.0;
             }
         }
+        let current = Tier2StateId(current);
         self.current = current;
         taken
     }
@@ -1567,9 +1685,9 @@ impl<'a> Tier2DfaMatcher<'a> {
         let t = &self.cache.transitions[slot];
 
         // Fast path: non-counting, no seeds, no live counters.
-        if !t.counts_or_seeds && !self.has_live_counters {
-            self.current = t.no_break;
-            self.status.record_match(t.no_break_is_match);
+        if !t.no_break.has_effect() && !self.has_live_counters {
+            self.current = t.no_break.as_current();
+            self.status.record_match(t.no_break.is_match());
             return;
         }
 
@@ -1599,11 +1717,11 @@ impl<'a> Tier2DfaMatcher<'a> {
 
         // Select DFA successor and record match flags.
         if any_can_break {
-            self.current = t.with_break;
-            self.status.record_match(t.with_break_is_match);
+            self.current = t.with_break.as_current();
+            self.status.record_match(t.with_break.is_match());
         } else {
-            self.current = t.no_break;
-            self.status.record_match(t.no_break_is_match);
+            self.current = t.no_break.as_current();
+            self.status.record_match(t.no_break.is_match());
         }
 
         // Apply counter_reset: clear instances for counters whose body
@@ -1654,7 +1772,7 @@ impl<'a> Tier2DfaMatcher<'a> {
         // — back in the start state — the prefilter can re-engage.
         // The settled state keeps the match flags, so the answer at end of
         // input does not change.
-        if self.settle && !self.has_live_counters && self.current != DfaStateId::DEAD {
+        if self.settle && !self.has_live_counters && !self.current.is_dead() {
             self.current = self.cache.settled_state(self.current, self.regex);
         }
     }
@@ -1665,7 +1783,7 @@ impl<'a> Tier2DfaMatcher<'a> {
     /// whether the search ended.
     #[inline]
     fn clear_for_dead(&mut self) -> bool {
-        debug_assert!(self.current == DfaStateId::DEAD);
+        debug_assert_eq!(self.current, Tier2StateId::DEAD);
         let anchored = self.regex.start_anchored;
         if anchored {
             self.status = SearchStatus::Exhausted;
@@ -1683,13 +1801,36 @@ impl<'a> Tier2DfaMatcher<'a> {
     /// does anything else; [`step_from_dead`](Self::step_from_dead) takes
     /// that one.
     ///
-    /// Out of line: inside the scanning loop, how tight this loop came
-    /// out depended on the code around it (64 ms or 71 ms on a pattern
-    /// that is dead for most of every line).
+    /// Out of line for two reasons.  Inside the scanning loop, how tight
+    /// this loop came out depended on the code around it (64 ms or 71 ms on
+    /// a pattern that is dead for most of every line); and the compare in
+    /// it is only fast while the value it compares with is not a constant
+    /// to the compiler (see the comment in the body).
     #[inline(never)]
     fn dead_run<const DIRECT: bool>(&self, input: &[u8]) -> usize {
         let row = &self.cache.dead_transitions[..];
         let classes = &self.regex.byte_classes;
+        // "Dead again, and neither a match nor a seed" is the entry that
+        // equals the DEAD state with no other tag, which is the matcher's
+        // current state here.  Each entry is compared with that value, read
+        // into a register, and not with the constant `DEAD`, although
+        // the two are equal.  Against the constant, the loop compares
+        // memory with a 32-bit immediate; the CPU's front end delivers that
+        // form more slowly (same instruction count, same branch and cache
+        // misses, 2.6 times the undelivered uop slots on an i5-4460), which
+        // cost 13% on a pattern that is dead for most of every line: 68 ms
+        // against 60 ms.
+        //
+        // This only holds while the compiler cannot tell that `dead` is
+        // that constant.  It cannot here because this function is not
+        // inlined (`#[inline(never)]` above) and reads the value from the
+        // matcher.  Inlined into a caller that has just tested for DEAD, or
+        // given the value as a constant argument, the loop would go back to
+        // the slow form, and nothing in CI would notice: the Callgrind gate
+        // counts instructions, branches and cache misses, which are the
+        // same either way.
+        let dead = self.current;
+        debug_assert_eq!(dead, Tier2StateId::DEAD);
         input
             .iter()
             .position(|&byte| {
@@ -1698,7 +1839,7 @@ impl<'a> Tier2DfaMatcher<'a> {
                 } else {
                     classes[byte as usize] as usize
                 };
-                !row[column].idle_self_loop
+                row[column].no_break != dead
             })
             .unwrap_or(input.len())
     }
@@ -1719,11 +1860,11 @@ impl<'a> Tier2DfaMatcher<'a> {
         } else {
             self.regex.byte_classes[byte as usize] as usize
         };
-        if self.cache.dead_transitions[class].no_break == DfaStateId::UNPOPULATED {
-            self.cache.make_room(DfaStateId::DEAD);
+        if self.cache.dead_transitions[class].no_break == Tier2StateId::UNKNOWN {
+            self.cache.make_room(Tier2StateId::DEAD);
             let trans = self.cache.populate(
                 self.memory,
-                DfaStateId::DEAD,
+                Tier2StateId::DEAD,
                 byte,
                 self.regex,
                 self.analysis,
@@ -1731,15 +1872,15 @@ impl<'a> Tier2DfaMatcher<'a> {
             self.cache.dead_transitions[class] = trans;
         }
         let trans = &self.cache.dead_transitions[class];
-        self.current = trans.no_break;
+        self.current = trans.no_break.as_current();
 
         // Still dead and nothing seeded: no counter state to maintain.
         // The phase clock only matters relative to live instances.
-        if trans.no_break == DfaStateId::DEAD && trans.seeds.is_empty() {
+        if trans.no_break.is_dead() && trans.seeds.is_empty() {
             return;
         }
 
-        if trans.counting_mask == 0 && trans.no_break_is_match {
+        if trans.counting_mask == 0 && trans.no_break.is_match() {
             self.status = SearchStatus::Matched;
         }
 
@@ -1766,7 +1907,7 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
 
         if let [byte] = input
-            && self.current == DfaStateId::START
+            && self.current == Tier2StateId::START
             && !self.has_live_counters
             && !self.prefilter.accepts(*byte)
         {
@@ -1799,7 +1940,7 @@ impl<'a> Tier2DfaMatcher<'a> {
     #[inline(always)]
     fn scan_without_prefilter<const DIRECT: bool>(&mut self, mut input: &[u8]) {
         loop {
-            if self.current == DfaStateId::DEAD {
+            if self.current.is_dead() {
                 if input.is_empty() {
                     return;
                 }
@@ -1829,7 +1970,7 @@ impl<'a> Tier2DfaMatcher<'a> {
         }
     }
 
-    /// Bulk scan with the prefilter. At [`DfaStateId::START`] (state zero)
+    /// Bulk scan with the prefilter. At [`Tier2StateId::START`] (state zero)
     /// with no live counters, the finder may skip to the next candidate.
     /// The cache interns the start state first and preserves its id on eviction.
     /// Keeping this loop out of line keeps its specializations out of the
@@ -1842,7 +1983,7 @@ impl<'a> Tier2DfaMatcher<'a> {
                 return;
             }
             // chunk() already checked an idle singleton against the prefilter.
-            if self.current == DfaStateId::START && !self.has_live_counters && input.len() > 1 {
+            if self.current == Tier2StateId::START && !self.has_live_counters && input.len() > 1 {
                 if let Some(offset) = finder(&input[i..]) {
                     i += offset;
                 } else {
@@ -1871,11 +2012,10 @@ impl<'a> Tier2DfaMatcher<'a> {
     fn match_at_end(&self) -> bool {
         // A stream that ends where it started, as most short ones do,
         // needs no lookup: the start state's flag is kept with the cache.
-        if self.current == DfaStateId::START {
+        if self.current == Tier2StateId::START {
             return self.cache.inner.start_is_match_at_end;
         }
-        self.current != DfaStateId::DEAD
-            && self.cache.inner.states[self.current.idx()].is_match_at_end
+        !self.current.is_dead() && self.cache.inner.states[self.current.idx()].is_match_at_end
     }
 
     /// Whether a match has already been found without waiting for EOF.
@@ -1887,8 +2027,8 @@ impl<'a> Tier2DfaMatcher<'a> {
 impl fmt::Debug for Tier2DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("Tier2DfaMatcher");
-        s.field("current", &self.current);
-        if self.current != DfaStateId::DEAD {
+        s.field("current", &self.current.state());
+        if !self.current.is_dead() {
             let state = &self.cache.inner.states[self.current.idx()];
             s.field("nfa_states", &state.nfa_states);
             s.field("is_match", &state.is_match);
@@ -1905,7 +2045,7 @@ impl fmt::Debug for Tier2DfaMatcher<'_> {
 
 impl fmt::Display for Tier2DfaMatcher<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.current == DfaStateId::DEAD {
+        if self.current.is_dead() {
             write!(f, "DFA[T2] state=DEAD matched={}", self.ismatch())?;
             if self.status == SearchStatus::Exhausted {
                 write!(f, " exhausted")?;
@@ -2042,12 +2182,18 @@ mod tests {
 
         // Put ids into the two side tables, as matching would.
         let n = m.cache.inner.states.len();
-        m.cache.settled.resize(n, DfaStateId::UNPOPULATED);
+        m.cache.settled.resize(n, Tier2StateId::UNKNOWN);
         m.cache.settled[0] = current;
         m.cache.dead_transitions[0].no_break = current;
         m.cache.dead_transitions[0].with_break = current;
 
         m.current = m.cache.evict(current);
+        // Emptying the cache keeps the start state where matchers expect it.
+        assert_eq!(m.cache.inner.start_id, DfaStateId::START);
+        assert_eq!(
+            Tier2StateId::from_state(m.cache.inner.start_id),
+            Tier2StateId::START
+        );
         assert_eq!(m.cache.inner.states[m.current.idx()], state);
         assert_eq!(m.cache.inner.states.len(), 2);
         assert!(m.cache.settled.is_empty());
@@ -2056,14 +2202,14 @@ mod tests {
             m.cache
                 .dead_transitions
                 .iter()
-                .all(|t| t.no_break == DfaStateId::UNPOPULATED)
+                .all(|t| t.no_break == Tier2StateId::UNKNOWN)
         );
         assert_eq!(m.cache.transitions.len(), 2 * stride);
         assert!(
             m.cache
                 .transitions
                 .iter()
-                .all(|t| t.no_break == DfaStateId::UNPOPULATED)
+                .all(|t| t.no_break == Tier2StateId::UNKNOWN)
         );
         assert_eq!(m.cache.counters.live_count, live);
         assert_eq!(m.cache.evictions(), 1);
@@ -2097,7 +2243,7 @@ mod tests {
         for (pattern, accepts) in [("foo.{0,5}bar|$", true), ("foo.{0,5}bar", false)] {
             for input in [b"".as_slice(), b"z", b"zz"] {
                 with_matcher(pattern, input, |m| {
-                    assert_eq!(m.current, DfaStateId::START, "`{pattern}` on {input:?}");
+                    assert_eq!(m.current, Tier2StateId::START, "`{pattern}` on {input:?}");
                     assert_eq!(m.cache.inner.start_is_match_at_end, accepts);
                     assert_eq!(m.cache.inner.states[0].is_match_at_end, accepts);
                     assert_eq!(m.match_at_end(), accepts, "`{pattern}` on {input:?}");
@@ -2105,7 +2251,7 @@ mod tests {
             }
             // Anywhere else the state's own flag answers.
             with_matcher(pattern, b"zfo", |m| {
-                assert_ne!(m.current, DfaStateId::START);
+                assert_ne!(m.current, Tier2StateId::START);
                 let state = &m.cache.inner.states[m.current.idx()];
                 assert_eq!(m.match_at_end(), state.is_match_at_end);
             });
@@ -2146,12 +2292,12 @@ mod tests {
     /// True if the matcher sits in the start state with no live counter —
     /// the exact condition under which `chunk_prefilter` skips input.
     fn at_start(m: &Tier2DfaMatcher) -> bool {
-        m.current == m.cache.inner.start_id && !m.has_live_counters
+        m.current.state() == m.cache.inner.start_id && !m.has_live_counters
     }
 
     /// True if the matcher's DFA state lists a counter-body NFA state.
     fn has_body_state(m: &Tier2DfaMatcher) -> bool {
-        m.current != DfaStateId::DEAD
+        !m.current.is_dead()
             && m.cache.inner.states[m.current.idx()]
                 .nfa_states
                 .iter()
@@ -2237,6 +2383,153 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_state_id_tags_do_not_disturb_the_state() {
+        // The tags are single bits, apart from each other and from the
+        // index bits.
+        let tags = [
+            Tier2StateId::UNKNOWN.0,
+            Tier2StateId::MATCH_TAG,
+            Tier2StateId::DEAD_TAG,
+            Tier2StateId::EFFECT_TAG,
+        ];
+        for (i, &tag) in tags.iter().enumerate() {
+            assert_eq!(tag.count_ones(), 1);
+            assert_eq!(tag & Tier2StateId::MAX, 0);
+            assert!(tag > Tier2StateId::MAX);
+            for &other in &tags[..i] {
+                assert_ne!(tag, other);
+            }
+        }
+        assert_eq!(TIER2_MAX_STATES, Tier2StateId::MAX as usize + 1);
+
+        // A state with any tags of an edge: the tags read back, and both
+        // ways of dropping them give the state.
+        for index in [0, 1, 0x1234, Tier2StateId::MAX] {
+            let plain = DfaStateId(index);
+            let id = Tier2StateId::from_state(plain);
+            assert!(!id.is_tagged());
+            assert_eq!(id.idx(), index as usize);
+            for is_match in [false, true] {
+                for effect in [false, true] {
+                    let edge = id.with_tags(is_match, effect);
+                    assert_eq!(edge.is_match(), is_match);
+                    assert_eq!(edge.has_effect(), effect);
+                    assert!(!edge.is_dead());
+                    assert_eq!(edge.is_tagged(), is_match || effect);
+                    assert_ne!(edge, Tier2StateId::UNKNOWN);
+                    assert_eq!(edge.as_current(), id);
+                    assert_eq!(edge.state(), plain);
+                }
+            }
+        }
+        assert_eq!(
+            Tier2StateId::from_state(DfaStateId::START),
+            Tier2StateId::START
+        );
+
+        // The DEAD state keeps its tag as a current state: it is what says
+        // that there is no row to index.
+        let dead = Tier2StateId::from_state(DfaStateId::DEAD);
+        assert_eq!(dead, Tier2StateId::DEAD);
+        assert!(dead.is_dead() && dead.is_tagged());
+        for is_match in [false, true] {
+            for effect in [false, true] {
+                let edge = dead.with_tags(is_match, effect);
+                assert!(edge.is_dead());
+                assert_eq!(edge.is_match(), is_match);
+                assert_eq!(edge.has_effect(), effect);
+                assert_eq!(edge.as_current(), Tier2StateId::DEAD);
+                assert_eq!(edge.state(), DfaStateId::DEAD);
+            }
+        }
+    }
+
+    #[test]
+    fn test_idle_run_stops_at_every_tagged_entry() {
+        // The idle run follows untagged entries, and its self-loop skip
+        // compares whole entries with the current state.  A self-loop that
+        // also matches, counts or seeds must end both, like an entry that
+        // is missing or leads to DEAD.  The row is written by hand: one
+        // plain self-loop and one of each tagged kind.
+        for classes in [false, true] {
+            let re = build_columns("foo.{0,5}bar", classes);
+            let analysis = re.tier2_analysis.as_ref().unwrap();
+            let mut memory = DfaMemory::default();
+            let mut cache = Tier2DfaCache::new();
+            cache.prepare(&mut memory, &re, analysis);
+            // Six bytes with a column each.
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut columns: Vec<usize> = Vec::new();
+            for byte in 0..=255u8 {
+                let column = if classes {
+                    re.byte_classes[byte as usize] as usize
+                } else {
+                    byte as usize
+                };
+                if !columns.contains(&column) {
+                    bytes.push(byte);
+                    columns.push(column);
+                }
+            }
+            assert!(bytes.len() >= 6, "`foo.{{0,5}}bar` has six byte classes");
+            let [plain, other, matching, effect, dead, unknown] = bytes[..6] else {
+                unreachable!()
+            };
+            let start = Tier2StateId::START;
+            let next = cache
+                .intern_state(&[], &[], false, true, BoundaryContext(0), &re)
+                .unwrap();
+            assert_ne!(next, start);
+            let mut set = |byte: u8, to: Tier2StateId| {
+                let column = columns[bytes.iter().position(|&b| b == byte).unwrap()];
+                cache.transitions[start.idx() * cache.stride + column] = Transition {
+                    no_break: to,
+                    with_break: to,
+                    ..Transition::empty()
+                };
+            };
+            set(plain, start);
+            set(other, next);
+            set(matching, start.with_tags(true, false));
+            set(effect, start.with_tags(false, true));
+            set(dead, Tier2StateId::DEAD);
+            assert_eq!(
+                cache.transitions[start.idx() * cache.stride + columns[5]].no_break,
+                Tier2StateId::UNKNOWN
+            );
+
+            let mut run = |input: &[u8]| {
+                let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+                assert!(!m.has_live_counters);
+                let taken = if classes {
+                    m.idle_run::<false>(input)
+                } else {
+                    m.idle_run::<true>(input)
+                };
+                (taken, m.current)
+            };
+            // Plain self-loops are skipped to the end of the input.
+            assert_eq!(run(&[plain; 9]), (9, start));
+            // Each tagged entry ends the run where it stands, first in the
+            // input, right after one self-loop, and inside the skip.
+            for stop in [matching, effect, dead, unknown] {
+                for before in [0, 1, 7] {
+                    let mut input = vec![plain; before];
+                    input.extend_from_slice(&[stop, plain, plain]);
+                    assert_eq!(
+                        run(&input),
+                        (before, start),
+                        "byte {stop} after {before} self-loops (classes: {classes})"
+                    );
+                }
+            }
+            // An untagged entry to another state ends the skip and is
+            // followed.
+            assert_eq!(run(&[plain, plain, plain, other]), (4, next));
+        }
+    }
+
     /// Compile without unrolling, with byte classes for every pattern or
     /// for none: the two ways the scanning loop finds a column.
     fn build_columns(pattern: &str, classes: bool) -> Regex {
@@ -2266,7 +2559,7 @@ mod tests {
             m.chunk(chunk);
         }
         let state = (m.current, m.has_live_counters, m.status);
-        (m.finish(), state.0, state.1, state.2)
+        (m.finish(), state.0.state(), state.1, state.2)
     }
 
     /// Every way of splitting `input` into equal chunks gives the answer
@@ -2324,7 +2617,7 @@ mod tests {
             cache.prepare(&mut memory, &re, analysis);
             let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
             m.chunk(b"zzzzzzzz");
-            assert_eq!(m.current, DfaStateId::DEAD);
+            assert_eq!(m.current, Tier2StateId::DEAD);
             assert_eq!(m.status, SearchStatus::Searching);
             // The skip is what the row offers for `z` and not for LF.
             let column = |byte: u8| {
@@ -2334,11 +2627,16 @@ mod tests {
                     byte as usize
                 }
             };
-            assert!(m.cache.dead_transitions[column(b'z')].idle_self_loop);
-            assert!(!m.cache.dead_transitions[column(b'z')].idle_plain);
+            assert_eq!(
+                m.cache.dead_transitions[column(b'z')].no_break,
+                Tier2StateId::DEAD
+            );
             m.chunk(b"zzzz\nfoo");
-            assert!(!m.cache.dead_transitions[column(b'\n')].idle_self_loop);
-            assert_ne!(m.current, DfaStateId::DEAD);
+            assert_ne!(
+                m.cache.dead_transitions[column(b'\n')].no_break,
+                Tier2StateId::DEAD
+            );
+            assert_ne!(m.current, Tier2StateId::DEAD);
             m.chunk(b"bar");
             assert!(m.finish());
 
@@ -2349,14 +2647,14 @@ mod tests {
             for byte in 0..=255 {
                 let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
                 m.chunk(b"z");
-                assert_eq!(m.current, DfaStateId::DEAD);
+                assert_eq!(m.current, Tier2StateId::DEAD);
                 m.step(byte);
             }
             assert!(
                 cache
                     .dead_transitions
                     .iter()
-                    .all(|t| t.no_break != DfaStateId::UNPOPULATED)
+                    .all(|t| t.no_break != Tier2StateId::UNKNOWN)
             );
             for (input, expected) in [
                 (b"zzzz\nfoobar".as_slice(), true),
@@ -2388,7 +2686,7 @@ mod tests {
                 let mut cache = Tier2DfaCache::new();
                 cache.prepare(&mut memory, &re, analysis);
                 let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
-                m.current = DfaStateId::DEAD;
+                m.current = Tier2StateId::DEAD;
                 m.cache.counters.seed(0, 0);
                 m.has_live_counters = true;
                 // An empty chunk looks at no byte and settles nothing.
@@ -2398,7 +2696,7 @@ mod tests {
                 m.chunk(b"zz");
                 assert!(!m.has_live_counters, "`{pattern}`");
                 assert_eq!(m.cache.counters.live_count, 0, "`{pattern}`");
-                assert_eq!(m.current, DfaStateId::DEAD);
+                assert_eq!(m.current, Tier2StateId::DEAD);
                 let expected = if anchored {
                     SearchStatus::Exhausted
                 } else {
@@ -2439,7 +2737,7 @@ mod tests {
             assert!(m.settle);
             assert!(!m.has_live_counters);
             assert!(!has_body_state(m));
-            assert_ne!(m.current, m.cache.inner.start_id);
+            assert_ne!(m.current.state(), m.cache.inner.start_id);
         });
         let re = build(pattern);
         let mut mem = MatcherMemory::default();
@@ -2507,13 +2805,13 @@ mod tests {
         with_matcher("^foo.{0,5}bar", b"fooxxxxxxxxxx", |m| {
             assert!(m.settle);
             assert!(!m.has_live_counters);
-            assert_eq!(m.current, DfaStateId::DEAD);
+            assert_eq!(m.current, Tier2StateId::DEAD);
             assert_eq!(m.status, SearchStatus::Exhausted);
             let populated = m
                 .cache
                 .dead_transitions
                 .iter()
-                .filter(|t| t.no_break != DfaStateId::UNPOPULATED)
+                .filter(|t| t.no_break != Tier2StateId::UNKNOWN)
                 .count();
             assert_eq!(populated, 0, "an absolute start cannot restart");
         });
@@ -2538,7 +2836,7 @@ mod tests {
         for _ in 0..2 {
             let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &first, analysis);
             m.chunk(b"zzzzzzzzqux");
-            assert_eq!(m.current, DfaStateId::DEAD);
+            assert_eq!(m.current, Tier2StateId::DEAD);
             m.chunk(b"\nqux");
             assert!(m.finish(), "line-start branch must restart at LF");
         }
@@ -2546,7 +2844,7 @@ mod tests {
             cache
                 .dead_transitions
                 .iter()
-                .any(|t| t.no_break != DfaStateId::UNPOPULATED)
+                .any(|t| t.no_break != Tier2StateId::UNKNOWN)
         );
 
         let analysis = second.tier2_analysis.as_ref().unwrap();
@@ -2556,7 +2854,7 @@ mod tests {
             cache
                 .dead_transitions
                 .iter()
-                .all(|t| t.no_break == DfaStateId::UNPOPULATED)
+                .all(|t| t.no_break == Tier2StateId::UNKNOWN)
         );
     }
 
@@ -2608,7 +2906,10 @@ mod tests {
         let mut memory = DfaMemory::default();
         let mut cache = Tier2DfaCache::new();
         cache.prepare(&mut memory, &re, analysis);
-        let start = cache.inner.start_id;
+        // The matcher starts from the constant without reading this id.
+        assert_eq!(cache.inner.start_id, DfaStateId::START);
+        let start = Tier2StateId::from_state(cache.inner.start_id);
+        assert_eq!(start, Tier2StateId::START);
         // Nothing is computed until a matcher asks.
         assert!(cache.settled.is_empty());
 
