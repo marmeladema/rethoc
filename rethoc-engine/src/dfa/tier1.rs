@@ -97,6 +97,13 @@ fn push_consume_targets(state: &State, byte: u8, regex: &Regex, targets: &mut Ve
 pub(super) struct Tier1StateId(u32);
 
 impl Tier1StateId {
+    // Two kinds of constant.  One of type `Self` is a complete value, which
+    // an entry or the current state can be equal to: `UNKNOWN`, `START`.
+    // One named `*_TAG` is a single bit, a `u32` that the methods below
+    // combine with a row offset.  `MAX` is neither: the largest offset, and
+    // the mask of the offset bits.  `Tier2StateId` follows the same rule
+    // and gives a tag both tiers have the same value.
+
     /// Tag of the start state in the table of a regex with a prefilter:
     /// entering it hands the input over to the prefilter.  The matcher's
     /// current state never carries it.
@@ -105,7 +112,7 @@ impl Tier1StateId {
     /// after the cache is emptied.
     const START: Self = Self(0);
     /// Tag of a state whose `is_match` flag is set; the offset is kept.
-    const MATCH: u32 = 1 << 30;
+    const MATCH_TAG: u32 = 1 << 30;
     /// A transition that is not computed yet.
     const UNKNOWN: Self = Self(1 << 31);
     /// Largest untagged value, and the mask of the offset bits.
@@ -119,7 +126,7 @@ impl Tier1StateId {
 
     #[inline(always)]
     fn is_match(self) -> bool {
-        self.0 & Self::MATCH != 0
+        self.0 & Self::MATCH_TAG != 0
     }
 
     #[inline(always)]
@@ -215,7 +222,7 @@ impl Tier1DfaCache {
             row |= Tier1StateId::START_TAG;
         }
         if self.inner.states[id.idx()].is_match {
-            row |= Tier1StateId::MATCH;
+            row |= Tier1StateId::MATCH_TAG;
         }
         Tier1StateId(row)
     }
@@ -549,6 +556,15 @@ impl Tier1DfaCache {
             is_match_at_end,
             context,
         );
+        // Checked in release builds too: a matcher starts from the START
+        // constant and compares against it without reading `start_id`, so
+        // a start state anywhere else would give wrong answers silently.
+        // This runs once per prepared regex, not per stream.
+        assert_eq!(
+            self.inner.start_id,
+            DfaStateId::START,
+            "the start state is the first state interned"
+        );
         self.inner.start_is_match = self.inner.states[self.inner.start_id.idx()].is_match;
     }
 }
@@ -602,7 +618,7 @@ impl<'a> DfaMatcher<'a> {
         debug_assert_eq!(cache.inner.start_id, DfaStateId::START);
         let start_is_match = cache.inner.start_is_match;
         let tag = if start_is_match {
-            Tier1StateId::MATCH
+            Tier1StateId::MATCH_TAG
         } else {
             0
         };
