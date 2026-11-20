@@ -223,8 +223,18 @@ struct Transition {
     /// Whether stepping this transition must process increments or seeds even
     /// when no counter instances were live on entry.
     counts_or_seeds: bool,
-    /// This populated edge preserves the DFA state and cannot count, seed, or match.
-    /// With no live instances, any sequence of these edges in this row is inert.
+    /// This populated edge leads to a state (not DEAD) and cannot count,
+    /// seed, or match: with no live instance, taking it only changes the
+    /// current state.  [`Tier2DfaMatcher::idle_run`] follows such edges.
+    idle_plain: bool,
+    /// This populated edge leads back to its own state and cannot count,
+    /// seed, or match.  A run of bytes whose edges in one row are all such
+    /// loops is skipped without following them one by one.
+    ///
+    /// For an ordinary state this is an [`idle_plain`](Self::idle_plain)
+    /// edge that loops.  In the DEAD row it is an edge that stays dead,
+    /// which `idle_plain` excludes: the skip over dead bytes in
+    /// [`Tier2DfaMatcher::scan_without_prefilter`] tests this flag alone.
     idle_self_loop: bool,
     /// Seeds to apply AFTER counter_increment and counter_reset.
     ///
@@ -254,6 +264,7 @@ impl Transition {
             counting_mask: 0,
             pre_seeds: Box::new([]),
             counts_or_seeds: false,
+            idle_plain: false,
             idle_self_loop: false,
             seeds: Box::new([]),
             counter_reset: 0,
@@ -1000,6 +1011,7 @@ impl Tier2DfaCache {
                 with_break_is_match: wb_m || resolved_is_match,
                 counting_mask,
                 counts_or_seeds,
+                idle_plain: false,
                 idle_self_loop: false,
                 pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
@@ -1017,6 +1029,7 @@ impl Tier2DfaCache {
                 with_break_is_match: m || resolved_is_match,
                 counting_mask: 0,
                 counts_or_seeds,
+                idle_plain: id != DfaStateId::DEAD && !counts_or_seeds && !m && !resolved_is_match,
                 idle_self_loop: id == from && !counts_or_seeds && !m && !resolved_is_match,
                 pre_seeds: pre_seed_list.into_boxed_slice(),
                 seeds: seed_list.into_boxed_slice(),
@@ -1480,10 +1493,10 @@ impl<'a> Tier2DfaMatcher<'a> {
     }
 
     #[inline(always)]
-    fn step(&mut self, byte: u8) -> bool {
+    fn step(&mut self, byte: u8) {
         if self.current == DfaStateId::DEAD {
             self.step_from_dead(byte);
-            return false;
+            return;
         }
 
         let slot = self.ensure_transition(byte);
@@ -1491,26 +1504,73 @@ impl<'a> Tier2DfaMatcher<'a> {
     }
 
     #[inline(always)]
-    fn step_direct(&mut self, byte: u8) -> bool {
+    fn step_direct(&mut self, byte: u8) {
         if self.current == DfaStateId::DEAD {
             self.step_from_dead(byte);
-            return false;
+            return;
         }
 
         let slot = self.ensure_transition_direct(byte);
         self.step_inner(slot)
     }
 
-    /// Apply the cached edge and report whether further idle self-loops can be batched.
+    /// Follow cached [`idle_plain`](Transition::idle_plain) edges from the
+    /// current state and return how many bytes of `input` they consumed.
+    /// Stops at the first byte whose edge is missing or does anything
+    /// else; [`step`](Self::step) takes that one.
+    ///
+    /// Must only be called with no live counter instance and a current
+    /// state other than DEAD.  The current state and the table live in
+    /// locals for the whole run, so a byte costs one lookup and one test.
     #[inline(always)]
-    fn step_inner(&mut self, slot: usize) -> bool {
+    fn idle_run<const DIRECT: bool>(&mut self, input: &[u8]) -> usize {
+        debug_assert!(!self.has_live_counters && self.current != DfaStateId::DEAD);
+        let table = &self.cache.transitions[..];
+        let stride = if DIRECT { 256 } else { self.cache.stride };
+        let classes = &self.regex.byte_classes;
+        let column = |byte: u8| {
+            if DIRECT {
+                byte as usize
+            } else {
+                classes[byte as usize] as usize
+            }
+        };
+        let mut current = self.current;
+        let mut taken = 0;
+        while taken < input.len() {
+            let row = &table[current.idx() * stride..][..stride];
+            let t = &row[column(input[taken])];
+            if !t.idle_plain {
+                break;
+            }
+            taken += 1;
+            if t.idle_self_loop {
+                // The state does not change: the following bytes need no
+                // lookup that depends on the previous one, only their own
+                // flag in this row.
+                let rest = &input[taken..];
+                taken += rest
+                    .iter()
+                    .position(|&byte| !row[column(byte)].idle_self_loop)
+                    .unwrap_or(rest.len());
+            } else {
+                current = t.no_break;
+            }
+        }
+        self.current = current;
+        taken
+    }
+
+    /// Apply the cached edge.
+    #[inline(always)]
+    fn step_inner(&mut self, slot: usize) {
         let t = &self.cache.transitions[slot];
 
         // Fast path: non-counting, no seeds, no live counters.
         if !t.counts_or_seeds && !self.has_live_counters {
             self.current = t.no_break;
             self.status.record_match(t.no_break_is_match);
-            return t.idle_self_loop;
+            return;
         }
 
         let mut any_can_break = false;
@@ -1597,20 +1657,57 @@ impl<'a> Tier2DfaMatcher<'a> {
         if self.settle && !self.has_live_counters && self.current != DfaStateId::DEAD {
             self.current = self.cache.settled_state(self.current, self.regex);
         }
-        false
+    }
+
+    /// What standing on DEAD settles before any byte is looked at: no
+    /// thread is left, so counter instances still listed go, and a regex
+    /// anchored at the start of input has nothing more to find.  Returns
+    /// whether the search ended.
+    #[inline]
+    fn clear_for_dead(&mut self) -> bool {
+        debug_assert!(self.current == DfaStateId::DEAD);
+        let anchored = self.regex.start_anchored;
+        if anchored {
+            self.status = SearchStatus::Exhausted;
+        }
+        if self.has_live_counters {
+            self.cache.counters.reset();
+            self.has_live_counters = false;
+        }
+        anchored
+    }
+
+    /// How many bytes at the start of `input` leave the matcher dead and
+    /// seed nothing: they are tested against the DEAD row alone, without a
+    /// step each.  Stops at the first byte whose transition is missing or
+    /// does anything else; [`step_from_dead`](Self::step_from_dead) takes
+    /// that one.
+    ///
+    /// Out of line: inside the scanning loop, how tight this loop came
+    /// out depended on the code around it (64 ms or 71 ms on a pattern
+    /// that is dead for most of every line).
+    #[inline(never)]
+    fn dead_run<const DIRECT: bool>(&self, input: &[u8]) -> usize {
+        let row = &self.cache.dead_transitions[..];
+        let classes = &self.regex.byte_classes;
+        input
+            .iter()
+            .position(|&byte| {
+                let column = if DIRECT {
+                    byte as usize
+                } else {
+                    classes[byte as usize] as usize
+                };
+                !row[column].idle_self_loop
+            })
+            .unwrap_or(input.len())
     }
 
     fn step_from_dead(&mut self, byte: u8) {
         if self.status != SearchStatus::Searching {
             return;
         }
-        if self.has_live_counters {
-            self.cache.counters.reset();
-            self.has_live_counters = false;
-        }
-
-        if self.regex.start_anchored {
-            self.status = SearchStatus::Exhausted;
+        if self.clear_for_dead() {
             return;
         }
 
@@ -1701,8 +1798,26 @@ impl<'a> Tier2DfaMatcher<'a> {
 
     #[inline(always)]
     fn scan_without_prefilter<const DIRECT: bool>(&mut self, mut input: &[u8]) {
-        while let Some((&byte, rest)) = input.split_first() {
-            let looping = if DIRECT {
+        loop {
+            if self.current == DfaStateId::DEAD {
+                if input.is_empty() {
+                    return;
+                }
+                // As the step out of DEAD would on this byte.
+                if self.clear_for_dead() {
+                    return;
+                }
+                let skip = self.dead_run::<DIRECT>(input);
+                input = &input[skip..];
+            } else if !self.has_live_counters {
+                // With nothing live, almost every edge only moves the state.
+                let taken = self.idle_run::<DIRECT>(input);
+                input = &input[taken..];
+            }
+            let Some((&byte, rest)) = input.split_first() else {
+                return;
+            };
+            if DIRECT {
                 self.step_direct(byte)
             } else {
                 self.step(byte)
@@ -1711,24 +1826,6 @@ impl<'a> Tier2DfaMatcher<'a> {
                 return;
             }
             input = rest;
-            if looping {
-                // The first step applied this state's EOF flag. Other cached
-                // idle self-loops in the row have the same successor and EOF
-                // flag. A cache miss or any observable effect ends the run.
-                let stride = if DIRECT { 256 } else { self.cache.stride };
-                let start = self.current.idx() * stride;
-                let row = &self.cache.transitions[start..start + stride];
-                let skip = input.iter().position(|&b| {
-                    let column = if DIRECT {
-                        b
-                    } else {
-                        self.regex.byte_classes[b as usize]
-                    };
-                    !row[column as usize].idle_self_loop
-                });
-                let Some(skip) = skip else { return };
-                input = &input[skip..];
-            }
         }
     }
 
@@ -2138,6 +2235,198 @@ mod tests {
                 "split at {split}"
             );
         }
+    }
+
+    /// Compile without unrolling, with byte classes for every pattern or
+    /// for none: the two ways the scanning loop finds a column.
+    fn build_columns(pattern: &str, classes: bool) -> Regex {
+        let re = Regex::with_config(
+            pattern,
+            RegexConfig {
+                max_unroll_states: 0,
+                byte_class_min_states: if classes { 0 } else { usize::MAX },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(re.tier2_eligible, "`{pattern}` must be tier 2 eligible");
+        assert_eq!(re.num_byte_classes < 256, classes, "`{pattern}`");
+        re
+    }
+
+    /// Feed `input` in chunks of `size` and return the answer with the
+    /// matcher's final state.
+    fn feed(re: &Regex, input: &[u8], size: usize) -> (bool, DfaStateId, bool, SearchStatus) {
+        let analysis = re.tier2_analysis.as_ref().unwrap();
+        let mut memory = DfaMemory::default();
+        let mut cache = Tier2DfaCache::new();
+        cache.prepare(&mut memory, re, analysis);
+        let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, re, analysis);
+        for chunk in input.chunks(size.max(1)) {
+            m.chunk(chunk);
+        }
+        let state = (m.current, m.has_live_counters, m.status);
+        (m.finish(), state.0, state.1, state.2)
+    }
+
+    /// Every way of splitting `input` into equal chunks gives the answer
+    /// of the `regex` crate and ends on the state of the unsplit scan.
+    fn assert_chunking_agrees(pattern: &str, inputs: &[&[u8]]) {
+        let oracle = regex::bytes::Regex::new(&format!("(?s-u){pattern}")).unwrap();
+        for classes in [false, true] {
+            let re = build_columns(pattern, classes);
+            assert!(
+                matches!(re.prefilter, Prefilter::None),
+                "`{pattern}` must scan without a prefilter"
+            );
+            for &input in inputs {
+                let whole = feed(&re, input, input.len());
+                assert_eq!(
+                    whole.0,
+                    oracle.is_match(input),
+                    "`{pattern}` on {input:?} (classes: {classes})"
+                );
+                for size in [1, 2, 3, 5, 7] {
+                    assert_eq!(
+                        feed(&re, input, size),
+                        whole,
+                        "`{pattern}` on {input:?} in chunks of {size} (classes: {classes})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dead_row_skip_restarts_where_the_row_says() {
+        // The matcher is DEAD from the first `z` to the next line start;
+        // those bytes are skipped against the DEAD row.  The byte that
+        // restarts a match attempt must not be skipped, in whichever chunk
+        // it falls.
+        let pattern = "(?m:^)foo.{0,5}bar";
+        assert_chunking_agrees(
+            pattern,
+            &[
+                b"zzzzzzzz\nfooxbar",
+                b"zzzzzzzzfooxbar",
+                b"zzzz\nzz\nfooxxxxxxbar",
+                b"zz\nfozz\nfoobar",
+                b"zzzzzzzzzzzz",
+                b"zzzz\n",
+                b"\n\n\nfoobar",
+            ],
+        );
+        for classes in [false, true] {
+            let re = build_columns(pattern, classes);
+            let analysis = re.tier2_analysis.as_ref().unwrap();
+            let mut memory = DfaMemory::default();
+            let mut cache = Tier2DfaCache::new();
+            cache.prepare(&mut memory, &re, analysis);
+            let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+            m.chunk(b"zzzzzzzz");
+            assert_eq!(m.current, DfaStateId::DEAD);
+            assert_eq!(m.status, SearchStatus::Searching);
+            // The skip is what the row offers for `z` and not for LF.
+            let column = |byte: u8| {
+                if classes {
+                    re.byte_classes[byte as usize] as usize
+                } else {
+                    byte as usize
+                }
+            };
+            assert!(m.cache.dead_transitions[column(b'z')].idle_self_loop);
+            assert!(!m.cache.dead_transitions[column(b'z')].idle_plain);
+            m.chunk(b"zzzz\nfoo");
+            assert!(!m.cache.dead_transitions[column(b'\n')].idle_self_loop);
+            assert_ne!(m.current, DfaStateId::DEAD);
+            m.chunk(b"bar");
+            assert!(m.finish());
+
+            // With every column of the DEAD row computed, a skip that read
+            // the wrong column would jump over the line start.  The row is
+            // filled one step at a time, which does not go through the
+            // skip.
+            for byte in 0..=255 {
+                let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+                m.chunk(b"z");
+                assert_eq!(m.current, DfaStateId::DEAD);
+                m.step(byte);
+            }
+            assert!(
+                cache
+                    .dead_transitions
+                    .iter()
+                    .all(|t| t.no_break != DfaStateId::UNPOPULATED)
+            );
+            for (input, expected) in [
+                (b"zzzz\nfoobar".as_slice(), true),
+                (b"zzzzfoobar", false),
+                (b"zzbzz\nzfoobar", false),
+            ] {
+                let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+                m.chunk(input);
+                assert_eq!(m.finish(), expected, "{input:?} (classes: {classes})");
+            }
+        }
+    }
+
+    #[test]
+    fn test_dead_with_live_counters_drops_them() {
+        // No thread is left on DEAD, so instances still listed are stale.
+        // An anchored regex ends its search there; any other goes on
+        // without them.  Both scanning paths go through the same code.
+        for (pattern, anchored) in [
+            ("^foo.{0,5}bar", true),
+            ("(?m:^)foo.{0,5}bar", false),
+            ("^foo.{0,5}bar|(?m:^)qux", false),
+        ] {
+            for classes in [false, true] {
+                let re = build_columns(pattern, classes);
+                assert_eq!(re.start_anchored, anchored, "`{pattern}`");
+                let analysis = re.tier2_analysis.as_ref().unwrap();
+                let mut memory = DfaMemory::default();
+                let mut cache = Tier2DfaCache::new();
+                cache.prepare(&mut memory, &re, analysis);
+                let mut m = Tier2DfaMatcher::new(&mut cache, &mut memory, &re, analysis);
+                m.current = DfaStateId::DEAD;
+                m.cache.counters.seed(0, 0);
+                m.has_live_counters = true;
+                // An empty chunk looks at no byte and settles nothing.
+                m.chunk(b"");
+                assert!(m.has_live_counters);
+                assert_eq!(m.status, SearchStatus::Searching);
+                m.chunk(b"zz");
+                assert!(!m.has_live_counters, "`{pattern}`");
+                assert_eq!(m.cache.counters.live_count, 0, "`{pattern}`");
+                assert_eq!(m.current, DfaStateId::DEAD);
+                let expected = if anchored {
+                    SearchStatus::Exhausted
+                } else {
+                    SearchStatus::Searching
+                };
+                assert_eq!(m.status, expected, "`{pattern}` (classes: {classes})");
+                assert!(!m.finish());
+            }
+        }
+    }
+
+    #[test]
+    fn test_idle_run_follows_chains_across_chunks() {
+        // Before the gap, the literal is a chain of idle edges that are
+        // not self-loops, and a failed attempt falls back along it.  The
+        // run has to hand the state it reached back at every chunk end.
+        assert_chunking_agrees(
+            r"\babcde.{0,5}f",
+            &[
+                b" abcdeXXf",
+                b" abcabcdeXf",
+                b" abcdxabcd abcde......f",
+                b"abcab abcdeabcdef",
+                b" abcd",
+                b"abcde",
+                b" abcde.....f",
+            ],
+        );
     }
 
     #[test]
